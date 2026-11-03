@@ -1,0 +1,9 @@
+node_modules/
+dist/
+dist-test/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.tsbuildinfo
+.DS_Store
+
