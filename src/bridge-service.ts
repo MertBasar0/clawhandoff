@@ -875,7 +875,7 @@ export class BridgeService {
         errorText: "Run reached a terminal state, but its exact reply is unavailable. Inspect this Gateway run before continuing.", now });
       return this.buildRunningOrUncertainResult(this.requireSession(session.handoffId), this.requireLatestTurn(session.handoffId));
     }
-    const reported = parseReportedResult(rawReply);
+    const reported = parseReportedResult(rawReply, session.remoteSessionKey?.startsWith("browser:") ? "browser" : "gateway");
 
     const candidateRef = reported.candidateRef ?? session.sourceRemoteRef ??
       (session.mode === "verify_only" && session.publisherOwner === "none" ? session.pinnedSourceCommitSha : undefined);

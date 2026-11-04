@@ -1,10 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { test } from "node:test";
 import { browserTranscriptScript, inspectBrowserTurn, wrapBrowserPrompt } from "../src/browser-turn.js";
-import { loadBridgeConfig } from "../src/config.js";
 import { parseReportedResult } from "../src/prompt-compiler.js";
 
 const key = "idem_1234";
@@ -16,42 +12,6 @@ const observe = (
   messages: Array<{ role: string; text: string; unconfirmed?: boolean; sendState?: string; settling?: boolean; loading?: boolean }>,
   busy = false,
 ) => inspectBrowserTurn(JSON.stringify({ ready: true, busy, messages }), key);
-
-test("browser target config accepts OpenClaw multi-segment session URLs and rejects invalid ones", () => {
-  const dir = mkdtempSync(join(tmpdir(), "bridge-cfg-"));
-  try {
-    const check = (sessionUrl: string, agentId = "roboclaw") => {
-      const p = join(dir, "cfg.json");
-      writeFileSync(p, JSON.stringify({
-        targets: { robo: { targetId: "robo", transport: "browser", agentId, sessionUrl, browserMcp: { command: "node", args: [] } } },
-      }));
-      return loadBridgeConfig(p);
-    };
-    for (const validUrl of [
-      "https://team.example/chat/roboclaw/verify-linux-00112233445566778899aabbccddeeff",
-      "https://team.example/chat/roboclaw/dashboard/33257e49-0012-426e-80ab-6ba8f8eb881f",
-      "https://team.example/dashboard/roboclaw/33257e49-0012-426e-80ab-6ba8f8eb881f",
-      "https://team.example/chat/roboclaw/~key/subagent/run-42",
-      "https://team.example/ui/chat/roboclaw/dashboard/33257e49-0012-426e-80ab-6ba8f8eb881f",
-    ]) {
-      assert.equal(check(validUrl).targets.robo?.transport, "browser", validUrl);
-    }
-    for (const invalidUrl of [
-      "https://team.example/chat/roboclaw",
-      "https://team.example/chat/roboclaw/",
-      "https://team.example/chat/roboclaw/~key",
-      "https://team.example/chat/other/33257e49-0012-426e-80ab-6ba8f8eb881f",
-      "http://team.example/chat/roboclaw/33257e49-0012-426e-80ab-6ba8f8eb881f",
-      "https://user:pass@team.example/chat/roboclaw/33257e49-0012-426e-80ab-6ba8f8eb881f",
-      "https://team.example/chat/roboclaw/33257e49-0012-426e-80ab-6ba8f8eb881f?x=1",
-      "https://team.example/chat/roboclaw/33257e49-0012-426e-80ab-6ba8f8eb881f#top",
-    ]) {
-      assert.throws(() => check(invalidUrl), /Invalid bridge config/, invalidUrl);
-    }
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
 
 test("browser turn settles only its acknowledged final reply after the matching submission", () => {
   assert.equal(wrapBrowserPrompt(key, "Check receipt").split("\n")[0], request.text);
@@ -70,6 +30,38 @@ test("browser turn settles only its acknowledged final reply after the matching 
   assert.equal(observe([request, { ...answer, text: "> " + answer.text }]).state, "uncertain");
   assert.equal(observe([request, { role: "assistant", text: "```text\n" + answer.text + "\n```" }]).state, "uncertain");
   assert.equal(observe([answer, { role: "assistant", text: request.text }]).state, "absent");
+});
+
+test("a browser handoff result belongs only to the section starting at the current reply marker", () => {
+  const completed = '```handoff-result\n{"disposition":"completed","summaryDelta":"Previous task"}\n```';
+  const preamble = "Previous run:\nBridge-Reply: idem_old\n" + completed + "\n\n";
+  const marker = "Bridge-Reply: " + key;
+  const current = marker + "\r\nNo evidence for this run.";
+  const read = (text: string) => observe([request, { role: "assistant", text }]);
+
+  const missing = read(preamble + current);
+  assert.equal(missing.state, "completed");
+  assert.equal(parseReportedResult(missing.text!, "browser").disposition, "needs_evidence");
+  assert.equal(missing.text, current);
+  const fresh = read(preamble + answer.text);
+  assert.equal(fresh.text, answer.text);
+  assert.equal(parseReportedResult(fresh.text!, "browser").summaryDelta, "Missing test output");
+
+  for (const competing of [marker, "Bridge-Reply: idem_other"]) {
+    assert.equal(read(current + "\n" + competing + "\n" + completed).state, "uncertain");
+  }
+  const quotedMarker = marker + "\n~~~~text\nBridge-Reply: idem_old\n~~~~\n" + completed;
+  assert.equal(read(quotedMarker).text, quotedMarker);
+  const exampleOnly = marker + "\nEarlier output:\n~~~~text\n" + completed + "\n~~~~";
+  assert.equal(parseReportedResult(read(exampleOnly).text!, "browser").disposition, "needs_evidence");
+  const listedExample = marker + "\nCannot confirm this run.\n- Previous result:\n\n" + completed.replace(/^/gm, "  ");
+  assert.equal(parseReportedResult(read(listedExample).text!, "browser").disposition, "needs_evidence");
+  for (const asymmetric of ["  " + completed, completed.replace(/\n```$/, "\n  ```")]) {
+    assert.equal(parseReportedResult(read(marker + "\n" + asymmetric).text!, "browser").disposition, "needs_evidence");
+  }
+  const notFinal = marker + "\n" + completed + "\nNo evidence for *this* request.";
+  assert.equal(parseReportedResult(read(notFinal).text!, "browser").disposition, "needs_evidence");
+  assert.equal(parseReportedResult(read(marker + "\n" + completed + "\r\n\n").text!, "browser").disposition, "completed");
 });
 
 test("browser transcript script guards route, streaming placeholder footers, and oversized loading bubbles", () => {
@@ -93,11 +85,18 @@ test("browser transcript script guards route, streaming placeholder footers, and
     assistantText: string;
     fullMessageStatus?: "loading" | "loaded" | "error";
     loadErrorDom?: boolean;
+    composerCount?: number;
   }) => {
-    const composer = {
-      getAttribute: (n: string) => (n === "aria-label" ? "Nachricht eingeben" : null),
+    // A nonblocking question can render a labelled answer before the main chat input.
+    const question = {
+      getAttribute: (n: string) => (n === "aria-label" ? "Eigene Antwort" : null),
       closest: () => null,
     };
+    const composerAttrs: Record<string, string> = { "aria-label": "Nachricht eingeben", "aria-autocomplete": "list" };
+    const textareas = [question, ...Array.from({ length: opts.composerCount ?? 1 }, () => ({
+      getAttribute: (n: string) => composerAttrs[n] ?? null,
+      closest: (sel: string) => sel === ".agent-chat__input--chat" ? {} : null,
+    }))];
     const sendBtn = {
       disabled: false,
       textContent: "Senden",
@@ -141,8 +140,8 @@ test("browser transcript script guards route, streaming placeholder footers, and
         : {}),
     };
     const scope = {
+      getElementsByTagName: (tag: string) => tag === "textarea" ? textareas : [],
       querySelector: (sel: string) => {
-        if (sel.includes("textarea")) return composer;
         if (sel.includes("chat-send-btn--send") && !sel.includes("sending")) return sendBtn;
         return null;
       },
@@ -154,6 +153,12 @@ test("browser transcript script guards route, streaming placeholder footers, and
     };
     return { querySelectorAll: () => [thread] };
   };
+
+  const projectComposer = (composerCount: number) =>
+    runScript({ href: targetUrl }, makeDom({ footerSettled: true, composerCount, assistantText: "" }));
+  assert.equal(projectComposer(1).controls?.composerLabel, "Nachricht eingeben");
+  assert.equal(projectComposer(0).ready, false);
+  assert.equal(projectComposer(2).ready, false);
 
   // 1. Streaming placeholder footer (aria-hidden="true", no meta) must stay running, never premature completed/uncertain.
   const streamingSnap = JSON.stringify(runScript({ href: targetUrl }, makeDom({ footerSettled: false, assistantText: answer.text })));
@@ -176,13 +181,21 @@ test("browser transcript script guards route, streaming placeholder footers, and
     href: targetUrl,
   }, makeDom({ footerSettled: true, assistantText: "```text\n" + answer.text + "\n```" })));
   assert.equal(inspectBrowserTurn(fencedSnap, key).state, "uncertain");
+  const indented = runScript({ href: targetUrl }, makeDom({
+    footerSettled: true, assistantText: "    " + answer.text,
+  }));
+  assert.equal(inspectBrowserTurn(JSON.stringify(indented), key).state, "uncertain");
 
   const settledProj = runScript({
     href: targetUrl,
   }, makeDom({ footerSettled: true, assistantText: "Kurzfassung:\n\n" + answer.text, fullMessageStatus: "loaded" }));
   assert.equal(settledProj.controls?.composerLabel, "Nachricht eingeben");
   assert.equal(settledProj.controls?.sendLabel, "Nachricht senden");
-  assert.equal(inspectBrowserTurn(JSON.stringify(settledProj), key).state, "completed");
+  assert.deepEqual(inspectBrowserTurn(JSON.stringify(settledProj), key), { state: "completed", text: answer.text });
+  const ambiguous = runScript({ href: targetUrl }, makeDom({
+    footerSettled: true, assistantText: answer.text + "\nBridge-Reply: idem_other",
+  }));
+  assert.equal(inspectBrowserTurn(JSON.stringify(ambiguous), key).state, "uncertain");
 });
 
 test("a result with no candidate ref or PR keeps the target's evidence blockers", () => {

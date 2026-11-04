@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { terminalBrowserResultJson } from "./browser-turn.js";
 import { Sha40Schema } from "./schema.js";
 import type { HandoffEnvelopeV2, ReportedResult } from "./types.js";
 
@@ -214,15 +215,13 @@ function renderStructuredReturnFooter(): string {
   ].join("\n");
 }
 
-export function parseReportedResult(rawText: string): ReportedResult {
-  const taggedRegex = /```handoff-result\s*([\s\S]*?)```/gi;
-  let lastMatch: RegExpExecArray | null = null;
-  let m: RegExpExecArray | null;
-  while ((m = taggedRegex.exec(rawText)) !== null) {
-    lastMatch = m;
+export function parseReportedResult(rawText: string, transport: "gateway" | "browser" = "gateway"): ReportedResult {
+  let candidateJson: string | undefined;
+  if (transport === "browser") {
+    candidateJson = terminalBrowserResultJson(rawText);
+  } else {
+    for (const match of rawText.matchAll(/```handoff-result\s*([\s\S]*?)```/gi)) candidateJson = match[1]?.trim();
   }
-
-  const candidateJson = lastMatch?.[1]?.trim();
   if (candidateJson) {
     try {
       const parsedObj: unknown = JSON.parse(candidateJson);

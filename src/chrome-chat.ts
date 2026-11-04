@@ -15,7 +15,6 @@ function isRecord(value: unknown): value is RecordValue {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-const COMPOSER = ["Chat composer", "Sohbet mesajı yazma alanı"];
 const SEND = ["Send message", "Mesaj gönder"];
 const STOP = ["Stop", "Stop generating", "Durdur", "Yanıt oluşturmayı durdur"];
 
@@ -153,12 +152,15 @@ export class ChromeChat {
   ) {
     const proj = await this.readProjection(pageId);
     if (proj.busy === true) throw new BridgeError(busyCode, busyMessage);
-    const ctl = isRecord(proj.controls) ? proj.controls : undefined;
-    const snap = await this.composerSnapshot(pageId, labelSet(ctl?.stopLabel, STOP));
+    const ctl = proj.controls;
+    if (!isRecord(ctl) || typeof ctl.composerLabel !== "string" || !ctl.composerLabel.trim()) {
+      throw new BridgeError("TARGET_UNAVAILABLE", "Could not identify the chat composer's accessible name.");
+    }
+    const snap = await this.composerSnapshot(pageId, labelSet(ctl.stopLabel, STOP));
     return {
       snap,
-      composer: oneEnabled(snap, "textbox", labelSet(ctl?.composerLabel, COMPOSER)),
-      sendNames: labelSet(ctl?.sendLabel, SEND),
+      composer: oneEnabled(snap, "textbox", [ctl.composerLabel]),
+      sendNames: labelSet(ctl.sendLabel, SEND),
     };
   }
 

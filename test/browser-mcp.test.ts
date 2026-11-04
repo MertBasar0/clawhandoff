@@ -13,7 +13,8 @@ test("browser MCP resumes a lost send receipt and accepts counter-evidence in th
   const commit = fixture.commitFile("status.txt", "ready\n", "candidate");
   const configPath = join(fixture.rootDir, "bridge.json");
   const statePath = join(fixture.rootDir, "browser-state.json");
-  writeFileSync(statePath, JSON.stringify({ sessionUrl, locale: "de", messages: [], draft: "" }));
+  // A separate question can use a label recognized by the English composer.
+  writeFileSync(statePath, JSON.stringify({ sessionUrl, locale: "de", questionLabel: "Chat composer", messages: [], draft: "" }));
   writeFileSync(configPath, JSON.stringify({
     dataDir: fixture.rootDir,
     targets: { robo: {

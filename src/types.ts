@@ -71,6 +71,8 @@ export interface BrowserTargetConfig {
   targetId: string;
   agentId: string;
   sessionUrl: string;
+  /** Control UI mount for resolving ambiguous session URLs; use "/" for the root. */
+  basePath?: string;
   browserMcp: { command: string; args: string[] };
 }
 

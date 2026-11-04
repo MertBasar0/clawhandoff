@@ -16,12 +16,13 @@ server.registerTool("list_pages", { inputSchema: {} }, async () => result({
   pages: [{ id: 7, url: load().sessionUrl }, { id: 19, url: "https://example.invalid/unrelated" }],
 }));
 server.registerTool("take_snapshot", { inputSchema: page }, async () => {
-  const { sessionUrl, draft, locale, remoteResponding } = load();
+  const { sessionUrl, draft, locale, remoteResponding, questionLabel } = load();
   const de = locale === "de";
   const composerLabel = de ? "Nachricht eingeben" : "Chat composer";
   const sendLabel = draft ? (de ? "Nachricht senden" : "Send message") : (de ? "Zuerst eine Nachricht eingeben" : "Write a message first");
   const stopLabel = de ? "Generierung stoppen" : "Stop generating";
   return result({ snapshot: { id: "1_0", role: "RootWebArea", url: sessionUrl, children: [
+    ...(questionLabel ? [{ id: "1_4", role: "textbox", name: questionLabel }] : []),
     { id: "1_1", role: "textbox", name: composerLabel, ...(draft && { value: draft }) },
     ...(remoteResponding ? [{ id: "1_3", role: "button", name: stopLabel, disabled: false }] : []),
     { id: "1_2", role: "button", name: sendLabel, disabled: !draft || Boolean(remoteResponding) },

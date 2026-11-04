@@ -19,7 +19,7 @@ const GatewayTargetSchema = z.object({
 });
 
 function decodeSessionSegment(segment: string): string | null {
-  if (!segment || !/^[a-zA-Z0-9._~%-]+$/.test(segment) || segment === "." || segment === "..") {
+  if (!segment || !/^[a-zA-Z0-9._~%!'()*-]+$/.test(segment) || segment === "." || segment === "..") {
     return null;
   }
   if (segment === "~dot") return ".";
@@ -36,6 +36,7 @@ const BrowserTargetSchema = z.object({
   targetId: z.string().min(1),
   agentId: z.string().min(1),
   sessionUrl: z.string().url(),
+  basePath: z.string().regex(/^(?:\/[^/?#\\]+)*\/?$/, "Use an absolute UI mount path, or / for the root.").optional(),
   browserMcp: z.object({
     command: z.string().min(1),
     args: z.array(z.string()).default([]),
@@ -44,23 +45,27 @@ const BrowserTargetSchema = z.object({
   try {
     const url = new URL(target.sessionUrl);
     if (
-      url.protocol !== "https:" || url.username || url.password || url.search || url.hash ||
-      url.href !== target.sessionUrl || url.pathname.endsWith("/")
+      url.protocol !== "https:" || url.origin + url.pathname !== target.sessionUrl ||
+      url.pathname.endsWith("/")
     ) {
       return false;
     }
-    const parts = url.pathname.slice(1).split("/");
+    const prefix = (target.basePath ?? "").replace(/\/$/, "") + "/";
+    if (!url.pathname.startsWith(prefix)) return false;
+    const parts = url.pathname.slice(prefix.length).split("/");
     if (!parts.every((part) => decodeSessionSegment(part) !== null)) return false;
-    const nsIndex = parts.findIndex((part) => part === "chat" || part === "dashboard");
-    if (nsIndex < 0) return false;
-    const agent = decodeSessionSegment(parts[nsIndex + 1] ?? "")?.toLowerCase();
-    if (agent !== target.agentId.trim().toLowerCase()) return false;
-    const rest = parts[nsIndex + 2] === "~key" ? parts.slice(nsIndex + 3) : parts.slice(nsIndex + 2);
-    return rest.length >= 1;
+    // OpenClaw uses the deployment mount, not the configured agent, to locate the namespace.
+    // Without a mount, namespace words inside a session key must not authorize another agent.
+    const candidates = (target.basePath === undefined ? parts : parts.slice(0, 1)).flatMap((part, index) => {
+      if (part !== "chat" && part !== "dashboard") return [];
+      const sessionStart = index + (parts[index + 2] === "~key" ? 3 : 2);
+      return sessionStart < parts.length ? [decodeSessionSegment(parts[index + 1] ?? "")?.toLowerCase()] : [];
+    });
+    return candidates.length === 1 && candidates[0] === target.agentId.trim().toLowerCase();
   } catch {
     return false;
   }
-}, { path: ["sessionUrl"], message: "Use the exact HTTPS /chat/<agentId>/<session...> (or /dashboard/<agentId>/<session...>) URL without credentials, query, or fragment." });
+}, { path: ["sessionUrl"], message: "Use the exact HTTPS /chat/<agentId>/<session...> (or /dashboard/<agentId>/<session...>) URL without credentials, query, or fragment. If the route is ambiguous, set basePath to the UI mount (/ for the root)." });
 
 const BridgeConfigFileSchema = z.object({
   dataDir: z.string().min(1).optional(),
