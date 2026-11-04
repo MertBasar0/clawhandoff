@@ -56,7 +56,7 @@ export function terminalBrowserResultJson(text: string): string | undefined {
 export const browserTranscriptScript = String.raw`(expectedUrl, turnKey, uuidRoute) => {
   const browserMarkdownParts = ${browserMarkdownParts};
   const replySection = ${browserReplySection};
-  const url = location.href;
+  const url = location.href.replace(/\?openclaw_mount_recovery=\d+$/, "");
   const page = { url, ready: false, busy: false, messages: [] };
   const sameUuidRoute = !!uuidRoute && url.startsWith(uuidRoute.prefix) && (() => {
     const tail = url.slice(uuidRoute.prefix.length);

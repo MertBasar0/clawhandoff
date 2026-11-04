@@ -82,6 +82,8 @@ test("32-hex UUID browser session routes tolerate display-slug replacement witho
   const bareUuid = `${team}/chat/roboclaw/4f99c346fa5d4daea8d9ba738d8bae4d`;
   assert.equal(sameBrowserSessionUrl(initial, retitled), true);
   assert.equal(sameBrowserSessionUrl(initial, bareUuid), true);
+  assert.equal(sameBrowserSessionUrl(initial, `${retitled}?openclaw_mount_recovery=1793820369833`), true);
+  assert.equal(sameBrowserSessionUrl(initial, `${retitled}?session=other`), false);
   assert.deepEqual(parseBrowserSessionRoute(initial)?.uuidRoute, {
     prefix: `${team}/chat/roboclaw/`,
     uuid: "4f99c346fa5d4daea8d9ba738d8bae4d",

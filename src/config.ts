@@ -81,10 +81,14 @@ export function parseBrowserSessionRoute(
   }
 }
 
+const MOUNT_RECOVERY_QUERY = /\?openclaw_mount_recovery=\d+$/u;
+
 export function sameBrowserSessionUrl(a: string, b: string, basePath?: string): boolean {
-  if (a === b) return true;
-  const left = parseBrowserSessionRoute(a, basePath);
-  const right = parseBrowserSessionRoute(b, basePath);
+  const cleanA = a.replace(MOUNT_RECOVERY_QUERY, "");
+  const cleanB = b.replace(MOUNT_RECOVERY_QUERY, "");
+  if (cleanA === cleanB) return parseBrowserSessionRoute(cleanA, basePath) !== null;
+  const left = parseBrowserSessionRoute(cleanA, basePath);
+  const right = parseBrowserSessionRoute(cleanB, basePath);
   return left !== null && right !== null && left.identity === right.identity;
 }
 
