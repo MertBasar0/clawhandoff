@@ -88,6 +88,7 @@ export class GitVerifier {
       }
 
       const remoteIsLocal = isLocalPath(remoteUrlOrPath);
+      const bloblessArgs = remoteIsLocal ? [] : ["--filter=blob:none"];
       try {
         await this.runGit(
           mirrorDir,
@@ -95,6 +96,7 @@ export class GitVerifier {
             "fetch",
             "--no-tags",
             "--no-recurse-submodules",
+            ...bloblessArgs,
             "--",
             remoteUrlOrPath,
             `${candidateRef}:${tempRef}`,
@@ -285,6 +287,8 @@ export class GitVerifier {
     if (await this.hasCommit(mirrorDir, sha)) {
       return;
     }
+    const localSource = isLocalPath(sourceUrlOrPath);
+    const bloblessArgs = localSource ? [] : ["--filter=blob:none"];
     try {
       await this.runGit(
         mirrorDir,
@@ -292,11 +296,12 @@ export class GitVerifier {
           "fetch",
           "--no-tags",
           "--no-recurse-submodules",
+          ...bloblessArgs,
           "--",
           sourceUrlOrPath,
           sha,
         ],
-        isLocalPath(sourceUrlOrPath),
+        localSource,
       );
     } catch {
       // Some remotes disallow direct unadvertised SHA fetch; fallback to fetching default heads if needed.
@@ -307,11 +312,12 @@ export class GitVerifier {
             "fetch",
             "--no-tags",
             "--no-recurse-submodules",
+            ...bloblessArgs,
             "--",
             sourceUrlOrPath,
             "+refs/heads/*:refs/bridge/remotes/*",
           ],
-          isLocalPath(sourceUrlOrPath),
+          localSource,
         );
       } catch {
         // Handled by caller via hasCommit check.
