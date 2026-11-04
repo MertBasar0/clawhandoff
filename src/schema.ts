@@ -173,6 +173,7 @@ export const VerifyGitInputSchema = z.object({
 });
 
 export const AbortHandoffInputSchema = z.object({
+  localOnly: z.boolean().optional(),
   handoffId: z.string().min(1).max(128),
   reason: z.string().min(1).max(500).optional(),
 });

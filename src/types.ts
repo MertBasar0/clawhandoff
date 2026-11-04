@@ -52,6 +52,7 @@ export type DispatchState =
 export type ReconciledPrState = "none" | "open_verified" | "uncertain_in_flight";
 
 export interface GatewayTargetConfig {
+  transport?: "gateway";
   targetId: string;
   /** Public HTTPS or WS/WSS origin of the OpenClaw Gateway */
   url: string;
@@ -65,9 +66,19 @@ export interface GatewayTargetConfig {
   rpcTimeoutMs?: number;
 }
 
+export interface BrowserTargetConfig {
+  transport: "browser";
+  targetId: string;
+  agentId: string;
+  sessionUrl: string;
+  browserMcp: { command: string; args: string[] };
+}
+
+export type BridgeTargetConfig = GatewayTargetConfig | BrowserTargetConfig;
+
 export interface BridgeConfig {
   dataDir: string;
-  targets: Record<string, GatewayTargetConfig>;
+  targets: Record<string, BridgeTargetConfig>;
   ghCliPath?: string;
   defaultWaitBudgetMs?: number;
   defaultMaxAutonomousTurns?: number;
@@ -232,6 +243,7 @@ export interface RivalPrWarning {
 export interface PreflightResult {
   targetId: string;
   gatewayHealthy: boolean;
+  browserReady?: boolean;
   authReady: boolean;
   agentFound: boolean;
   defaultAgentId?: string;

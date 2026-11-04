@@ -11,6 +11,8 @@ Read this complete skill before delegating coding, cross-OS verification, review
 
 You are the **Goal Owner** of the task—never a passive courier carrying raw objections between the remote session and the user.
 
+For a browser target, use the operator's configured `targetId`. Keep the existing Chrome chat open and use the same `handoffId` for start/attach/continue. A draft belongs to the person composing it. When delivery is uncertain, inspect the marked turn and use `attach` before taking further action.
+
 1. **Pin Moving Git Refs Before Starting:**
    - Resolve moving refs (`origin/main`, `HEAD`, branch names) to exact 40-character hexadecimal commit SHAs (`git rev-parse HEAD`, `git rev-parse origin/main`) before calling `bridge_handoff_start`.
    - When handing off verified platform-specific code (for example Windows WinUI / Inno Setup `.iss` scripts to a Linux Gateway), list those files in `gitContext.lockedPaths` and set `pinnedSourceCommitSha` and `expectedTreeSha` (`git rev-parse HEAD^{tree}`). File locks begin at that source commit; `pinnedBaseCommitSha` separately identifies the PR base. This preserves authorized changes made before handoff.

@@ -1,0 +1,58 @@
+// A local Chrome DevTools MCP fixture. The bridge itself runs unchanged in a separate process.
+import assert from "node:assert/strict";
+import { readFileSync, writeFileSync } from "node:fs";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { z } from "zod";
+
+const file = process.argv[2];
+const load = () => JSON.parse(readFileSync(file, "utf8"));
+const save = (state) => writeFileSync(file, JSON.stringify(state));
+const server = new McpServer({ name: "fixture-chrome", version: "1" });
+const result = (structuredContent) => ({ structuredContent, content: [] });
+const page = { pageId: z.literal(7) };
+
+server.registerTool("list_pages", { inputSchema: {} }, async () => result({
+  pages: [{ id: 7, url: load().sessionUrl }, { id: 19, url: "https://example.invalid/unrelated" }],
+}));
+server.registerTool("take_snapshot", { inputSchema: page }, async () => {
+  const { sessionUrl, draft } = load();
+  return result({ snapshot: { id: "1_0", role: "RootWebArea", url: sessionUrl, children: [
+    { id: "1_1", role: "textbox", name: "Chat composer", ...(draft && { value: draft }) },
+    { id: "1_2", role: "button", name: draft ? "Send message" : "Write a message first", disabled: !draft },
+  ] } });
+});
+server.registerTool("fill", { inputSchema: { ...page, uid: z.literal("1_1"), value: z.string() } }, async ({ value }) => {
+  const state = load();
+  assert.equal(state.draft, "");
+  save({ ...state, draft: value });
+  return result({});
+});
+server.registerTool("click", { inputSchema: { ...page, uid: z.literal("1_2") } }, async () => {
+  const state = load();
+  if (state.loseNextClickWithoutReceipt) {
+    save({ ...state, draft: "", loseNextClickWithoutReceipt: false });
+    return { isError: true, content: [{ type: "text", text: "browser disconnected before a receipt was observable" }] };
+  }
+  const key = /^Bridge-Turn: (idem_[\w-]+)$/m.exec(state.draft)?.[1];
+  assert.ok(key, "bridge must correlate each submission");
+  const missing = !state.draft.includes("receipt:");
+  const report = missing
+    ? { disposition: "needs_evidence", summaryDelta: "Missing receipt for the local run.", blockers: ["Missing receipt"] }
+    : { disposition: "completed", summaryDelta: "Local evidence received.", blockers: [] };
+  state.messages.push({ role: "user", text: state.draft }, { role: "assistant",
+    text: `Bridge-Reply: ${key}\n\n\`\`\`handoff-result\n${JSON.stringify(report)}\n\`\`\`` });
+  state.draft = "";
+  save(state);
+  // The click reached the chat. Simulate losing its acknowledgement on the first turn.
+  if (state.messages.length === 2) return { isError: true, content: [{ type: "text", text: "click acknowledgement lost" }] };
+  return result({});
+});
+server.registerTool("evaluate_script", { inputSchema: { ...page, function: z.string() } }, async () => {
+  const { sessionUrl: url, messages } = load();
+  const projection = { url, ready: true, busy: false, messages: messages.map(({ role, text }) => ({
+    role, text: role === "user" ? text.split("\n", 1)[0] : text,
+  })) };
+  return result({ message: `Script ran on page and returned:\n\`\`\`json\n${JSON.stringify(projection)}\n\`\`\`` });
+});
+await server.connect(new StdioServerTransport());

@@ -1,5 +1,10 @@
 import { z } from "zod";
+import { Sha40Schema } from "./schema.js";
 import type { HandoffEnvelopeV2, ReportedResult } from "./types.js";
+
+// Some agents serialize an absent optional text field as an empty string.
+const optionalResultText = (schema: z.ZodString) =>
+  z.preprocess(value => typeof value === "string" && !value.trim() ? undefined : value, schema.optional());
 
 const ReportedResultSchema = z.object({
   disposition: z.enum([
@@ -8,9 +13,9 @@ const ReportedResultSchema = z.object({
     "blocked",
     "ready_for_publish_gate",
   ]),
-  candidateCommitSha: z.string().min(7).max(64).optional(),
-  candidateRef: z.string().min(1).max(256).optional(),
-  prUrl: z.string().url().optional(),
+  candidateCommitSha: optionalResultText(Sha40Schema),
+  candidateRef: optionalResultText(z.string().min(1).max(256)),
+  prUrl: optionalResultText(z.string().url()),
   summaryDelta: z.string().min(1).max(4_000),
   blockers: z.array(z.string().min(1).max(1_000)).default([]),
   claimedChecks: z
@@ -189,6 +194,7 @@ export function compileAuthorizePublishPrompt(params: {
 function renderStructuredReturnFooter(): string {
   return [
     "## Required Machine-Readable Result Block",
+    "Omit candidateCommitSha, candidateRef and prUrl when unavailable. Do not fill them with placeholders.",
     "At the very end of your response, include a fenced `handoff-result` JSON block with this exact shape:",
     "```handoff-result",
     JSON.stringify(

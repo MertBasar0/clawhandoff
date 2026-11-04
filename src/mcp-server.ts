@@ -106,7 +106,7 @@ export function createBridgeMcpServer(service: BridgeService): McpServer {
     {
       title: "Bridge Preflight Check",
       description:
-        "Checks OpenClaw Gateway health, authentication readiness, agent availability, and optional non-blocking rival PR warnings before starting a handoff.",
+        "Checks the configured Gateway or browser chat and optional rival PR warnings. For browser targets inspect browserReady.",
       inputSchema: PreflightInputSchema.shape,
     },
     async (args) => {
@@ -123,7 +123,7 @@ export function createBridgeMcpServer(service: BridgeService): McpServer {
     {
       title: "Start Durable Agent Handoff",
       description:
-        "Persists write-ahead SQLite intent, opens an isolated OpenClaw Gateway handoff session with pinned 40-char Git SHAs, and observes up to waitBudgetMs. Returns `orchestratorDirective` separating `reported` claims from `observed` Git/PR facts.",
+        "Stores the handoff before sending. Gateway targets open a dedicated session; browser targets use the exact open chat configured by the operator. Observes up to waitBudgetMs. Returns `orchestratorDirective` separating `reported` claims from `observed` Git/PR facts.",
       inputSchema: StartHandoffInputSchema.shape,
     },
     async (args) => {
@@ -191,7 +191,7 @@ export function createBridgeMcpServer(service: BridgeService): McpServer {
     {
       title: "Abort Remote Handoff Run",
       description:
-        "Explicitly cancels the remote OpenClaw run via `chat.abort` (distinct from letting local waitBudgetMs expire).",
+        "Cancels a Gateway run by its ID or an unsent browser turn. For a submitted browser turn, localOnly=true closes local tracking without stopping Robo.",
       inputSchema: AbortHandoffInputSchema.shape,
     },
     async (args) => {

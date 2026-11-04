@@ -17,7 +17,7 @@ Without a structured local bridge, the human developer becomes a manual courier 
 
 1. **Host-driven counter-evidence loop:** The calling local assistant evaluates remote objections, runs authorized local checks, and submits evidence through `bridge_handoff_continue`. The bridge stores progress and returns `orchestratorDirective`; it does not run a local reasoning agent itself. New evidence references count as progress even when the commit is unchanged; resending the same reference does not. The turn budget bounds further submissions. `COMPLETE` reports completion separately from `ESCALATE_TO_HUMAN`.
 2. **Single publisher (`local` or cooperative `remote_gated`):** With `remote_gated`, the bridge sends Stage-2 authorization only after Git verification. Stage 1's instruction not to publish is a prompt contract, **not a revocation of the remote agent's tools or credentials**. When publication must be technically prevented until verification, use a local publisher and a remote worker without publication authority. For reconciliation, the bridge checks the exact open PR when its URL is known; otherwise it requires a unique same-repository match for the verified head. The contract does not name a destination branch; check it separately when it matters.
-3. **Durable lifecycle (`start -> handoffId -> attach -> continue`):** SQLite records submission intent before the RPC. A recorded `runId` can be observed after restart. The bridge claims each submission before sending it and stores its remote session key. If a submission response is lost, the bridge looks for the submitted message and its run ID in session history. Without a match it returns `uncertain` with `ESCALATE_TO_HUMAN` and does not resend. A saved idempotency key alone cannot guarantee replay safety after the Gateway loses its deduplication state. Letting `waitBudgetMs` expire never cancels the remote job; explicit cancellation uses `bridge_handoff_abort`.
+3. **Durable lifecycle (`start -> handoffId -> attach -> continue`):** SQLite records submission intent before the RPC. A recorded `runId` can be observed after restart. The bridge claims each submission before sending it and stores its remote session key. If a submission response is lost, the bridge looks for the submitted message and its run ID in session history. Without a match it returns `uncertain` with `ESCALATE_TO_HUMAN` and does not resend. A saved idempotency key alone cannot guarantee replay safety after the Gateway loses its deduplication state. Letting `waitBudgetMs` expire never cancels the remote job. Gateway targets support explicit cancellation by run ID.
 4. **Checkout-free Git verification:** Candidate refs are fetched into an isolated bare mirror without checkout, recursive submodule fetching, hooks, external diff, or textconv. PR-base ancestry is checked separately from file locks. `lockedPaths` start at `pinnedSourceCommitSha` (or `pinnedBaseCommitSha` when no source is provided), so authorized local changes made before handoff are preserved. Remote modify-then-revert commits are still detected.
 
 ---
@@ -26,7 +26,7 @@ Without a structured local bridge, the human developer becomes a manual courier 
 
 - **Node.js `>= 22.13.0`** (uses built-in `node:sqlite`)
 - **Git `>= 2.38`**
-- **OpenClaw CLI** (`openclaw`) on `PATH` or configured via `cliPath` / `OPENCLAW_HANDOFF_CLI`
+- Gateway targets require the **OpenClaw CLI**. Browser targets require a signed-in Chrome session and **Chrome DevTools MCP** with page ID and structured output support (tested with 1.11.0).
 - Optional: `cloudflared` (for `edge-cloudflare` Gateways) and `gh` (for PR reconciliation & rival-PR preflight warnings)
 
 ```bash
@@ -79,6 +79,33 @@ export OPENCLAW_HANDOFF_PROJECT="example-project"
 }
 ```
 
+### Use an existing Robo chat in Chrome
+
+Open the desired chat in exactly one tab of the Chrome profile you use for Team. Enable Chrome's remote debugging at `chrome://inspect/#remote-debugging` and accept the local connection prompt if Chrome shows one. The browser inherits the access of your signed-in account. Messages and evidence appear in that chat's ordinary history.
+
+Add this entry to `targets` in the bridge config, replacing the URL and executable path with yours:
+
+```json
+{
+  "robo-web": {
+    "targetId": "robo-web",
+    "transport": "browser",
+    "agentId": "roboclaw",
+    "sessionUrl": "https://team.openclaw.ai/chat/roboclaw/YOUR-EXISTING-CHAT-ID",
+    "browserMcp": {
+      "command": "/absolute/path/to/chrome-devtools-mcp",
+      "args": ["--no-usage-statistics", "--no-performance-crux"]
+    }
+  }
+}
+```
+
+Use a locally installed [Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp) on the same OS as Chrome. From WSL with Windows Chrome, `command` can be the WSL path to Windows `node.exe`; give the Windows path to the installed `chrome-devtools-mcp.js` as the first argument. The bridge enables auto-connect and structured output. No Gateway CLI credentials or Team device pairing are needed for this target.
+
+Call `bridge_preflight(targetId="robo-web")` and check `browserReady`. Start with `bridge_handoff_start` and use the returned `handoffId` for every attach or follow-up, just as for a Gateway target. Keep the chat open and its composer free. Each outgoing turn carries a unique marker. The bridge accepts a finished reply only when it can tie the visible assistant message to that turn. An ambiguous send is recorded as uncertain; `attach` only looks for the original message. For a virtualized transcript you may need to bring the relevant messages back into view.
+
+Browser targets reuse the existing chat and its workspace. A named worktree requires a Gateway target. You can cancel an unsent browser turn with `bridge_handoff_abort`. After submission only the chat UI can stop the current response; the bridge cannot safely cancel a specific browser run. After inspecting an unresolved turn, an operator can explicitly call `bridge_handoff_abort(handoffId, localOnly=true)` to release the chat from local tracking. This does not stop Robo or deliver a message. Browser `runId` values identify the bridge's marked turns and cannot be passed to the Gateway API.
+
 ### Registering in Claude Code or Codex
 
 ```bash
@@ -103,7 +130,7 @@ Registration makes the tools available; it does not automatically load the orche
 | **Tool:** `bridge_handoff_attach` | Observes a recorded run after timeout/restart; unknown dispatch acceptance requires reconciliation, not a second submission. |
 | **Tool:** `bridge_handoff_continue` | Sends commit-bound counter-evidence/follow-ups (`counter_evidence_or_followup`) or sends Stage-2 managed publication authorization (`authorize_publish`) once Git checks pass; rejects submissions beyond the turn budget. |
 | **Tool:** `bridge_verify_git` | Runs checkout-free bare-mirror verification of `pinnedBaseCommitSha` ancestry, `expectedTreeSha`, `lockedPaths` since the handed-off source commit, and the exact PR head through `gh`. |
-| **Tool:** `bridge_handoff_abort` | Explicitly cancels the remote run via `chat.abort`. |
+| **Tool:** `bridge_handoff_abort` | Cancels a Gateway run via `chat.abort` or a browser turn before it has been sent. |
 
 ## Verification and real-host acceptance
 

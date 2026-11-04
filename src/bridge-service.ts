@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
+import { ChromeChat } from "./chrome-chat.js";
+import { inspectBrowserTurn, wrapBrowserPrompt } from "./browser-turn.js";
 import { join } from "node:path";
 import { evaluateOrchestratorDirective } from "./directive.js";
 import { buildPrettySessionUrl, OpenClawGatewayClient } from "./gateway-client.js";
@@ -15,6 +18,8 @@ import { BridgeStore } from "./store.js";
 import {
   BridgeError,
   type BridgeConfig,
+  type BridgeTargetConfig,
+  type BrowserTargetConfig,
   type GatewayTargetConfig,
   type HandoffResultEnvelopeV2,
   type ObservedResult,
@@ -28,6 +33,7 @@ export class BridgeService {
   private readonly store: BridgeStore;
   private readonly gitVerifier: GitVerifier;
   private readonly githubReconciler: GitHubReconciler;
+  private readonly browserChats = new Map<string, ChromeChat>();
   private readonly inFlightMutations = new Set<string>();
 
   constructor(config: BridgeConfig) {
@@ -38,11 +44,12 @@ export class BridgeService {
     this.githubReconciler = new GitHubReconciler(config.ghCliPath);
   }
 
-  close(): void {
+  async close(): Promise<void> {
     this.store.close();
+    await Promise.all([...this.browserChats.values()].map((chat) => chat.close()));
   }
 
-  private getClient(targetId: string): { target: GatewayTargetConfig; client: OpenClawGatewayClient } {
+  private getTarget(targetId: string): BridgeTargetConfig {
     const target = this.config.targets[targetId];
     if (!target) {
       const known = Object.keys(this.config.targets).join(", ") || "(none configured)";
@@ -51,10 +58,26 @@ export class BridgeService {
         `Unknown targetId "${targetId}". Configured targets: ${known}.`,
       );
     }
-    return {
-      target,
-      client: new OpenClawGatewayClient(target, this.config.dataDir),
-    };
+    return target;
+  }
+
+  private browser(target: BrowserTargetConfig): ChromeChat {
+    const key = JSON.stringify([target.sessionUrl, target.browserMcp.command, target.browserMcp.args]);
+    let chat = this.browserChats.get(key);
+    if (!chat) {
+      chat = new ChromeChat({ ...target.browserMcp, sessionUrl: target.sessionUrl });
+      this.browserChats.set(key, chat);
+    }
+    return chat;
+  }
+
+  private targetForSession(session: SessionRecord): BridgeTargetConfig {
+    const target = this.getTarget(session.targetId);
+    const key = session.remoteSessionKey;
+    if (target.transport === "browser" ? key !== `browser:${target.sessionUrl}` : key?.startsWith("browser:")) {
+      throw new BridgeError("INVALID_CONTRACT_CONFLICT", "The configured transport or browser chat differs from this handoff's recorded destination.");
+    }
+    return target;
   }
 
   async preflight(params: {
@@ -62,7 +85,15 @@ export class BridgeService {
     repoId?: string;
     issueQuery?: string;
   }): Promise<PreflightResult> {
-    const { target, client } = this.getClient(params.targetId);
+    const target = this.getTarget(params.targetId);
+    if (target.transport === "browser") {
+      await this.browser(target).read();
+      return {
+        targetId: params.targetId, gatewayHealthy: false, browserReady: true, authReady: true, agentFound: true, availableAgentIds: [target.agentId],
+        rivalPullRequests: await this.githubReconciler.findRivalPullRequests(params),
+      };
+    }
+    const client = new OpenClawGatewayClient(target, this.config.dataDir);
     let gatewayHealthy = false;
     let authReady = false;
     let agentFound = false;
@@ -134,7 +165,10 @@ export class BridgeService {
     maxAutonomousTurns?: number;
   }): Promise<HandoffResultEnvelopeV2> {
     const normalized = validateAndNormalizeEnvelope(params.envelope);
-    const { target } = this.getClient(params.targetId);
+    const target = this.getTarget(params.targetId);
+    if (target.transport === "browser" && params.worktreeName) {
+      throw new BridgeError("INVALID_INPUT", "A browser target uses its existing chat and cannot create a named worktree.");
+    }
 
     // Idempotent requestId check: never create a duplicate handoff if retried with same requestId.
     const existing = this.store.getSessionByRequestId(normalized.requestId);
@@ -171,8 +205,10 @@ export class BridgeService {
       envelope: envelopeWithTree,
     });
 
-    const remoteSessionKey = `agent:${target.agentId}:bridge-${handoffId.slice(5)}`;
-    const createRpcParams = {
+    const remoteSessionKey = target.transport === "browser"
+      ? `browser:${target.sessionUrl}`
+      : `agent:${target.agentId}:bridge-${handoffId.slice(5)}`;
+    const createRpcParams = target.transport === "browser" ? undefined : {
       key: remoteSessionKey,
       agentId: target.agentId,
       label: envelopeWithTree.title,
@@ -202,6 +238,7 @@ export class BridgeService {
       envelope: envelopeWithTree,
       worktreeName: params.worktreeName,
       remoteSessionKey,
+      remoteSessionUrl: target.transport === "browser" ? target.sessionUrl : undefined,
       lifecycleStatus: "running",
       maxAutonomousTurns,
       sameBlockerStreak: 0,
@@ -253,8 +290,12 @@ export class BridgeService {
 
     this.inFlightMutations.add(params.handoffId);
     try {
-      const { target, client } = this.getClient(session.targetId);
+      const target = this.targetForSession(session);
       const waitBudgetMs = params.waitBudgetMs ?? this.config.defaultWaitBudgetMs ?? 30_000;
+      if (target.transport === "browser") {
+        return await this.attachBrowserTurn(session, latestTurn, target, waitBudgetMs);
+      }
+      const client = new OpenClawGatewayClient(target, this.config.dataDir);
       const deadline = Date.now() + waitBudgetMs;
 
       // Only a prepared intent may be sent; reconcile uncertain submissions by reading.
@@ -339,6 +380,67 @@ export class BridgeService {
     }
   }
 
+  private async attachBrowserTurn(
+    session: SessionRecord,
+    turn: TurnRecord,
+    target: BrowserTargetConfig,
+    waitBudgetMs: number,
+  ): Promise<HandoffResultEnvelopeV2> {
+    const { handoffId } = session;
+    const { turnId, idempotencyKey } = turn;
+    const chat = this.browser(target);
+    const deadline = Date.now() + waitBudgetMs;
+    let submitted = turn.dispatchState !== "prepared";
+    let accepted = turn.dispatchState === "dispatched";
+    let reply: string | undefined;
+    const uncertain = (errorText: string) =>
+      this.store.markTurnUncertain({ handoffId, turnId, errorText, now: new Date().toISOString() });
+
+    try {
+      if (!submitted) {
+        await chat.send(wrapBrowserPrompt(idempotencyKey, turn.promptText), () => {
+          const claimed = this.store.claimDispatch(handoffId, turnId);
+          submitted = true; // A competing attach may already have claimed the same turn.
+          return claimed;
+        });
+      }
+      for (;;) {
+        const receipt = inspectBrowserTurn(await chat.read(idempotencyKey), idempotencyKey);
+        if (!accepted && (receipt.state === "running" || receipt.state === "completed")) {
+          this.store.recordDispatched({
+            handoffId, turnId, remoteSessionKey: `browser:${target.sessionUrl}`,
+            remoteSessionUrl: target.sessionUrl, runId: `browser:${idempotencyKey}`, now: new Date().toISOString(),
+          });
+          accepted = true;
+        }
+        if (receipt.state === "completed") {
+          reply = receipt.text;
+          break;
+        }
+        if (receipt.state === "uncertain") {
+          uncertain("The visible chat cannot tie a finished answer to this exact turn. Inspect the existing chat and attach again.");
+          break;
+        }
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+          if (receipt.state === "absent") uncertain("The sent turn is not visible in the configured chat. Reopen it and attach without resending.");
+          break;
+        }
+        await delay(Math.min(remaining, 1200));
+      }
+    } catch (error) {
+      if (!(error instanceof BridgeError)) throw error;
+      if (!submitted) throw new BridgeError(error.code, error.message, `When the chat is ready, attach to ${handoffId}.`);
+      uncertain(error.message);
+    }
+    if (reply) return this.finalizeSettledTurn({ session, turn, terminalReplyText: reply });
+    const latest = this.requireLatestTurn(handoffId);
+    const current = this.requireSession(handoffId);
+    return current.lifecycleStatus === "running" || current.lifecycleStatus === "uncertain"
+      ? this.buildRunningOrUncertainResult(current, latest)
+      : this.buildEnvelopeFromRecords(current, latest);
+  }
+
   async continueHandoff(params: {
     handoffId: string;
     intent: "counter_evidence_or_followup" | "authorize_publish";
@@ -359,6 +461,7 @@ export class BridgeService {
     this.inFlightMutations.add(params.handoffId);
     try {
       const session = this.requireSession(params.handoffId);
+      this.targetForSession(session);
       const latestTurn = this.requireLatestTurn(params.handoffId);
 
       if (
@@ -590,6 +693,7 @@ export class BridgeService {
 
   async abortHandoff(params: {
     handoffId: string;
+    localOnly?: boolean;
     reason?: string;
   }): Promise<HandoffResultEnvelopeV2> {
     const session = this.requireSession(params.handoffId);
@@ -597,10 +701,25 @@ export class BridgeService {
     if (turn.dispatchState === "aborted" || turn.dispatchState === "settled" || turn.dispatchState === "failed") {
       return this.buildEnvelopeFromRecords(session, turn);
     }
+    // Local-only abandonment never touches Chrome, even if the operator changed the target URL.
+    if (params.localOnly || (session.remoteSessionKey?.startsWith("browser:") && turn.dispatchState === "prepared")) {
+      if (!session.remoteSessionKey?.startsWith("browser:")) {
+        throw new BridgeError("INVALID_INPUT", "localOnly applies to existing browser chats.");
+      }
+      if (!this.store.markAborted(session.handoffId, turn.turnId, params.reason ?? "Local browser handoff closed.",
+        new Date().toISOString(), turn.dispatchState)) {
+        throw new BridgeError("BUSY_ACTIVE_TURN", "The turn changed while closing the handoff. Attach to check its current state.");
+      }
+      return this.buildEnvelopeFromRecords(this.requireSession(session.handoffId), this.requireLatestTurn(session.handoffId));
+    }
+    const target = this.targetForSession(session);
+    if (target.transport === "browser") {
+      throw new BridgeError("INVALID_CONTRACT_CONFLICT", "A browser chat cannot safely stop a specific run. Inspect the chat; localOnly=true closes tracking without stopping Robo.");
+    }
     if (!session.remoteSessionKey || !turn.runId) {
       throw new BridgeError("RECONCILIATION_UNCERTAIN", "Cannot abort without an accepted run ID. Attach to this handoff to reconcile its submission.");
     }
-    const { client } = this.getClient(session.targetId);
+    const client = new OpenClawGatewayClient(target, this.config.dataDir);
     if (!await client.abortRun(session.remoteSessionKey, turn.runId)) {
       throw new BridgeError("RECONCILIATION_UNCERTAIN", "Gateway did not confirm cancellation of this run. Attach to observe its outcome.");
     }
@@ -845,8 +964,13 @@ export class BridgeService {
       reconciledPrState: pubLedger.prState,
       reconciledPrUrl: pubLedger.prUrl,
     };
-    const directive =
-      turn.directive ??
+    const directive = turn.dispatchState === "aborted" && session.remoteSessionKey?.startsWith("browser:")
+      ? {
+          action: "ESCALATE_TO_HUMAN" as const,
+          reason: "Local tracking closed. The bridge did not stop a remote browser run.",
+          remainingTurnBudget: Math.max(0, session.maxAutonomousTurns - turn.turnNumber),
+        }
+      : turn.directive ??
       evaluateOrchestratorDirective({
         mode: session.mode,
         lifecycleStatus: session.lifecycleStatus,

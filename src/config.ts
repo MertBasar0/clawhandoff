@@ -4,7 +4,8 @@ import { join } from "node:path";
 import { z } from "zod";
 import { BridgeError, type BridgeConfig, type GatewayTargetConfig } from "./types.js";
 
-const TargetConfigSchema = z.object({
+const GatewayTargetSchema = z.object({
+  transport: z.literal("gateway").optional(),
   targetId: z.string().min(1),
   url: z.string().min(1),
   authMode: z.enum(["edge-cloudflare", "direct-token", "existing-profile"]),
@@ -17,12 +18,33 @@ const TargetConfigSchema = z.object({
   rpcTimeoutMs: z.number().int().min(1_000).max(300_000).optional(),
 });
 
+const BrowserTargetSchema = z.object({
+  transport: z.literal("browser"),
+  targetId: z.string().min(1),
+  agentId: z.string().min(1),
+  sessionUrl: z.string().url(),
+  browserMcp: z.object({
+    command: z.string().min(1),
+    args: z.array(z.string()).default([]),
+  }).strict(),
+}).strict().refine((target) => {
+  try {
+    const url = new URL(target.sessionUrl);
+    const parts = url.pathname.split("/");
+    return url.protocol === "https:" && !url.username && !url.password && !url.search && !url.hash &&
+      url.href === target.sessionUrl && parts.length === 4 && parts[1] === "chat" &&
+      parts[2] === target.agentId && /^[a-zA-Z0-9_-]+$/.test(parts[3] ?? "");
+  } catch {
+    return false;
+  }
+}, { path: ["sessionUrl"], message: "Use the exact HTTPS /chat/<agentId>/<session> URL without credentials, query, or fragment." });
+
 const BridgeConfigFileSchema = z.object({
   dataDir: z.string().min(1).optional(),
   ghCliPath: z.string().min(1).optional(),
   defaultWaitBudgetMs: z.number().int().min(0).max(120_000).optional(),
   defaultMaxAutonomousTurns: z.number().int().min(1).max(15).optional(),
-  targets: z.record(z.string(), TargetConfigSchema),
+  targets: z.record(z.string(), z.union([BrowserTargetSchema, GatewayTargetSchema])),
 });
 
 export function loadBridgeConfig(explicitConfigPath?: string): BridgeConfig {

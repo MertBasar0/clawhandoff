@@ -20,13 +20,13 @@ async function main(): Promise<void> {
   const server = createBridgeMcpServer(service);
   const transport = new StdioServerTransport();
 
+  let closing = false;
   const shutdown = () => {
-    try {
-      service.close();
-    } catch {
-      // Ignore close errors during shutdown.
-    }
+    if (closing) return;
+    closing = true;
+    void service.close().catch(() => { process.exitCode = 1; });
   };
+  process.stdin.once("end", shutdown);
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
 

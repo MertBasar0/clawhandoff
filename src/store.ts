@@ -133,18 +133,30 @@ export class BridgeStore {
     return row ? this.mapSession(row) : undefined;
   }
 
+  // An existing browser chat has one composer shared by all handoffs targeting its URL.
+  private assertBrowserChatIdle(key: string | undefined, ownHandoffId: string): void {
+    if (!key?.startsWith("browser:")) return;
+    const active = this.db.prepare(
+      `SELECT handoff_id FROM handoff_sessions WHERE remote_session_key = ? AND handoff_id != ?
+       AND lifecycle_status IN ('running', 'uncertain') LIMIT 1`,
+    ).get(key, ownHandoffId);
+    if (active) throw new BridgeError("BUSY_ACTIVE_TURN",
+      `Browser chat already has an unfinished turn. Attach to handoff "${active.handoff_id}" first.`);
+  }
+
   createInitialIntent(params: {
     session: SessionRecord;
     turn: {
       turnId: string;
       idempotencyKey: string;
       promptText: string;
-      createParamsJson: string;
+      createParamsJson?: string;
       now: string;
     };
   }): void {
     const { session: s, turn: t } = params;
     this.withTransaction(() => {
+      this.assertBrowserChatIdle(s.remoteSessionKey, s.handoffId);
       this.db
         .prepare(
           `INSERT INTO handoff_sessions (
@@ -199,7 +211,7 @@ export class BridgeStore {
           s.handoffId,
           t.idempotencyKey,
           t.promptText,
-          t.createParamsJson,
+          t.createParamsJson ?? null,
           t.now,
           t.now,
         );
@@ -243,6 +255,7 @@ export class BridgeStore {
           (session.lifecycleStatus !== "settled" && session.lifecycleStatus !== "failed")) {
         throw new BridgeError("BUSY_ACTIVE_TURN", "The handoff changed during preparation. Attach to its latest turn.");
       }
+      this.assertBrowserChatIdle(session.remoteSessionKey, params.handoffId);
       if (params.authorizedHead) {
         const ledger = this.getPublicationLedger(params.handoffId);
         if (ledger.attempted || ledger.prState !== "none" || ledger.headRef !== params.authorizedHead.ref ||
@@ -514,15 +527,16 @@ export class BridgeStore {
     );
   }
 
-  markAborted(handoffId: string, turnId: string, reason: string, now: string): void {
-    this.withTransaction(() => {
+  markAborted(handoffId: string, turnId: string, reason: string, now: string, expectedState: DispatchState = "dispatched"): boolean {
+    return this.withTransaction(() => {
       const changed = this.db.prepare(
-        "UPDATE handoff_turns SET dispatch_state = 'aborted', error_text = ?, updated_at = ? WHERE turn_id = ? AND dispatch_state = 'dispatched'",
-      ).run(reason, now, turnId).changes;
+        "UPDATE handoff_turns SET dispatch_state = 'aborted', error_text = ?, updated_at = ? WHERE turn_id = ? AND dispatch_state = ?",
+      ).run(reason, now, turnId, expectedState).changes;
       if (changed) {
         this.db.prepare("UPDATE handoff_sessions SET lifecycle_status = 'aborted', updated_at = ? WHERE handoff_id = ?")
           .run(now, handoffId);
       }
+      return changed === 1;
     });
   }
 
