@@ -32,14 +32,15 @@ The design distinguishes instructions given to an agent, restrictions the bridge
 
 A publish request in a model-generated envelope does not grant permission. The local orchestrator checks the user's authorization, the target's permissions, and the task scope. The bridge rejects contradictory contract fields. Rules that depend on the remote agent's cooperation are advisory instructions. The bridge cannot authorize or intercept every tool call on the target.
 
-Use `publisherOwner: "none"` for work that requires no PR. When the task calls for a PR, choose one publisher.
+Use `publisherOwner: "none"` for work that requires no PR. When `publisherOwner` is omitted, the bridge defaults to `"remote_gated"` (overridable via `defaultPublisherOwner` in bridge configuration or `CLAWHANDOFF_DEFAULT_PUBLISHER_OWNER`).
 
-- **Local publisher (recommended).** With `publisherOwner: "local"`, the remote agent reviews, tests, and prepares a candidate branch. Its instructions tell it to leave PR creation to the local publisher. The bridge verifies the candidate commit and the local publisher acts under the user's existing authorization. To technically prevent the remote agent from publishing, restrict its tools or credentials separately.
-- **Managed remote publisher.** With `publisherOwner: "remote_gated"`, a managed remote bot publishes through the following cooperative two-stage process.
+- **Managed remote publisher (`remote_gated`, default).** With `publisherOwner: "remote_gated"`, a managed remote bot publishes through the following cooperative two-stage process.
 
-  1. **Prepare the candidate.** The initial request must set `allowManagedPublishStage` to `false`. The remote agent prepares the candidate, then reports its `candidateCommitSha` and a reachable `candidateRef`.
+  1. **Prepare the candidate.** The initial request sets `allowManagedPublishStage` to `false`. The remote agent prepares the candidate (including any contributor `Co-authored-by:` commit trailer in Stage 1, before the commit SHA is locked), then reports its `candidateCommitSha` and a reachable `candidateRef`.
   2. **Verify the Git objects.** The bridge reads `observedHeadSha` and `observedTreeSha`. It checks ancestry against `pinnedBaseCommitSha`, checks locked paths, and compares the expected tree if one was provided.
   3. **Authorize publication.** After receiving `AUTHORIZE_REMOTE_PUBLISH`, the local assistant calls `bridge_handoff_continue` within the user's authorization, supplying `intent: "authorize_publish"` and a `message`. The bridge rechecks the same commit and open PR state before sending approval to the same remote session. If verification fails, it withholds the approval message and directs the assistant to correct or escalate the problem.
+
+- **Local publisher (`local`, opt-in).** With `publisherOwner: "local"`, the remote agent reviews, tests, and prepares a candidate branch. Its instructions tell it to leave PR creation to the local publisher. The bridge verifies the candidate commit and the local publisher acts under the user's existing authorization. To technically prevent the remote agent from publishing, restrict its tools or credentials separately.
 
 The remote publish gate depends on the agent respecting the first-stage instructions. Switching to a local `gh` publisher requires explicit user approval to change `publisherOwner`, because switching can bypass the remote service's review and authorization rules.
 
@@ -114,7 +115,7 @@ export interface HandoffEnvelopeV2 {
   outcome: string;
 
   mode: "investigate" | "implement" | "verify_only" | "publish_unchanged";
-  publisherOwner: "none" | "local" | "remote_gated";
+  publisherOwner?: "none" | "local" | "remote_gated"; // Defaults to "remote_gated" (or config defaultPublisherOwner)
 
   gitContext: {
     repoId: string;                 // For example, "openclaw/openclaw"

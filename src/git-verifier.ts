@@ -1,12 +1,38 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { promisify } from "node:util";
 import { normalizeLockedPath } from "./schema.js";
 import { BridgeError, type ObservedResult, type ReconciledPrState } from "./types.js";
 
-const execFileAsync = promisify(execFile);
+export interface GitVerifierOptions {
+  commandTimeoutMs?: number;
+  fetchTimeoutMs?: number;
+}
+
+function killProcessTree(child: ChildProcess): void {
+  const pid = child.pid;
+  if (!pid) return;
+  if (process.platform === "win32") {
+    execFile("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true }, () => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // Already exited.
+      }
+    });
+    return;
+  }
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // Already exited.
+    }
+  }
+}
 
 function isLocalPath(remote: string): boolean {
   if (/^(https?|ssh|git):\/\//i.test(remote) || /^[\w.-]+@[\w.-]+:/.test(remote)) {
@@ -32,10 +58,33 @@ function matchesLockedPath(changedPath: string, lockedPaths: readonly string[]):
 
 export class GitVerifier {
   private readonly mirrorsRoot: string;
+  private readonly commandTimeoutMs: number;
+  private readonly fetchTimeoutMs: number;
 
-  constructor(dataDir: string) {
+  constructor(dataDir: string, options: GitVerifierOptions = {}) {
     this.mirrorsRoot = join(dataDir, "git-mirrors");
+    this.commandTimeoutMs = options.commandTimeoutMs ?? 60_000;
+    this.fetchTimeoutMs = options.fetchTimeoutMs ?? 180_000;
     mkdirSync(this.mirrorsRoot, { recursive: true });
+  }
+
+  /** Validate that a path is an existing local Git repository or linked worktree. */
+  async assertLocalRepository(localRepoPath: string): Promise<void> {
+    if (!isLocalPath(localRepoPath)) {
+      throw new BridgeError(
+        "INVALID_INPUT",
+        `updatedLocalRepoPath "${localRepoPath}" is not an existing local directory.`,
+      );
+    }
+    try {
+      const commonDir = (await this.runGit(localRepoPath, ["rev-parse", "--git-common-dir"], false)).trim();
+      if (!commonDir) throw new Error("empty git-common-dir");
+    } catch {
+      throw new BridgeError(
+        "INVALID_INPUT",
+        `updatedLocalRepoPath "${localRepoPath}" is not a readable Git repository or worktree.`,
+      );
+    }
   }
 
   /** Resolve a commit's tree SHA from an existing local repository without touching working tree files. */
@@ -391,23 +440,103 @@ export class GitVerifier {
       ...(allowFileProtocol ? ["-c", "protocol.file.allow=always"] : []),
     ];
 
-    try {
-      const { stdout } = await execFileAsync("git", [...hardenedPrefix, ...args], {
+    const isNetworkFetch = args[0] === "fetch" && !allowFileProtocol;
+    const timeoutMs = isNetworkFetch ? this.fetchTimeoutMs : this.commandTimeoutMs;
+    const maxBytes = 16 * 1024 * 1024;
+    const fullArgs = [...hardenedPrefix, ...args];
+
+    return await new Promise<string>((resolve, reject) => {
+      let settled = false;
+      let timedOut = false;
+      let overflowed = false;
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
+      const stdoutChunks: Buffer[] = [];
+      const stderrChunks: Buffer[] = [];
+      let postKillTimer: ReturnType<typeof setTimeout> | undefined;
+
+      const finish = (err?: BridgeError, stdout = "") => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (postKillTimer) clearTimeout(postKillTimer);
+        if (err) reject(err);
+        else resolve(stdout);
+      };
+
+      const child = spawn("git", fullArgs, {
         cwd,
-        timeout: 60_000,
-        maxBuffer: 16 * 1024 * 1024,
+        stdio: ["ignore", "pipe", "pipe"],
+        detached: process.platform !== "win32",
         windowsHide: true,
         env: {
           ...process.env,
           GIT_TERMINAL_PROMPT: "0",
           GIT_CONFIG_NOSYSTEM: "1",
+          GIT_HTTP_LOW_SPEED_LIMIT: "1024",
+          GIT_HTTP_LOW_SPEED_TIME: "30",
         },
       });
-      return stdout;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      throw new BridgeError("GIT_VERIFICATION_FAILED", `Git command failed (${args[0]}): ${msg}`);
-    }
+
+      const abortChildTree = (reason: "timeout" | "maxBuffer") => {
+        if (reason === "timeout") timedOut = true;
+        else overflowed = true;
+        killProcessTree(child);
+        postKillTimer = setTimeout(() => {
+          finish(
+            new BridgeError(
+              "GIT_VERIFICATION_FAILED",
+              reason === "timeout"
+                ? `Git command timed out after ${timeoutMs}ms (${args[0]}).`
+                : `Git command exceeded maxBuffer (${args[0]}).`,
+            ),
+          );
+        }, 1_500);
+        postKillTimer.unref?.();
+      };
+
+      const timer = setTimeout(() => abortChildTree("timeout"), timeoutMs);
+
+      child.stdout?.on("data", (chunk: Buffer) => {
+        stdoutBytes += chunk.length;
+        if (stdoutBytes > maxBytes) {
+          abortChildTree("maxBuffer");
+          return;
+        }
+        stdoutChunks.push(chunk);
+      });
+
+      child.stderr?.on("data", (chunk: Buffer) => {
+        if (stderrBytes < 65_536) {
+          stderrChunks.push(chunk);
+          stderrBytes += chunk.length;
+        }
+      });
+
+      child.on("error", (err) => {
+        finish(new BridgeError("GIT_VERIFICATION_FAILED", `Git command failed (${args[0]}): ${err.message}`));
+      });
+
+      child.on("close", (code, signal) => {
+        if (timedOut) {
+          finish(
+            new BridgeError("GIT_VERIFICATION_FAILED", `Git command timed out after ${timeoutMs}ms (${args[0]}).`),
+          );
+          return;
+        }
+        if (overflowed) {
+          finish(new BridgeError("GIT_VERIFICATION_FAILED", `Git command exceeded maxBuffer (${args[0]}).`));
+          return;
+        }
+        if (code !== 0) {
+          const stderrText = Buffer.concat(stderrChunks).toString("utf8").trim();
+          const detail = stderrText || `exited with code ${code ?? "null"}${signal ? ` (${signal})` : ""}`;
+          finish(new BridgeError("GIT_VERIFICATION_FAILED", `Git command failed (${args[0]}): ${detail}`));
+          return;
+        }
+        finish(undefined, Buffer.concat(stdoutChunks).toString("utf8"));
+      });
+    });
   }
 }
 

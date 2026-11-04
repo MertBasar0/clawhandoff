@@ -171,7 +171,10 @@ export class BridgeService {
     waitBudgetMs?: number;
     maxAutonomousTurns?: number;
   }): Promise<HandoffResultEnvelopeV2> {
-    const normalized = validateAndNormalizeEnvelope(params.envelope);
+    const normalized = validateAndNormalizeEnvelope(
+      params.envelope,
+      this.config.defaultPublisherOwner ?? "remote_gated",
+    );
     const target = this.getTarget(params.targetId);
     if (target.transport === "browser" && params.worktreeName) {
       throw new BridgeError("INVALID_INPUT", "A browser target uses its existing chat and cannot create a named worktree.");
@@ -412,6 +415,7 @@ export class BridgeService {
           return claimed;
         });
       }
+      let transientIdlePolls = 0;
       for (;;) {
         const receipt = inspectBrowserTurn(await chat.read(idempotencyKey), idempotencyKey, accepted);
         if (needsDispatchRecord && (receipt.state === "running" || receipt.state === "completed")) {
@@ -426,7 +430,20 @@ export class BridgeService {
           reply = receipt.text;
           break;
         }
+        if (receipt.state === "running" || receipt.state === "pending" || receipt.state === "absent") {
+          transientIdlePolls = 0;
+        }
         if (receipt.state === "uncertain") {
+          if (receipt.transientIdle && waitBudgetMs > 0 && transientIdlePolls < 2) {
+            const remainingForConfirm = deadline - Date.now();
+            if (remainingForConfirm <= 0) {
+              if (accepted) break;
+            } else {
+              transientIdlePolls += 1;
+              await delay(Math.min(remainingForConfirm, 1200));
+              continue;
+            }
+          }
           uncertain("The visible chat cannot tie a finished answer to this exact turn. Inspect the existing chat and attach again.");
           break;
         }
@@ -456,6 +473,7 @@ export class BridgeService {
     handoffId: string;
     intent: "counter_evidence_or_followup" | "authorize_publish";
     message: string;
+    updatedLocalRepoPath?: string;
     updatedSourceCommitSha?: string;
     updatedSourceRemoteRef?: string;
     updatedExpectedTreeSha?: string;
@@ -517,7 +535,12 @@ export class BridgeService {
           );
         }
 
-        if (params.updatedSourceCommitSha || params.updatedSourceRemoteRef || params.updatedExpectedTreeSha) {
+        if (
+          params.updatedLocalRepoPath ||
+          params.updatedSourceCommitSha ||
+          params.updatedSourceRemoteRef ||
+          params.updatedExpectedTreeSha
+        ) {
           throw new BridgeError("INVALID_CONTRACT_CONFLICT", "Submit changed Git coordinates for verification in a separate follow-up before authorizing publication.");
         }
         const before = this.store.getPublicationLedger(params.handoffId);
@@ -560,11 +583,19 @@ export class BridgeService {
         });
         authorizedHead = { ref: candidateRef, sha: session.verifiedPublishHeadSha };
       } else {
+        if (params.updatedLocalRepoPath) {
+          await this.gitVerifier.assertLocalRepository(params.updatedLocalRepoPath);
+        }
         if (params.updatedExpectedTreeSha && !params.updatedSourceCommitSha) {
           throw new BridgeError("INVALID_CONTRACT_CONFLICT", "A new expected tree requires its pinned source commit.");
         }
         if (params.updatedSourceCommitSha && (session.expectedTreeSha || params.updatedExpectedTreeSha)) {
-          const tree = await this.resolveSourceTree(session, params.updatedSourceCommitSha);
+          const effectiveSource = {
+            localRepoPath: params.updatedLocalRepoPath ?? session.localRepoPath,
+            remoteUrlOrPath: session.remoteUrlOrPath,
+            pinnedBaseCommitSha: session.pinnedBaseCommitSha,
+          };
+          const tree = await this.resolveSourceTree(effectiveSource, params.updatedSourceCommitSha);
           if (params.updatedExpectedTreeSha && tree !== params.updatedExpectedTreeSha.toLowerCase()) {
             throw new BridgeError("INVALID_CONTRACT_CONFLICT", "The submitted tree does not match the new pinned source commit.");
           }
@@ -593,6 +624,7 @@ export class BridgeService {
         kind: params.intent === "authorize_publish" ? "authorize_publish" : "continue",
         idempotencyKey,
         promptText,
+        updatedLocalRepoPath: params.updatedLocalRepoPath,
         updatedSourceCommitSha: params.updatedSourceCommitSha?.toLowerCase(),
         updatedSourceRemoteRef: params.updatedSourceRemoteRef,
         updatedExpectedTreeSha: params.updatedExpectedTreeSha?.toLowerCase(),

@@ -177,3 +177,65 @@ test("GitVerifier borrows common object store from linked Git worktrees for delt
     rmSync(dataDir, { recursive: true, force: true });
   }
 });
+
+test("GitVerifier kills the full git child+grandchild process tree on fetch timeout", async () => {
+  const fixture = createTempGitFixture();
+  const dataDir = mkdtempSync(join(tmpdir(), "clawhandoff-timeout-tree-"));
+  const pidFile = join(dataDir, "grandchild.pid");
+  const sshScript = join(dataDir, "fake-ssh.mjs");
+  const prevSsh = process.env.GIT_SSH_COMMAND;
+
+  writeFileSync(
+    sshScript,
+    [
+      'import { spawn } from "node:child_process";',
+      'import { writeFileSync } from "node:fs";',
+      `const sub = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });`,
+      `writeFileSync(${JSON.stringify(pidFile)}, String(sub.pid), "utf8");`,
+      "setInterval(() => {}, 1000);",
+    ].join("\n"),
+    "utf8",
+  );
+  // Forward-slash paths keep Git's sh-parsed GIT_SSH_COMMAND portable across Windows and POSIX.
+  process.env.GIT_SSH_COMMAND = `"${process.execPath.replace(/\\/g, "/")}" "${sshScript.replace(/\\/g, "/")}"`;
+
+  try {
+    const base = fixture.commitFile("README.md", "base\n", "base commit");
+    const verifier = new GitVerifier(dataDir, { fetchTimeoutMs: 400 });
+    const observed = await verifier.verifyCandidate({
+      remoteUrlOrPath: "ssh://git@127.0.0.1/example/repo.git",
+      localRepoPath: fixture.workRepoDir,
+      candidateRef: "refs/heads/main",
+      pinnedBaseCommitSha: base,
+    });
+
+    assert.equal(observed.reachableRefVerified, false);
+    assert.match((observed.verificationNotes ?? []).join("\n"), /timed out/i);
+    assert.equal(existsSync(pidFile), true, "fake ssh helper must have spawned grandchild before timeout");
+
+    const grandchildPid = Number(readFileSync(pidFile, "utf8").trim());
+    assert.ok(Number.isInteger(grandchildPid) && grandchildPid > 0);
+
+    // Allow OS process-tree teardown (taskkill /T /F on win32) a brief moment to reap the grandchild.
+    let alive = true;
+    for (let i = 0; i < 15 && alive; i += 1) {
+      try {
+        process.kill(grandchildPid, 0);
+        await new Promise((r) => setTimeout(r, 100));
+      } catch {
+        alive = false;
+      }
+    }
+    try {
+      if (alive) process.kill(grandchildPid, "SIGKILL");
+    } catch {
+      // Already exited.
+    }
+    assert.equal(alive, false, `Grandchild PID ${grandchildPid} should be terminated with git fetch timeout`);
+  } finally {
+    if (prevSsh === undefined) delete process.env.GIT_SSH_COMMAND;
+    else process.env.GIT_SSH_COMMAND = prevSsh;
+    fixture.cleanup();
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});

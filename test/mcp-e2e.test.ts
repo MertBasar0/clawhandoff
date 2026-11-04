@@ -92,6 +92,14 @@ test("MCP Stdio E2E: exposes all 6 tools and autonomous-handoff prompt cleanly o
 
       const promptsList = await client.listPrompts();
       assert.ok(promptsList.prompts.some((p) => p.name === "autonomous-handoff"));
+      const promptPayload = await client.getPrompt({
+        name: "autonomous-handoff",
+        arguments: { targetId: "robo", goal: "Fix workflow policy refusal and open PR" },
+      });
+      const promptText =
+        promptPayload.messages[0]?.content.type === "text" ? promptPayload.messages[0].content.text : "";
+      assert.match(promptText, /publisherOwner: "remote_gated"/);
+      assert.match(promptText, /Co-authored-by:/);
 
       // 1) Preflight check
       const preflightRes = await client.callTool({
@@ -110,7 +118,7 @@ test("MCP Stdio E2E: exposes all 6 tools and autonomous-handoff prompt cleanly o
       assert.equal(preflightJson.gatewayHealthy, true);
       assert.equal(preflightJson.rivalPullRequests[0]?.number, 99);
 
-      // 2) Start with waitBudgetMs=0 -> running -> explicit abort
+      // 2) Start with waitBudgetMs=0 and omitted publisherOwner (defaults to remote_gated) -> running -> explicit abort
       const startRes = await client.callTool({
         name: "bridge_handoff_start",
         arguments: {
@@ -122,16 +130,14 @@ test("MCP Stdio E2E: exposes all 6 tools and autonomous-handoff prompt cleanly o
             workspaceId: "ws-e2e",
             title: "MCP stdio test handoff",
             outcome: "Verify MCP stdio transport.",
-            mode: "investigate",
-            publisherOwner: "none",
+            mode: "implement",
             gitContext: {
               repoId: "example/repo",
               pinnedBaseCommitSha: baseSha,
             },
             requestedCapabilities: {
-              allowCodeEdit: false,
-              allowBranchPush: false,
-              allowManagedPublishStage: false,
+              allowCodeEdit: true,
+              allowBranchPush: true,
             },
             advisoryInstructions: [],
             priorEvidence: [],

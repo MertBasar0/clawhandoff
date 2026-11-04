@@ -157,6 +157,98 @@ test("browser MCP survives OpenClaw auto-title slug replacement on 32-hex UUID s
       evidenceRefs: [{ claim: "Verified on commit.", sourceRef: `receipt:${commit}:passed` }],
     });
     assert.equal(completed.orchestratorDirective.action, "COMPLETE");
+
+    // Reopening Chrome (reconnected: true on initial list_pages) recovers on the first preflight call,
+    // while mid-operation reconnect during evaluate_script still fails closed.
+    writeFileSync(
+      statePath,
+      JSON.stringify({ ...JSON.parse(readFileSync(statePath, "utf8")), reconnectedOnNextListPages: true }),
+    );
+    const preflightOk = await client.callTool({ name: "bridge_preflight", arguments: { targetId: "robo" } });
+    assert.ok(!preflightOk.isError, JSON.stringify(preflightOk.content));
+    assert.equal(
+      JSON.parse((preflightOk.content as Array<{ text: string }>)[0]!.text).browserReady,
+      true,
+    );
+
+    writeFileSync(
+      statePath,
+      JSON.stringify({ ...JSON.parse(readFileSync(statePath, "utf8")), reconnectedOnNextEvaluate: true }),
+    );
+    const preflightMidReconnect = await client.callTool({ name: "bridge_preflight", arguments: { targetId: "robo" } });
+    assert.equal(preflightMidReconnect.isError, true);
+
+    // Between-tool-call preamble flicker (settled unlabelled bubble + momentary !busy) rides through
+    // waitBudgetMs and settles cleanly on Bridge-Reply instead of aborting as uncertain.
+    writeFileSync(
+      statePath,
+      JSON.stringify({ ...JSON.parse(readFileSync(statePath, "utf8")), preambleFlickerStage: 2 }),
+    );
+    const flickerRes = await client.callTool({
+      name: "bridge_handoff_start",
+      arguments: {
+        targetId: "robo",
+        waitBudgetMs: 8_000,
+        envelope: {
+          schemaVersion: "0.2",
+          requestId: "preamble-flicker-1",
+          workspaceId: "test",
+          title: "Survive between-tool-call preamble flicker",
+          outcome: "Settle cleanly after preamble bubble and momentary !busy.",
+          mode: "verify_only",
+          publisherOwner: "none",
+          gitContext: {
+            repoId: "example/status",
+            localRepoPath: fixture.workRepoDir,
+            pinnedBaseCommitSha: commit,
+            pinnedSourceCommitSha: commit,
+          },
+          requestedCapabilities: { allowCodeEdit: false, allowBranchPush: false, allowManagedPublishStage: false },
+          priorEvidence: [{ claim: "Smoke passed", sourceRef: `receipt:${commit}:passed` }],
+          acceptanceCriteria: ["Settles without false ESCALATE_TO_HUMAN"],
+        },
+      },
+    });
+    assert.ok(!flickerRes.isError, JSON.stringify(flickerRes.content));
+    const flickerEnvelope = JSON.parse((flickerRes.content as Array<{ text: string }>)[0]!.text) as HandoffResultEnvelopeV2;
+    assert.equal(flickerEnvelope.lifecycleStatus, "settled");
+    assert.equal(flickerEnvelope.orchestratorDirective.action, "COMPLETE");
+    assert.equal(JSON.parse(readFileSync(statePath, "utf8")).preambleFlickerStage, 0);
+
+    // Conversely, a genuinely finished reply that omits Bridge-Reply across confirmation polls still becomes uncertain.
+    writeFileSync(
+      statePath,
+      JSON.stringify({ ...JSON.parse(readFileSync(statePath, "utf8")), unlabelledFinalReply: true }),
+    );
+    const unlabelledRes = await client.callTool({
+      name: "bridge_handoff_start",
+      arguments: {
+        targetId: "robo",
+        waitBudgetMs: 5_000,
+        envelope: {
+          schemaVersion: "0.2",
+          requestId: "unlabelled-final-1",
+          workspaceId: "test",
+          title: "Detect persistently unlabelled browser reply",
+          outcome: "Surface uncertain when Bridge-Reply never arrives.",
+          mode: "verify_only",
+          publisherOwner: "none",
+          gitContext: {
+            repoId: "example/status",
+            localRepoPath: fixture.workRepoDir,
+            pinnedBaseCommitSha: commit,
+            pinnedSourceCommitSha: commit,
+          },
+          requestedCapabilities: { allowCodeEdit: false, allowBranchPush: false, allowManagedPublishStage: false },
+          priorEvidence: [{ claim: "Smoke passed", sourceRef: `receipt:${commit}:passed` }],
+          acceptanceCriteria: ["Marks uncertain after confirmation window"],
+        },
+      },
+    });
+    assert.ok(!unlabelledRes.isError, JSON.stringify(unlabelledRes.content));
+    const unlabelledEnvelope = JSON.parse((unlabelledRes.content as Array<{ text: string }>)[0]!.text) as HandoffResultEnvelopeV2;
+    assert.equal(unlabelledEnvelope.lifecycleStatus, "uncertain");
+    assert.equal(unlabelledEnvelope.orchestratorDirective.action, "ESCALATE_TO_HUMAN");
   } finally {
     await client.close();
     fixture.cleanup();

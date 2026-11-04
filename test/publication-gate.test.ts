@@ -89,3 +89,208 @@ test("Fresh verification after restart cannot replace a pending publication's au
   }
   assert.equal(JSON.parse(readFileSync(gate.statePath, "utf8")).rpcCounts["chat.send"], 1);
 });
+
+test("Omitting publisherOwner defaults to remote_gated (unless config overrides defaultPublisherOwner) and mid-handoff updatedLocalRepoPath binds worktree", async (t) => {
+  const fixture = createTempGitFixture();
+  const baseSha = fixture.commitFile("README.md", "base\n", "base");
+  fixture.git(["push", "origin", "main"]);
+
+  const worktreeDir = join(fixture.rootDir, "mid-handoff-wt");
+  fixture.git(["worktree", "add", "-b", "robo/feature", worktreeDir, "HEAD"]);
+  const featureSha = fixture.commitFile("src/feature.ts", "export const v = 2;\n", "feature", worktreeDir);
+  const featureTree = fixture.revParse("HEAD^{tree}", worktreeDir);
+  fixture.git(["push", "origin", "robo/feature"], worktreeDir);
+
+  const statePath = join(fixture.rootDir, "gateway.json");
+  const originalEnv = process.env.FAKE_GATEWAY_STATE_FILE;
+  process.env.FAKE_GATEWAY_STATE_FILE = statePath;
+  writeFileSync(
+    statePath,
+    JSON.stringify({
+      queuedTurnReplies: [
+        {
+          replyText:
+            "```handoff-result\n" +
+            JSON.stringify({
+              disposition: "needs_evidence",
+              summaryDelta: "Need candidate branch pushed.",
+              blockers: ["Push candidate branch"],
+              claimedChecks: [],
+            }) +
+            "\n```",
+        },
+        {
+          replyText:
+            "```handoff-result\n" +
+            JSON.stringify({
+              disposition: "ready_for_publish_gate",
+              candidateRef: "refs/heads/robo/feature",
+              candidateCommitSha: featureSha,
+              summaryDelta: "Verified feature branch.",
+              blockers: [],
+              claimedChecks: [],
+            }) +
+            "\n```",
+        },
+        {
+          createdPr: {
+            number: 77,
+            url: "https://github.com/example/repo/pull/77",
+            headRefName: "robo/feature",
+            headRefOid: featureSha,
+          },
+          replyText:
+            "```handoff-result\n" +
+            JSON.stringify({
+              disposition: "completed",
+              candidateRef: "refs/heads/robo/feature",
+              candidateCommitSha: featureSha,
+              prUrl: "https://github.com/example/repo/pull/77",
+              summaryDelta: "Opened draft PR #77 under managed identity.",
+              blockers: [],
+              claimedChecks: [],
+            }) +
+            "\n```",
+        },
+        {
+          replyText:
+            "```handoff-result\n" +
+            JSON.stringify({
+              disposition: "completed",
+              candidateRef: "refs/heads/robo/feature",
+              candidateCommitSha: featureSha,
+              summaryDelta: "Ready for configured local owner.",
+              blockers: [],
+              claimedChecks: [],
+            }) +
+            "\n```",
+        },
+      ],
+      openPrs: [],
+    }),
+  );
+
+  const baseConfig: BridgeConfig = {
+    dataDir: fixture.rootDir,
+    ghCliPath: resolve("test/helpers/fake-gh-cli.mjs"),
+    targets: {
+      robo: {
+        targetId: "robo",
+        url: "https://gateway.example",
+        authMode: "direct-token",
+        agentId: "main",
+        cliPath: resolve("test/helpers/fake-openclaw-cli.mjs"),
+      },
+    },
+  };
+  const service = new BridgeService(baseConfig);
+  const localDefaultService = new BridgeService({ ...baseConfig, defaultPublisherOwner: "local" });
+  t.after(() => {
+    service.close();
+    localDefaultService.close();
+    if (originalEnv === undefined) delete process.env.FAKE_GATEWAY_STATE_FILE;
+    else process.env.FAKE_GATEWAY_STATE_FILE = originalEnv;
+    fixture.cleanup();
+  });
+
+  // Turn 1: publisherOwner AND allowManagedPublishStage AND localRepoPath are omitted -> defaults to remote_gated!
+  const t1 = await service.startHandoff({
+    targetId: "robo",
+    envelope: {
+      schemaVersion: "0.2",
+      requestId: "default-remote-gated-1",
+      workspaceId: "ws",
+      title: "Implement and gate PR under Robo identity",
+      outcome: "Prepare fix and open managed PR after gate.",
+      mode: "implement",
+      gitContext: {
+        repoId: "example/repo",
+        remoteUrlOrPath: fixture.originBareDir,
+        pinnedBaseCommitSha: baseSha,
+      },
+      requestedCapabilities: {
+        allowCodeEdit: true,
+        allowBranchPush: true,
+      },
+      acceptanceCriteria: ["PR opened under managed bot identity"],
+    },
+  });
+  assert.equal(t1.orchestratorDirective.action, "CONTINUE_AUTONOMOUSLY");
+
+  // Invalid updatedLocalRepoPath fails fast before mutating state.
+  await assert.rejects(
+    () =>
+      service.continueHandoff({
+        handoffId: t1.handoffId,
+        intent: "counter_evidence_or_followup",
+        message: "Bad path",
+        updatedLocalRepoPath: join(fixture.rootDir, "does-not-exist"),
+      }),
+    (err: unknown) => err instanceof BridgeError && err.code === "INVALID_INPUT",
+  );
+
+  // Turn 2: bind newly created worktree via updatedLocalRepoPath + new commit/tree -> unlocks AUTHORIZE_REMOTE_PUBLISH!
+  const t2 = await service.continueHandoff({
+    handoffId: t1.handoffId,
+    intent: "counter_evidence_or_followup",
+    message: "Prepared candidate commit in linked worktree.",
+    updatedLocalRepoPath: worktreeDir,
+    updatedSourceCommitSha: featureSha,
+    updatedSourceRemoteRef: "refs/heads/robo/feature",
+    updatedExpectedTreeSha: featureTree,
+  });
+  assert.equal(t2.orchestratorDirective.action, "AUTHORIZE_REMOTE_PUBLISH");
+  assert.equal(t2.observed.treeMatchesExpected, true);
+
+  // updatedLocalRepoPath is rejected on Stage-2 authorize_publish.
+  await assert.rejects(
+    () =>
+      service.continueHandoff({
+        handoffId: t1.handoffId,
+        intent: "authorize_publish",
+        message: "Sneak path change during publish",
+        updatedLocalRepoPath: worktreeDir,
+      }),
+    (err: unknown) => err instanceof BridgeError && err.code === "INVALID_CONTRACT_CONFLICT",
+  );
+
+  // Turn 3: Stage-2 authorize_publish opens and reconciles PR #77.
+  const t3 = await service.continueHandoff({
+    handoffId: t1.handoffId,
+    intent: "authorize_publish",
+    message: "Authorize managed draft PR.",
+  });
+  assert.equal(t3.observed.reconciledPrState, "open_verified");
+  assert.equal(t3.orchestratorDirective.action, "COMPLETE");
+
+  // Reset openPrs so we also prove config-level defaultPublisherOwner="local" override when envelope omits publisherOwner.
+  const gw = JSON.parse(readFileSync(statePath, "utf8"));
+  gw.openPrs = [];
+  writeFileSync(statePath, JSON.stringify(gw));
+
+  const localTurn = await localDefaultService.startHandoff({
+    targetId: "robo",
+    envelope: {
+      schemaVersion: "0.2",
+      requestId: "config-override-local-1",
+      workspaceId: "ws",
+      title: "Config defaultPublisherOwner override",
+      outcome: "Verify candidate for configured local publisher.",
+      mode: "verify_only",
+      gitContext: {
+        repoId: "example/repo",
+        localRepoPath: worktreeDir,
+        remoteUrlOrPath: fixture.originBareDir,
+        pinnedBaseCommitSha: baseSha,
+        pinnedSourceCommitSha: featureSha,
+        sourceRemoteRef: "refs/heads/robo/feature",
+      },
+      requestedCapabilities: {
+        allowCodeEdit: false,
+        allowBranchPush: false,
+      },
+      acceptanceCriteria: ["Returns PUBLISH_LOCALLY"],
+    },
+  });
+  assert.equal(localTurn.orchestratorDirective.action, "PUBLISH_LOCALLY");
+});

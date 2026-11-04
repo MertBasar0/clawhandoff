@@ -82,6 +82,7 @@ export interface BridgeConfig {
   dataDir: string;
   targets: Record<string, BridgeTargetConfig>;
   ghCliPath?: string;
+  defaultPublisherOwner?: PublisherOwner;
   defaultWaitBudgetMs?: number;
   defaultMaxAutonomousTurns?: number;
 }

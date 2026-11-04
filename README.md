@@ -179,13 +179,13 @@ Use `bridge_handoff_abort` for an intentional cancellation. It can cancel a reco
 
 For a task that needs Git verification, configure a repository to fetch from with `gitContext.remoteUrlOrPath` or `gitContext.localRepoPath`. `bridge_verify_git` accepts a `handoffId` and a reachable `candidateRef`. It fetches into an isolated bare mirror without checking out candidate code, running hooks or fetching submodules. It checks the candidate’s ancestry and optional expected tree. `lockedPaths` are protected from changes after `pinnedSourceCommitSha` (or `pinnedBaseCommitSha` if no source commit was supplied), including changes reverted before the tip.
 
-The initial `publisherOwner` determines who can be asked to publish.
+The initial `publisherOwner` determines who can be asked to publish. When omitted from the envelope, the bridge defaults to `remote_gated` (configurable via `defaultPublisherOwner` in `bridge-config.json` or `CLAWHANDOFF_DEFAULT_PUBLISHER_OWNER`).
 
 | `publisherOwner` | Who acts |
 | --- | --- |
+| `remote_gated` (default) | The remote agent prepares the candidate with `allowManagedPublishStage: false` (including any contributor `Co-authored-by:` commit trailer in Stage 1). On `AUTHORIZE_REMOTE_PUBLISH`, call `bridge_handoff_continue` with `intent: "authorize_publish"`, the handoff ID and an authorization message. The bridge rechecks the verified commit before sending the authorization. The remote agent cooperates with this protocol using its existing permissions. |
 | `none` | Use for a report or verification without publication. |
-| `local` | The local assistant publishes the verified candidate when authorized. To enforce a local-only boundary, use a remote worker without publishing credentials or tools. |
-| `remote_gated` | The remote agent prepares the candidate with `allowManagedPublishStage: false`. On `AUTHORIZE_REMOTE_PUBLISH`, call `bridge_handoff_continue` with `intent: "authorize_publish"`, the handoff ID and an authorization message. The bridge rechecks the verified commit before sending the authorization. The remote agent cooperates with this protocol using its existing permissions. |
+| `local` | Opt-in local publication: the local assistant publishes the verified candidate when authorized. To enforce a local-only boundary, use a remote worker without publishing credentials or tools. |
 
 PR reconciliation requires an authenticated GitHub CLI (`gh`) with read access to the repository. The bridge checks an open PR’s exact head. Without a PR URL it requires a unique same-repository match. Verify the destination branch separately when it matters. If a publish might have succeeded, an empty search is insufficient to repeat it safely. Preflight can optionally search for rival PRs when given both `repoId` and `issueQuery`. An empty advisory list can also mean `gh` was unavailable.
 

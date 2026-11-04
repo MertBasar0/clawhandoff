@@ -113,14 +113,14 @@ export const browserTranscriptScript = String.raw`(expectedUrl, turnKey, uuidRou
       !bubble.classList.contains('streaming') &&
       !!group.querySelector(':scope > .chat-group-footer:not([aria-hidden="true"]) .chat-group-footer__meta'));
     const fullMsg = !user && bubble.messageActions && bubble.messageActions.fullMessage;
-    const loading = !!fullMsg && (!fullMsg.state || fullMsg.state.status !== 'loaded') &&
-      !bubble.querySelector('.chat-message-load-error');
+    const loadError = !user && !!bubble.querySelector('.chat-message-load-error');
+    const loading = !!fullMsg && (!fullMsg.state || fullMsg.state.status !== 'loaded') && !loadError;
     // Keep other turns' boundaries without copying their contents out of the browser.
     const ownRequest = user && !group.classList.contains('chat-group--peer') &&
       firstLine === "Bridge-Turn: " + turnKey;
     const sendStatus = ownRequest ? group.querySelector('[data-send-state]') : null;
     const sendState = sendStatus ? (sendStatus.getAttribute('data-send-state') || 'unconfirmed') : '';
-    const reply = !user && settledFooter && !loading && raw.length <= 256000
+    const reply = !user && settledFooter && !loading && !loadError && raw.length <= 256000
       ? replySection(raw, "Bridge-Reply: " + turnKey) : undefined;
     page.messages.push({
       role: user ? 'user' : 'assistant', text: ownRequest ? firstLine : reply ?? '',
@@ -128,6 +128,7 @@ export const browserTranscriptScript = String.raw`(expectedUrl, turnKey, uuidRou
       ...(sendState ? { sendState, ...(sendState !== 'waiting-reconnect' ? { unconfirmed: true } : {}) } : {}),
       ...(!user && !settledFooter ? { settling: true } : {}),
       ...(loading ? { loading: true } : {}),
+      ...(loadError ? { loadError: true } : {}),
     });
   }
   return page;
@@ -148,6 +149,8 @@ export function wrapBrowserPrompt(idempotencyKey: string, prompt: string): strin
 export interface BrowserTurnObservation {
   state: "absent" | "pending" | "running" | "completed" | "uncertain";
   text?: string;
+  /** True when uncertainty comes solely from a brief unlabelled idle gap between tool calls. */
+  transientIdle?: boolean;
 }
 
 interface TranscriptMessage {
@@ -158,6 +161,7 @@ interface TranscriptMessage {
   sendState?: string;
   settling?: boolean;
   loading?: boolean;
+  loadError?: boolean;
 }
 
 export function inspectBrowserTurn(
@@ -191,8 +195,11 @@ export function inspectBrowserTurn(
   const nextUser = later.findIndex(message => message.role === "user");
   const answers = nextUser < 0 ? later : later.slice(0, nextUser);
   let matched: string | undefined;
+  let hasLoadError = false;
   for (const message of answers) {
-    if (message.role !== "assistant" || message.settling || message.loading) continue;
+    if (message.role !== "assistant") continue;
+    if (message.loadError) hasLoadError = true;
+    if (message.settling || message.loading) continue;
     const section = browserReplySection(message.text, reply);
     if (message.ambiguousReply || section === null) return { state: "uncertain" };
     if (section === undefined) continue;
@@ -202,10 +209,12 @@ export function inspectBrowserTurn(
   if (nextUser < 0 && (page.busy || answers.some(message => message.settling || message.loading))) {
     return { state: "running" };
   }
+  if (hasLoadError) return { state: "uncertain" };
   if (matched !== undefined) {
     // The ordinary bridge result parser handles a missing/malformed result conservatively.
     return { state: "completed", text: matched };
   }
-  if (requests.length === 0) return { state: "uncertain" };
-  return { state: nextUser >= 0 || answers.length > 0 ? "uncertain" : "running" };
+  if (nextUser >= 0) return { state: "uncertain" };
+  if (requests.length === 0) return { state: "uncertain", transientIdle: true };
+  return answers.length > 0 ? { state: "uncertain", transientIdle: true } : { state: "running" };
 }

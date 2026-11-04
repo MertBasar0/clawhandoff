@@ -94,12 +94,16 @@ export class ChromeChat {
     }
   }
 
-  private async tool(name: string, args: RecordValue): Promise<RecordValue> {
+  private async tool(name: string, args: RecordValue, allowReconnect = false): Promise<RecordValue> {
     await this.connect();
     // Raw tool errors can include unrelated tabs, URLs, or browser state.
     try {
       const reply = await this.client.callTool({ name, arguments: args }, undefined, { timeout: 75_000 });
-      if (reply.isError || !isRecord(reply.structuredContent) || reply.structuredContent.reconnected === true) {
+      if (
+        reply.isError ||
+        !isRecord(reply.structuredContent) ||
+        (!allowReconnect && reply.structuredContent.reconnected === true)
+      ) {
         throw new Error();
       }
       return reply.structuredContent;
@@ -109,7 +113,7 @@ export class ChromeChat {
   }
 
   private async page(expectedId?: number): Promise<number> {
-    const { pages } = await this.tool("list_pages", {});
+    const { pages } = await this.tool("list_pages", {}, expectedId === undefined);
     const matches = Array.isArray(pages)
       ? pages.filter((entry): entry is RecordValue => isRecord(entry) && this.matchesSessionUrl(entry.url))
       : [];

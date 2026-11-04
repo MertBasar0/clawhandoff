@@ -88,10 +88,10 @@ export function createBridgeMcpServer(service: BridgeService): McpServer {
               "",
               "Mandatory Autonomous Loop Contract:",
               "1. Resolve moving Git refs (`origin/main`, branch names) to exact 40-char commit SHAs before calling `bridge_handoff_start`.",
-              "2. Choose a single `publisherOwner` (`local` by default, or `remote_gated` when managed remote bot identity is required).",
+              "2. Use `publisherOwner: \"remote_gated\"` by default whenever a pull request is part of the goal (or omit `publisherOwner` to inherit the bridge's `remote_gated` default) so the remote agent publishes through the two-step verified gate under its managed identity. Include any contributor `Co-authored-by:` trailer requirement in Stage 1 before the commit SHA is locked. Use `\"none\"` when no PR is requested, or `\"local\"` only when explicitly configured or requested by the user.",
               "3. Never act as a passive message courier. When `orchestratorDirective.action` is:",
               "   - `POLL_ATTACH`: call `bridge_handoff_attach` (do not start a second session).",
-              "   - `CONTINUE_AUTONOMOUSLY`: inspect `reported.blockers` against local commits, builds, and tests. If the objection is a false premise or already satisfied, cite commit-bound proof via `bridge_handoff_continue`. If a genuine in-scope gap exists, fix/test locally, push the updated ref, and call `bridge_handoff_continue` without pausing to ask the human.",
+              "   - `CONTINUE_AUTONOMOUSLY`: inspect `reported.blockers` against local commits, builds, and tests. If the objection is a false premise or already satisfied, cite commit-bound proof via `bridge_handoff_continue`. If a genuine in-scope gap exists, fix/test locally (passing `updatedLocalRepoPath` if a worktree was created mid-handoff), push the updated ref, and call `bridge_handoff_continue` without pausing to ask the human.",
               "   - `AUTHORIZE_REMOTE_PUBLISH`: `observed` Git verification passed; call `bridge_handoff_continue(intent='authorize_publish')` to unlock Stage-2 managed PR creation for the exact verified commit.",
               "   - `COMPLETE`: present the result and distinguish observed facts from reported checks. `PUBLISH_LOCALLY`: the authorized local owner acts on the exact verified commit. `ESCALATE_TO_HUMAN`: report the specific unresolved decision or blocker.",
             ].join("\n"),
@@ -123,7 +123,7 @@ export function createBridgeMcpServer(service: BridgeService): McpServer {
     {
       title: "Start Durable Agent Handoff",
       description:
-        "Stores the handoff before sending. Gateway targets open a dedicated session; browser targets use the exact open chat configured by the operator. Observes up to waitBudgetMs. Returns `orchestratorDirective` separating `reported` claims from `observed` Git/PR facts.",
+        "Stores the handoff before sending. `envelope.publisherOwner` defaults to `remote_gated` (or configured `defaultPublisherOwner`) unless overridden. Gateway targets open a dedicated session; browser targets use the exact open chat configured by the operator. Observes up to waitBudgetMs. Returns `orchestratorDirective` separating `reported` claims from `observed` Git/PR facts.",
       inputSchema: StartHandoffInputSchema.shape,
     },
     async (args) => {
@@ -157,7 +157,7 @@ export function createBridgeMcpServer(service: BridgeService): McpServer {
     {
       title: "Continue Handoff or Authorize Stage-2 Publish",
       description:
-        "Sends counter-evidence, updated pinned Git coordinates, or Stage-2 `authorize_publish` approval into the same remote session (`single-flight` serialized).",
+        "Sends counter-evidence, updated pinned Git coordinates (`updatedSourceCommitSha`, `updatedSourceRemoteRef`, `updatedLocalRepoPath`), or Stage-2 `authorize_publish` approval into the same remote session (`single-flight` serialized).",
       inputSchema: ContinueHandoffInputSchema.shape,
     },
     async (args) => {

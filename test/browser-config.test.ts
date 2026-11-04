@@ -103,3 +103,36 @@ test("32-hex UUID browser session routes tolerate display-slug replacement witho
     false,
   );
 });
+
+test("loadBridgeConfig defaults defaultPublisherOwner to remote_gated and honors file or env overrides", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "bridge-pub-default-"));
+  const prevEnv = process.env.CLAWHANDOFF_DEFAULT_PUBLISHER_OWNER;
+  t.after(() => {
+    if (prevEnv === undefined) delete process.env.CLAWHANDOFF_DEFAULT_PUBLISHER_OWNER;
+    else process.env.CLAWHANDOFF_DEFAULT_PUBLISHER_OWNER = prevEnv;
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  delete process.env.CLAWHANDOFF_DEFAULT_PUBLISHER_OWNER;
+  assert.equal(loadBridgeConfig().defaultPublisherOwner, "remote_gated");
+
+  const cfgPath = join(directory, "config.json");
+  const target = {
+    transport: "browser",
+    targetId: "robo",
+    agentId: "roboclaw",
+    sessionUrl: `${team}/chat/roboclaw/4f99c346fa5d4daea8d9ba738d8bae4d`,
+    browserMcp: { command: "node" },
+  };
+  writeFileSync(cfgPath, JSON.stringify({ targets: { robo: target } }));
+  assert.equal(loadBridgeConfig(cfgPath).defaultPublisherOwner, "remote_gated");
+
+  process.env.CLAWHANDOFF_DEFAULT_PUBLISHER_OWNER = "local";
+  assert.equal(loadBridgeConfig(cfgPath).defaultPublisherOwner, "local");
+
+  writeFileSync(cfgPath, JSON.stringify({ defaultPublisherOwner: "none", targets: { robo: target } }));
+  assert.equal(loadBridgeConfig(cfgPath).defaultPublisherOwner, "none");
+
+  process.env.CLAWHANDOFF_DEFAULT_PUBLISHER_OWNER = "invalid-owner";
+  assert.throws(() => loadBridgeConfig(cfgPath), /CLAWHANDOFF_DEFAULT_PUBLISHER_OWNER/);
+});

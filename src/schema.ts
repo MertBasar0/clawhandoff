@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { BridgeError, type HandoffEnvelopeV2 } from "./types.js";
+import { BridgeError, type HandoffEnvelopeV2, type PublisherOwner } from "./types.js";
 
 const HEX_SHA_40 = /^[0-9a-fA-F]{40}$/;
 const noNullBytes = (value: string) => !value.includes("\0");
@@ -9,6 +9,14 @@ const safeText = (min: number, max: number) =>
 export const Sha40Schema = z
   .string()
   .regex(HEX_SHA_40, "Must be a resolved 40-character hexadecimal Git SHA (not a moving branch or tag ref).");
+
+export const PublisherOwnerSchema = z.enum(["none", "local", "remote_gated"]);
+const WaitBudgetMsSchema = z
+  .number()
+  .int()
+  .min(0)
+  .max(120_000)
+  .describe("Milliseconds to wait for turn completion before returning POLL_ATTACH (0-120000).");
 
 export function normalizeLockedPath(rawPath: string): string {
   const trimmed = rawPath.trim().replace(/\\/g, "/").replace(/^\.\/+/, "");
@@ -28,7 +36,9 @@ export const HandoffEnvelopeV2Schema = z.object({
   title: safeText(3, 160),
   outcome: safeText(10, 4_000),
   mode: z.enum(["investigate", "implement", "verify_only", "publish_unchanged"]),
-  publisherOwner: z.enum(["none", "local", "remote_gated"]),
+  publisherOwner: PublisherOwnerSchema.optional().describe(
+    'Defaults to bridge defaultPublisherOwner ("remote_gated" unless configured otherwise). Use "none" when no PR is requested or "local" when local publication is explicitly requested.',
+  ),
   gitContext: z.object({
     repoId: safeText(1, 200),
     localRepoPath: safeText(1, 1_024).optional(),
@@ -42,7 +52,10 @@ export const HandoffEnvelopeV2Schema = z.object({
   requestedCapabilities: z.object({
     allowCodeEdit: z.boolean(),
     allowBranchPush: z.boolean(),
-    allowManagedPublishStage: z.boolean(),
+    allowManagedPublishStage: z
+      .boolean()
+      .default(false)
+      .describe("Must be false on initial handoff creation; Stage-2 publish unlocks via bridge_handoff_continue(intent='authorize_publish')."),
   }),
   advisoryInstructions: z
     .array(
@@ -66,7 +79,10 @@ export const HandoffEnvelopeV2Schema = z.object({
   acceptanceCriteria: z.array(safeText(1, 1_000)).min(1).max(30),
 });
 
-export function validateAndNormalizeEnvelope(input: unknown): HandoffEnvelopeV2 {
+export function validateAndNormalizeEnvelope(
+  input: unknown,
+  defaultPublisherOwner: PublisherOwner = "remote_gated",
+): HandoffEnvelopeV2 {
   const parsed = HandoffEnvelopeV2Schema.safeParse(input);
   if (!parsed.success) {
     throw new BridgeError(
@@ -75,6 +91,7 @@ export function validateAndNormalizeEnvelope(input: unknown): HandoffEnvelopeV2 
     );
   }
   const env = parsed.data;
+  const publisherOwner: PublisherOwner = env.publisherOwner ?? defaultPublisherOwner;
 
   // Reject silent capability/mode contradictions explicitly per RFC v0.2 Section 5.1.
   if (
@@ -105,7 +122,7 @@ export function validateAndNormalizeEnvelope(input: unknown): HandoffEnvelopeV2 
     );
   }
 
-  if (env.mode === "publish_unchanged" && env.publisherOwner === "none") {
+  if (env.mode === "publish_unchanged" && publisherOwner === "none") {
     throw new BridgeError(
       "INVALID_CONTRACT_CONFLICT",
       'Mode "publish_unchanged" requires publisherOwner to be "local" or "remote_gated".',
@@ -118,6 +135,7 @@ export function validateAndNormalizeEnvelope(input: unknown): HandoffEnvelopeV2 
 
   return {
     ...env,
+    publisherOwner,
     gitContext: {
       ...env.gitContext,
       pinnedBaseCommitSha: env.gitContext.pinnedBaseCommitSha.toLowerCase(),
@@ -141,19 +159,22 @@ export const StartHandoffInputSchema = z.object({
     .string()
     .regex(/^[a-zA-Z0-9._-]{2,64}$/)
     .optional(),
-  waitBudgetMs: z.number().int().min(0).max(120_000).optional(),
+  waitBudgetMs: WaitBudgetMsSchema.optional(),
   maxAutonomousTurns: z.number().int().min(1).max(15).optional(),
 });
 
 export const AttachHandoffInputSchema = z.object({
   handoffId: z.string().min(1).max(128),
-  waitBudgetMs: z.number().int().min(0).max(120_000).optional(),
+  waitBudgetMs: WaitBudgetMsSchema.optional(),
 });
 
 export const ContinueHandoffInputSchema = z.object({
   handoffId: safeText(1, 128),
   intent: z.enum(["counter_evidence_or_followup", "authorize_publish"]),
   message: safeText(1, 8_000),
+  updatedLocalRepoPath: safeText(1, 1_024)
+    .optional()
+    .describe("Local repository or git worktree path created mid-handoff for local object borrowing and tree verification."),
   updatedSourceCommitSha: Sha40Schema.optional(),
   updatedSourceRemoteRef: safeText(1, 256).optional(),
   updatedExpectedTreeSha: Sha40Schema.optional(),
@@ -166,7 +187,7 @@ export const ContinueHandoffInputSchema = z.object({
     )
     .max(30)
     .optional(),
-  waitBudgetMs: z.number().int().min(0).max(120_000).optional(),
+  waitBudgetMs: WaitBudgetMsSchema.optional(),
 });
 
 export const VerifyGitInputSchema = z.object({

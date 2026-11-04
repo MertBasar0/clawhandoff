@@ -2,7 +2,9 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
-import { BridgeError, type BridgeConfig, type GatewayTargetConfig } from "./types.js";
+import { BridgeError, type BridgeConfig, type GatewayTargetConfig, type PublisherOwner } from "./types.js";
+
+const PublisherOwnerConfigSchema = z.enum(["none", "local", "remote_gated"]);
 
 const GatewayTargetSchema = z.object({
   transport: z.literal("gateway").optional(),
@@ -107,14 +109,29 @@ const BrowserTargetSchema = z.object({
 const BridgeConfigFileSchema = z.object({
   dataDir: z.string().min(1).optional(),
   ghCliPath: z.string().min(1).optional(),
+  defaultPublisherOwner: PublisherOwnerConfigSchema.optional(),
   defaultWaitBudgetMs: z.number().int().min(0).max(120_000).optional(),
   defaultMaxAutonomousTurns: z.number().int().min(1).max(15).optional(),
   targets: z.record(z.string(), z.union([BrowserTargetSchema, GatewayTargetSchema])),
 });
 
+function resolveEnvPublisherOwner(): PublisherOwner | undefined {
+  const raw = process.env.CLAWHANDOFF_DEFAULT_PUBLISHER_OWNER;
+  if (raw === undefined || raw === "") return undefined;
+  const parsed = PublisherOwnerConfigSchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new BridgeError(
+      "INVALID_INPUT",
+      `Invalid CLAWHANDOFF_DEFAULT_PUBLISHER_OWNER "${raw}". Expected "remote_gated", "local", or "none".`,
+    );
+  }
+  return parsed.data;
+}
+
 export function loadBridgeConfig(explicitConfigPath?: string): BridgeConfig {
   const defaultDataDir =
     process.env.CLAWHANDOFF_DATA_DIR ?? join(homedir(), ".clawhandoff");
+  const envPublisherOwner = resolveEnvPublisherOwner();
 
   const configPath = explicitConfigPath ?? process.env.CLAWHANDOFF_CONFIG_PATH;
   if (configPath) {
@@ -135,6 +152,7 @@ export function loadBridgeConfig(explicitConfigPath?: string): BridgeConfig {
     return {
       dataDir: parsed.data.dataDir ?? defaultDataDir,
       ghCliPath: parsed.data.ghCliPath ?? process.env.CLAWHANDOFF_GH_CLI,
+      defaultPublisherOwner: parsed.data.defaultPublisherOwner ?? envPublisherOwner ?? "remote_gated",
       defaultWaitBudgetMs: parsed.data.defaultWaitBudgetMs,
       defaultMaxAutonomousTurns: parsed.data.defaultMaxAutonomousTurns,
       targets: parsed.data.targets,
@@ -164,6 +182,7 @@ export function loadBridgeConfig(explicitConfigPath?: string): BridgeConfig {
   return {
     dataDir: defaultDataDir,
     ghCliPath: process.env.CLAWHANDOFF_GH_CLI,
+    defaultPublisherOwner: envPublisherOwner ?? "remote_gated",
     targets,
   };
 }

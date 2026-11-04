@@ -240,6 +240,7 @@ export class BridgeStore {
     kind: TurnKind;
     idempotencyKey: string;
     promptText: string;
+    updatedLocalRepoPath?: string;
     updatedSourceCommitSha?: string;
     updatedSourceRemoteRef?: string;
     updatedExpectedTreeSha?: string;
@@ -268,11 +269,22 @@ export class BridgeStore {
       for (const item of params.evidenceRefs ?? []) {
         evidence.set(item.sourceRef.trim(), { ...item, sourceRef: item.sourceRef.trim() });
       }
-      const envelope = { ...session.envelope, priorEvidence: [...evidence.values()] };
+      const envelope: HandoffEnvelopeV2 = {
+        ...session.envelope,
+        gitContext: {
+          ...session.envelope.gitContext,
+          ...(params.updatedLocalRepoPath ? { localRepoPath: params.updatedLocalRepoPath } : {}),
+          ...(params.updatedSourceCommitSha ? { pinnedSourceCommitSha: params.updatedSourceCommitSha } : {}),
+          ...(params.updatedSourceRemoteRef ? { sourceRemoteRef: params.updatedSourceRemoteRef } : {}),
+          ...(params.updatedExpectedTreeSha ? { expectedTreeSha: params.updatedExpectedTreeSha } : {}),
+        },
+        priorEvidence: [...evidence.values()],
+      };
       this.db
         .prepare(
           `UPDATE handoff_sessions
            SET envelope_json = ?, lifecycle_status = 'running',
+               local_repo_path = COALESCE(?, local_repo_path),
                pinned_source_commit_sha = COALESCE(?, pinned_source_commit_sha),
                source_remote_ref = COALESCE(?, source_remote_ref),
                expected_tree_sha = COALESCE(?, expected_tree_sha),
@@ -281,6 +293,7 @@ export class BridgeStore {
         )
         .run(
           JSON.stringify(envelope),
+          params.updatedLocalRepoPath ?? null,
           params.updatedSourceCommitSha ?? null,
           params.updatedSourceRemoteRef ?? null,
           params.updatedExpectedTreeSha ?? null,

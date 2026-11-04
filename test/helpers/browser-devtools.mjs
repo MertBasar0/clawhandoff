@@ -12,9 +12,15 @@ const server = new McpServer({ name: "fixture-chrome", version: "1" });
 const result = (structuredContent) => ({ structuredContent, content: [] });
 const page = { pageId: z.literal(7) };
 
-server.registerTool("list_pages", { inputSchema: {} }, async () => result({
-  pages: [{ id: 7, url: load().sessionUrl }, { id: 19, url: "https://example.invalid/unrelated" }],
-}));
+server.registerTool("list_pages", { inputSchema: {} }, async () => {
+  const state = load();
+  const reconnected = Boolean(state.reconnectedOnNextListPages);
+  if (reconnected) save({ ...state, reconnectedOnNextListPages: false });
+  return result({
+    pages: [{ id: 7, url: state.sessionUrl }, { id: 19, url: "https://example.invalid/unrelated" }],
+    ...(reconnected ? { reconnected: true } : {}),
+  });
+});
 server.registerTool("take_snapshot", { inputSchema: page }, async () => {
   const { sessionUrl, draft, locale, remoteResponding, questionLabel } = load();
   const de = locale === "de";
@@ -54,15 +60,48 @@ server.registerTool("click", { inputSchema: { ...page, uid: z.literal("1_2") } }
   if (state.messages.length === 2) return { isError: true, content: [{ type: "text", text: "click acknowledgement lost" }] };
   return result({});
 });
-server.registerTool("evaluate_script", { inputSchema: { ...page, function: z.string(), waitForStableDom: z.literal(false) } }, async () => {
-  const { sessionUrl: url, messages, draft, locale, remoteResponding } = load();
+server.registerTool("evaluate_script", { inputSchema: { ...page, function: z.string(), waitForStableDom: z.literal(false) } }, async ({ function: fnSource }) => {
+  const state = load();
+  if (state.reconnectedOnNextEvaluate) {
+    save({ ...state, reconnectedOnNextEvaluate: false });
+    return result({ reconnected: true, message: "" });
+  }
+  const { sessionUrl: url, messages, draft, locale, remoteResponding } = state;
+  let visibleMessages = messages;
+  let busy = Boolean(remoteResponding);
+  const isTurnRead = fnSource.includes('"idem_');
+  if (isTurnRead && typeof state.preambleFlickerStage === "number" && state.preambleFlickerStage > 0) {
+    const stage = state.preambleFlickerStage;
+    save({ ...state, preambleFlickerStage: stage - 1 });
+    if (stage === 2) {
+      // Stage 2 (Turn Poll #1): assistant emitted an unlabelled preamble bubble and busy briefly flickered false!
+      visibleMessages = [
+        ...messages.slice(0, -1),
+        { role: "assistant", text: "I will inspect the commit and run checks now." },
+      ];
+      busy = false;
+    } else if (stage === 1) {
+      // Stage 1 (Turn Poll #2): next tool call is actively streaming (`busy: true`).
+      visibleMessages = [
+        ...messages.slice(0, -1),
+        { role: "assistant", text: "I will inspect the commit and run checks now." },
+      ];
+      busy = true;
+    }
+  } else if (isTurnRead && state.unlabelledFinalReply) {
+    visibleMessages = [
+      ...messages.slice(0, -1),
+      { role: "assistant", text: "Finished without a Bridge-Reply marker." },
+    ];
+    busy = false;
+  }
   const de = locale === "de";
   const controls = {
     composerLabel: de ? "Nachricht eingeben" : "Chat composer",
     sendLabel: draft ? (de ? "Nachricht senden" : "Send message") : (de ? "Zuerst eine Nachricht eingeben" : "Write a message first"),
-    stopLabel: remoteResponding ? (de ? "Generierung stoppen" : "Stop generating") : "",
+    stopLabel: busy ? (de ? "Generierung stoppen" : "Stop generating") : "",
   };
-  const projection = { url, ready: true, busy: Boolean(remoteResponding), controls, messages: messages.map(({ role, text }) => ({
+  const projection = { url, ready: true, busy, controls, messages: visibleMessages.map(({ role, text }) => ({
     role, text: role === "user" ? text.split("\n", 1)[0] : text,
   })) };
   return result({ message: `Script ran on page and returned:\n\`\`\`json\n${JSON.stringify(projection)}\n\`\`\`` });
