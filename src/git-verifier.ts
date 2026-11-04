@@ -53,6 +53,7 @@ export class GitVerifier {
     localRepoPath?: string;
     candidateRef: string;
     pinnedBaseCommitSha: string;
+    pinnedSourceCommitSha?: string;
     expectedTreeSha?: string;
     lockedPaths?: readonly string[];
     existingPrState?: ReconciledPrState;
@@ -63,6 +64,7 @@ export class GitVerifier {
       localRepoPath,
       candidateRef,
       pinnedBaseCommitSha,
+      pinnedSourceCommitSha,
       expectedTreeSha,
       lockedPaths = [],
       existingPrState = "none",
@@ -70,16 +72,20 @@ export class GitVerifier {
     } = params;
 
     const normalizedLocks = lockedPaths.map(normalizeLockedPath);
+    const lockBaseSha = pinnedSourceCommitSha ?? pinnedBaseCommitSha;
     const mirrorDir = await this.ensureBareMirror(remoteUrlOrPath);
     const tempRef = `refs/bridge/verify/${randomUUID()}`;
     const notes: string[] = [];
 
     try {
-      // Seed base commit from localRepoPath if provided, then from remote if missing.
-      if (localRepoPath && isLocalPath(localRepoPath)) {
-        await this.ensureCommitPresent(mirrorDir, localRepoPath, pinnedBaseCommitSha);
+      // The PR base and handed-off source have different roles: local fixes before
+      // the handoff are allowed, while subsequent remote edits remain locked.
+      for (const sha of new Set([pinnedBaseCommitSha, lockBaseSha])) {
+        if (localRepoPath && isLocalPath(localRepoPath)) {
+          await this.ensureCommitPresent(mirrorDir, localRepoPath, sha);
+        }
+        await this.ensureCommitPresent(mirrorDir, remoteUrlOrPath, sha);
       }
-      await this.ensureCommitPresent(mirrorDir, remoteUrlOrPath, pinnedBaseCommitSha);
 
       const remoteIsLocal = isLocalPath(remoteUrlOrPath);
       try {
@@ -120,7 +126,7 @@ export class GitVerifier {
         .toLowerCase();
 
       const baseExists = await this.hasCommit(mirrorDir, pinnedBaseCommitSha);
-      let baseIsAncestor: boolean | undefined;
+      let baseIsAncestor = false;
       if (baseExists) {
         baseIsAncestor = await this.isAncestor(mirrorDir, pinnedBaseCommitSha, observedHeadSha);
         if (!baseIsAncestor) {
@@ -130,7 +136,18 @@ export class GitVerifier {
         }
       } else {
         notes.push(
-          `Pinned base commit ${pinnedBaseCommitSha} could not be fetched into isolated mirror; lockedPaths range check cannot be completed.`,
+          `Pinned base commit ${pinnedBaseCommitSha} could not be fetched into isolated mirror.`,
+        );
+      }
+
+      const lockBaseIsAncestor =
+        lockBaseSha === pinnedBaseCommitSha
+          ? baseIsAncestor
+          : (await this.hasCommit(mirrorDir, lockBaseSha)) &&
+            (await this.isAncestor(mirrorDir, lockBaseSha, observedHeadSha));
+      if (!lockBaseIsAncestor && lockBaseSha !== pinnedBaseCommitSha) {
+        notes.push(
+          `Pinned source commit ${lockBaseSha} is unavailable or is not an ancestor of candidate head ${observedHeadSha}.`,
         );
       }
 
@@ -147,16 +164,16 @@ export class GitVerifier {
       let violatedPaths: string[] | undefined;
       let inspectedCommitCount = 0;
 
-      if (normalizedLocks.length === 0) {
-        lockedPathsClean = true;
-        violatedPaths = [];
-      } else if (!baseExists) {
+      if (!baseIsAncestor || !lockBaseIsAncestor) {
         lockedPathsClean = false;
+        violatedPaths = [];
+      } else if (normalizedLocks.length === 0) {
+        lockedPathsClean = true;
         violatedPaths = [];
       } else {
         const violated = new Set<string>();
 
-        // 1) Direct tree-to-tree comparison between pinned base and candidate head.
+        // 1) Compare the handed-off source with the candidate head.
         const netDiffOut = await this.runGit(
           mirrorDir,
           [
@@ -164,22 +181,23 @@ export class GitVerifier {
             "--no-ext-diff",
             "--no-textconv",
             "--name-only",
+            "-z",
             "-r",
-            pinnedBaseCommitSha,
+            lockBaseSha,
             observedHeadSha,
           ],
           false,
         );
-        for (const file of splitLines(netDiffOut)) {
+        for (const file of netDiffOut.split("\0").filter(Boolean)) {
           if (matchesLockedPath(file, normalizedLocks)) {
             violated.add(file);
           }
         }
 
-        // 2) Inspect EVERY commit in pinnedBase..observedHead so modify-then-revert is also caught.
+        // 2) Inspect post-handoff commits so modify-then-revert is also caught.
         const revListOut = await this.runGit(
           mirrorDir,
-          ["rev-list", `${pinnedBaseCommitSha}..${observedHeadSha}`],
+          ["rev-list", `${lockBaseSha}..${observedHeadSha}`],
           false,
         );
         const commits = splitLines(revListOut);
@@ -194,6 +212,7 @@ export class GitVerifier {
               "--no-ext-diff",
               "--no-textconv",
               "--name-only",
+              "-z",
               "-r",
               "-m",
               "--root",
@@ -201,7 +220,7 @@ export class GitVerifier {
             ],
             false,
           );
-          for (const file of splitLines(commitDiffOut)) {
+          for (const file of commitDiffOut.split("\0").filter(Boolean)) {
             if (matchesLockedPath(file, normalizedLocks)) {
               violated.add(file);
             }
@@ -209,10 +228,10 @@ export class GitVerifier {
         }
 
         violatedPaths = Array.from(violated).sort();
-        lockedPathsClean = violatedPaths.length === 0 && baseIsAncestor === true;
+        lockedPathsClean = violatedPaths.length === 0;
         if (violatedPaths.length > 0) {
           notes.push(
-            `Locked paths modified across base..head (${inspectedCommitCount} commit(s) inspected): ${violatedPaths.join(", ")}`,
+            `Locked paths modified after handoff source (${inspectedCommitCount} commit(s) inspected): ${violatedPaths.join(", ")}`,
           );
         }
       }

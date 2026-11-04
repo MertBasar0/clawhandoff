@@ -17,7 +17,7 @@ export interface GatewayCreateSessionResponse {
 }
 
 export interface GatewayWaitObservation {
-  state: "completed" | "running" | "failed";
+  state: "completed" | "running" | "failed" | "not_found";
   terminalReplyText?: string;
   errorMessage?: string;
 }
@@ -26,11 +26,15 @@ export interface GatewayHistoryMessage {
   id?: string;
   runId?: string;
   role: "user" | "assistant" | "other";
+  finalAnswer?: boolean;
   text: string;
 }
 
 export interface GatewayHistorySnapshot {
-  sessionStatus?: string;
+  sessionKey?: string;
+  sessionId?: string;
+  acceptedRunId?: string;
+  lastTerminalRun?: { id: string; status: string };
   messages: GatewayHistoryMessage[];
 }
 
@@ -96,6 +100,7 @@ export class OpenClawGatewayClient {
   }
 
   async createSession(params: {
+    key?: string;
     agentId: string;
     label: string;
     message: string;
@@ -105,6 +110,7 @@ export class OpenClawGatewayClient {
     worktreeName?: string;
   }): Promise<GatewayCreateSessionResponse> {
     const rpcParams: Record<string, unknown> = {
+      ...(params.key ? { key: params.key } : {}),
       agentId: params.agentId,
       label: params.label,
       message: params.message,
@@ -214,6 +220,9 @@ export class OpenClawGatewayClient {
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      if (err instanceof BridgeError && err.code === "TARGET_UNAVAILABLE" && /agent run was not found/i.test(msg)) {
+        return { state: "not_found" };
+      }
       if (/CLIENT_TIMEOUT|AGENT_TIMEOUT|timed out/i.test(msg)) {
         return { state: "running" };
       }
@@ -263,19 +272,17 @@ export class OpenClawGatewayClient {
     return { state: "running" };
   }
 
-  async readHistory(sessionKey: string, limit = 20): Promise<GatewayHistorySnapshot> {
+  async readHistory(sessionKey: string, sessionId?: string, inputRunId?: string): Promise<GatewayHistorySnapshot> {
     const res = await this.callRpc("chat.history", {
       sessionKey,
       agentId: this.target.agentId,
-      limit,
+      ...(sessionId ? { sessionId } : {}),
+      ...(inputRunId ? { inputRunIds: [inputRunId] } : {}),
+      limit: 50,
       maxChars: 32_000,
       maxBytes: 512_000,
     });
 
-    const sessionInfo =
-      res.sessionInfo && typeof res.sessionInfo === "object"
-        ? (res.sessionInfo as Record<string, unknown>)
-        : undefined;
     const rawMessages = Array.isArray(res.messages) ? res.messages : [];
 
     const messages: GatewayHistoryMessage[] = rawMessages.map((raw) => {
@@ -296,28 +303,40 @@ export class OpenClawGatewayClient {
           : typeof m.id === "string"
             ? m.id
             : undefined;
-      const runId =
-        typeof meta?.runId === "string"
-          ? meta.runId
-          : typeof m.runId === "string"
-            ? m.runId
-            : undefined;
-      return { id, runId, role, text };
+      // OpenClaw persists each submitted user message with the exact "<runId>:user" key.
+      const userKey = meta?.idempotencyKey ?? m.idempotencyKey;
+      const userRunId = role === "user" && typeof userKey === "string" && userKey.endsWith(":user")
+        ? userKey.slice(0, -5) : undefined;
+      const runId = userRunId || (typeof meta?.runId === "string" ? meta.runId : undefined);
+      return { id, runId, role, text, finalAnswer: role === "assistant" && m.stopReason === "stop" && meta?.truncated !== true };
     });
 
+    const accepted = inputRunId && Array.isArray(res.inputReceipts) && res.inputReceipts.some(
+      (r) => r?.runId === inputRunId && (r.state === "consumed" || (r.state === "pending" && r.cancelled !== true)),
+    );
+    const info = res.sessionInfo && typeof res.sessionInfo === "object"
+      ? res.sessionInfo as Record<string, unknown> : undefined;
+    // The row projects the latest terminal run; an archived history page may carry a different current row.
+    const lastTerminalRun = info && info.sessionId === res.sessionId && info.hasActiveRun === false &&
+      typeof info.lastRunId === "string" && typeof info.status === "string" &&
+      ["done", "failed", "timeout", "killed", "interrupted"].includes(info.status)
+      ? { id: info.lastRunId, status: info.status } : undefined;
     return {
-      sessionStatus:
-        typeof sessionInfo?.status === "string" ? sessionInfo.status : undefined,
+      lastTerminalRun,
+      sessionKey: typeof res.sessionKey === "string" ? res.sessionKey : undefined,
+      sessionId: typeof res.sessionId === "string" ? res.sessionId : undefined,
+      acceptedRunId: accepted ? inputRunId : undefined,
       messages,
     };
   }
 
-  async abortRun(sessionKey: string, runId?: string): Promise<void> {
-    await this.callRpc("chat.abort", {
+  async abortRun(sessionKey: string, runId: string): Promise<boolean> {
+    const result = await this.callRpc("chat.abort", {
       sessionKey,
       agentId: this.target.agentId,
-      ...(runId ? { runId } : {}),
+      runId,
     });
+    return result.aborted === true && Array.isArray(result.runIds) && result.runIds.includes(runId);
   }
 
   private ensureIsolatedProfile(): string {

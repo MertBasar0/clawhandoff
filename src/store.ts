@@ -1,6 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { BridgeError } from "./types.js";
 import type {
   DispatchState,
   HandoffEnvelopeV2,
@@ -55,7 +56,6 @@ CREATE TABLE IF NOT EXISTS handoff_turns (
   run_id TEXT,
   prompt_text TEXT NOT NULL,
   create_params_json TEXT,
-  baseline_message_count INTEGER NOT NULL DEFAULT 0,
   raw_reply_text TEXT,
   reported_json TEXT,
   observed_json TEXT,
@@ -190,9 +190,9 @@ export class BridgeStore {
         .prepare(
           `INSERT INTO handoff_turns (
             turn_id, handoff_id, turn_number, kind, idempotency_key, dispatch_state,
-            run_id, prompt_text, create_params_json, baseline_message_count,
+            run_id, prompt_text, create_params_json,
             created_at, updated_at
-          ) VALUES (?, ?, 1, 'initial', ?, 'dispatch_pending', NULL, ?, ?, 0, ?, ?)`,
+          ) VALUES (?, ?, 1, 'initial', ?, 'prepared', NULL, ?, ?, ?, ?)`,
         )
         .run(
           t.turnId,
@@ -228,18 +228,38 @@ export class BridgeStore {
     kind: TurnKind;
     idempotencyKey: string;
     promptText: string;
-    baselineMessageCount: number;
     updatedSourceCommitSha?: string;
     updatedSourceRemoteRef?: string;
     updatedExpectedTreeSha?: string;
+    evidenceRefs?: HandoffEnvelopeV2["priorEvidence"];
     markPublishInFlight?: boolean;
+    authorizedHead?: { ref: string; sha: string };
     now: string;
   }): void {
     this.withTransaction(() => {
+      const session = this.getSession(params.handoffId);
+      const latest = this.getLatestTurn(params.handoffId);
+      if (!session || !latest || latest.turnNumber + 1 !== params.turnNumber ||
+          (session.lifecycleStatus !== "settled" && session.lifecycleStatus !== "failed")) {
+        throw new BridgeError("BUSY_ACTIVE_TURN", "The handoff changed during preparation. Attach to its latest turn.");
+      }
+      if (params.authorizedHead) {
+        const ledger = this.getPublicationLedger(params.handoffId);
+        if (ledger.attempted || ledger.prState !== "none" || ledger.headRef !== params.authorizedHead.ref ||
+            session.verifiedPublishHeadSha !== params.authorizedHead.sha ||
+            latest.directive?.action !== "AUTHORIZE_REMOTE_PUBLISH") {
+          throw new BridgeError("PUBLISH_GATE_BLOCKED", "The verified publication changed during preparation. Reconcile the current turn.");
+        }
+      }
+      const evidence = new Map(session.envelope.priorEvidence.map((item) => [item.sourceRef, item]));
+      for (const item of params.evidenceRefs ?? []) {
+        evidence.set(item.sourceRef.trim(), { ...item, sourceRef: item.sourceRef.trim() });
+      }
+      const envelope = { ...session.envelope, priorEvidence: [...evidence.values()] };
       this.db
         .prepare(
           `UPDATE handoff_sessions
-           SET lifecycle_status = 'running',
+           SET envelope_json = ?, lifecycle_status = 'running',
                pinned_source_commit_sha = COALESCE(?, pinned_source_commit_sha),
                source_remote_ref = COALESCE(?, source_remote_ref),
                expected_tree_sha = COALESCE(?, expected_tree_sha),
@@ -247,6 +267,7 @@ export class BridgeStore {
            WHERE handoff_id = ?`,
         )
         .run(
+          JSON.stringify(envelope),
           params.updatedSourceCommitSha ?? null,
           params.updatedSourceRemoteRef ?? null,
           params.updatedExpectedTreeSha ?? null,
@@ -258,9 +279,9 @@ export class BridgeStore {
         .prepare(
           `INSERT INTO handoff_turns (
             turn_id, handoff_id, turn_number, kind, idempotency_key, dispatch_state,
-            run_id, prompt_text, create_params_json, baseline_message_count,
+            run_id, prompt_text, create_params_json,
             created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, 'dispatch_pending', NULL, ?, NULL, ?, ?, ?)`,
+          ) VALUES (?, ?, ?, ?, ?, 'prepared', NULL, ?, NULL, ?, ?)`,
         )
         .run(
           params.turnId,
@@ -269,7 +290,6 @@ export class BridgeStore {
           params.kind,
           params.idempotencyKey,
           params.promptText,
-          params.baselineMessageCount,
           params.now,
           params.now,
         );
@@ -286,7 +306,21 @@ export class BridgeStore {
     });
   }
 
-  recordInitialDispatched(params: {
+  // Claim before I/O: a crash after this point means acceptance is unknown, never safe to replay.
+  claimDispatch(handoffId: string, turnId: string): boolean {
+    return this.withTransaction(() => {
+      const changed = this.db.prepare(
+        "UPDATE handoff_turns SET dispatch_state = 'uncertain' WHERE turn_id = ? AND dispatch_state = 'prepared'",
+      ).run(turnId).changes;
+      if (changed) {
+        this.db.prepare("UPDATE handoff_sessions SET lifecycle_status = 'uncertain' WHERE handoff_id = ?")
+          .run(handoffId);
+      }
+      return changed === 1;
+    });
+  }
+
+  recordDispatched(params: {
     handoffId: string;
     turnId: string;
     remoteSessionKey: string;
@@ -296,6 +330,8 @@ export class BridgeStore {
     now: string;
   }): void {
     this.withTransaction(() => {
+      const current = this.getLatestTurn(params.handoffId);
+      if (current?.turnId !== params.turnId || (current.dispatchState !== "uncertain" && current.dispatchState !== "dispatch_pending")) return;
       this.db
         .prepare(
           `UPDATE handoff_sessions
@@ -327,61 +363,23 @@ export class BridgeStore {
     });
   }
 
-  recordFollowupDispatched(params: {
-    handoffId: string;
-    turnId: string;
-    runId: string;
-    now: string;
-  }): void {
-    this.withTransaction(() => {
-      this.db
-        .prepare(
-          `UPDATE handoff_sessions
-           SET lifecycle_status = 'running', updated_at = ?
-           WHERE handoff_id = ?`,
-        )
-        .run(params.now, params.handoffId);
-
-      this.db
-        .prepare(
-          `UPDATE handoff_turns
-           SET dispatch_state = 'dispatched',
-               run_id = ?,
-               error_text = NULL,
-               updated_at = ?
-           WHERE turn_id = ?`,
-        )
-        .run(params.runId, params.now, params.turnId);
-    });
-  }
-
   markTurnUncertain(params: {
     handoffId: string;
     turnId: string;
     errorText: string;
-    remoteSessionKey?: string;
-    remoteSessionId?: string;
-    remoteSessionUrl?: string;
     now: string;
   }): void {
     this.withTransaction(() => {
+      const current = this.getLatestTurn(params.handoffId);
+      if (current?.turnId !== params.turnId || current.dispatchState === "settled" ||
+          current.dispatchState === "failed" || current.dispatchState === "aborted") return;
       this.db
         .prepare(
           `UPDATE handoff_sessions
-           SET lifecycle_status = 'uncertain',
-               remote_session_key = COALESCE(?, remote_session_key),
-               remote_session_id = COALESCE(?, remote_session_id),
-               remote_session_url = COALESCE(?, remote_session_url),
-               updated_at = ?
+           SET lifecycle_status = 'uncertain', updated_at = ?
            WHERE handoff_id = ?`,
         )
-        .run(
-          params.remoteSessionKey ?? null,
-          params.remoteSessionId ?? null,
-          params.remoteSessionUrl ?? null,
-          params.now,
-          params.handoffId,
-        );
+        .run(params.now, params.handoffId);
 
       this.db
         .prepare(
@@ -410,13 +408,15 @@ export class BridgeStore {
     now: string;
   }): void {
     this.withTransaction(() => {
+      const current = this.getLatestTurn(params.handoffId);
+      if (current?.turnId !== params.turnId || (current.dispatchState !== "dispatched" && current.dispatchState !== "uncertain")) return;
       this.db
         .prepare(
           `UPDATE handoff_sessions
            SET lifecycle_status = ?,
                same_blocker_streak = ?,
                last_blocker_fingerprint = ?,
-               verified_publish_head_sha = COALESCE(?, verified_publish_head_sha),
+               verified_publish_head_sha = ?,
                updated_at = ?
            WHERE handoff_id = ?`,
         )
@@ -452,26 +452,7 @@ export class BridgeStore {
           params.turnId,
         );
 
-      this.db
-        .prepare(
-          `UPDATE publication_ledger
-           SET head_ref = COALESCE(?, head_ref),
-               head_sha = COALESCE(?, head_sha),
-               tree_sha = COALESCE(?, tree_sha),
-               pr_state = ?,
-               pr_url = COALESCE(?, pr_url),
-               updated_at = ?
-           WHERE handoff_id = ?`,
-        )
-        .run(
-          params.headRef ?? null,
-          params.observed.observedHeadSha ?? null,
-          params.observed.observedTreeSha ?? null,
-          params.observed.reconciledPrState,
-          params.observed.reconciledPrUrl ?? null,
-          params.now,
-          params.handoffId,
-        );
+      this.recordPublicationObservation(params);
     });
   }
 
@@ -485,6 +466,11 @@ export class BridgeStore {
     now: string;
   }): void {
     this.withTransaction(() => {
+      const latest = this.getLatestTurn(params.handoffId);
+      if (params.turnId && (latest?.turnId !== params.turnId ||
+          (latest.dispatchState !== "settled" && latest.dispatchState !== "failed"))) {
+        throw new BridgeError("BUSY_ACTIVE_TURN", "The handoff advanced while verifying. Attach to its latest turn.");
+      }
       this.db
         .prepare(
           `UPDATE handoff_sessions
@@ -508,47 +494,34 @@ export class BridgeStore {
           );
       }
 
-      this.db
-        .prepare(
-          `UPDATE publication_ledger
-           SET head_ref = COALESCE(?, head_ref),
-               head_sha = COALESCE(?, head_sha),
-               tree_sha = COALESCE(?, tree_sha),
-               pr_state = ?,
-               pr_url = COALESCE(?, pr_url),
-               updated_at = ?
-           WHERE handoff_id = ?`,
-        )
-        .run(
-          params.headRef ?? null,
-          params.observed.observedHeadSha ?? null,
-          params.observed.observedTreeSha ?? null,
-          params.observed.reconciledPrState,
-          params.observed.reconciledPrUrl ?? null,
-          params.now,
-          params.handoffId,
-        );
+      this.recordPublicationObservation(params);
     });
   }
 
-  markAborted(handoffId: string, latestTurnId: string | undefined, reason: string, now: string): void {
-    this.withTransaction(() => {
-      this.db
-        .prepare(
-          `UPDATE handoff_sessions
-           SET lifecycle_status = 'aborted', updated_at = ?
-           WHERE handoff_id = ?`,
-        )
-        .run(now, handoffId);
+  private recordPublicationObservation(params: {
+    handoffId: string; headRef?: string; observed: ObservedResult; now: string;
+  }): void {
+    // Once authorization was sent, reconcile against its pinned ref/SHA, even if the branch moves.
+    const { attempted } = this.getPublicationLedger(params.handoffId);
+    this.db.prepare(`UPDATE publication_ledger SET head_ref = COALESCE(?, head_ref),
+      head_sha = COALESCE(?, head_sha), tree_sha = COALESCE(?, tree_sha),
+      pr_state = ?, pr_url = ?, updated_at = ? WHERE handoff_id = ?`).run(
+      attempted ? null : params.headRef ?? null,
+      attempted ? null : params.observed.observedHeadSha ?? null,
+      attempted ? null : params.observed.observedTreeSha ?? null,
+      params.observed.reconciledPrState, params.observed.reconciledPrUrl ?? null,
+      params.now, params.handoffId,
+    );
+  }
 
-      if (latestTurnId) {
-        this.db
-          .prepare(
-            `UPDATE handoff_turns
-             SET dispatch_state = 'aborted', error_text = ?, updated_at = ?
-             WHERE turn_id = ?`,
-          )
-          .run(reason, now, latestTurnId);
+  markAborted(handoffId: string, turnId: string, reason: string, now: string): void {
+    this.withTransaction(() => {
+      const changed = this.db.prepare(
+        "UPDATE handoff_turns SET dispatch_state = 'aborted', error_text = ?, updated_at = ? WHERE turn_id = ? AND dispatch_state = 'dispatched'",
+      ).run(reason, now, turnId).changes;
+      if (changed) {
+        this.db.prepare("UPDATE handoff_sessions SET lifecycle_status = 'aborted', updated_at = ? WHERE handoff_id = ?")
+          .run(now, handoffId);
       }
     });
   }
@@ -581,14 +554,17 @@ export class BridgeStore {
     prUrl?: string;
     headRef?: string;
     headSha?: string;
+    attempted?: boolean;
   } {
     const row = this.db
-      .prepare("SELECT * FROM publication_ledger WHERE handoff_id = ?")
+      .prepare(`SELECT p.*, EXISTS(SELECT 1 FROM handoff_turns t WHERE t.handoff_id = p.handoff_id
+        AND t.kind = 'authorize_publish') AS attempted FROM publication_ledger p WHERE p.handoff_id = ?`)
       .get(handoffId) as RawRow | undefined;
     if (!row) {
       return { prState: "none" };
     }
     return {
+      attempted: row.attempted === 1,
       prState: (row.pr_state as ReconciledPrState) ?? "none",
       prUrl: typeof row.pr_url === "string" ? row.pr_url : undefined,
       headRef: typeof row.head_ref === "string" ? row.head_ref : undefined,
@@ -655,7 +631,6 @@ export class BridgeStore {
       promptText: String(row.prompt_text),
       createParamsJson:
         typeof row.create_params_json === "string" ? row.create_params_json : undefined,
-      baselineMessageCount: Number(row.baseline_message_count),
       rawReplyText: typeof row.raw_reply_text === "string" ? row.raw_reply_text : undefined,
       reported:
         typeof row.reported_json === "string"

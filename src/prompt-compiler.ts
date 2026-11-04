@@ -37,7 +37,7 @@ export function compileInitialHandoffPrompt(params: {
       ? [
           "- Publisher Ownership: `remote_gated` (Two-Step Gate — CURRENT STAGE: Stage 1 `prepare_only`).",
           "- DO NOT open or publish a pull request in this turn (`canOpenPrNow: false`).",
-          "- Push or identify the reachable candidate Git ref and return its exact 40-char `candidateCommitSha` with `disposition: \"ready_for_publish_gate\"`. Managed PR creation is authorized only after the bridge verifies Git tree and locked-path invariants in Stage 2.",
+          "- Push or identify the reachable candidate Git ref and return its exact 40-char `candidateCommitSha` with `disposition: \"ready_for_publish_gate\"`. This is a cooperative publishing instruction, not a change to Gateway permissions. Managed PR creation is authorized only after the bridge verifies Git tree and locked-path invariants in Stage 2.",
         ].join("\n")
       : envelope.publisherOwner === "local"
         ? [
@@ -70,7 +70,7 @@ export function compileInitialHandoffPrompt(params: {
   }
   if (lockedPaths.length > 0) {
     lines.push(
-      `- Locked Paths (must remain untouched across ALL commits in \`base..head\`): ${lockedPaths.map((p) => `\`${p}\``).join(", ")}`,
+      `- Locked Paths (must remain untouched since the pinned source commit (or base when no source is supplied)): ${lockedPaths.map((p) => `\`${p}\``).join(", ")}`,
     );
   }
   lines.push(

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type {
+  HandoffMode,
   LifecycleStatus,
   ObservedResult,
   OrchestratorDirective,
@@ -15,17 +16,31 @@ export interface DirectiveEvaluation {
 
 export function evaluateOrchestratorDirective(params: {
   lifecycleStatus: LifecycleStatus;
+  mode?: HandoffMode;
+  publicationAttempted?: boolean;
   publisherOwner: PublisherOwner;
   turnNumber: number;
   maxAutonomousTurns: number;
   priorSameBlockerStreak: number;
   priorBlockerFingerprint?: string;
   reported?: ReportedResult;
+  evidenceSourceRefs?: readonly string[];
   observed: ObservedResult;
 }): DirectiveEvaluation {
   const remainingTurnBudget = Math.max(0, params.maxAutonomousTurns - params.turnNumber);
 
-  if (params.lifecycleStatus === "running" || params.lifecycleStatus === "uncertain") {
+  if (params.lifecycleStatus === "uncertain") {
+    return {
+      directive: {
+        action: "ESCALATE_TO_HUMAN",
+        reason: "The submission or its result could not be confirmed. Attach checks the recorded session without resending. Reconcile it before starting new work.",
+        remainingTurnBudget,
+      },
+      sameBlockerStreak: params.priorSameBlockerStreak,
+      blockerFingerprint: params.priorBlockerFingerprint,
+    };
+  }
+  if (params.lifecycleStatus === "running") {
     return {
       directive: {
         action: "POLL_ATTACH",
@@ -50,18 +65,33 @@ export function evaluateOrchestratorDirective(params: {
     };
   }
 
+  if (params.observed.reconciledPrState === "uncertain_in_flight" &&
+      (params.reported?.prUrl || params.publicationAttempted)) {
+    return {
+      directive: {
+        action: "ESCALATE_TO_HUMAN",
+        reason: "Publication may already be in flight. Reconcile the recorded PR before taking another action.",
+        remainingTurnBudget,
+      },
+      sameBlockerStreak: params.priorSameBlockerStreak,
+      blockerFingerprint: params.priorBlockerFingerprint,
+    };
+  }
+
   // Contract violation check: observed facts always outrank reported claims.
   if (params.observed.lockedPathsClean === false) {
     const violated = (params.observed.violatedPaths ?? []).join(", ") || "unknown";
-    if (remainingTurnBudget > 0 && params.publisherOwner === "remote_gated") {
+    const fingerprint = `violation:locked:${violated}`;
+    const streak = fingerprint === params.priorBlockerFingerprint ? params.priorSameBlockerStreak + 1 : 1;
+    if (remainingTurnBudget > 0 && streak < 2 && params.publisherOwner === "remote_gated") {
       return {
         directive: {
           action: "CONTINUE_AUTONOMOUSLY",
           reason: `CONTRACT_VIOLATION: Target modified locked path(s) [${violated}] or diverged from pinned base. Do NOT authorize publish. Instruct target via bridge_handoff_continue to reset strictly to the pinned commit/tree, or escalate if intentional.`,
           remainingTurnBudget,
         },
-        sameBlockerStreak: params.priorSameBlockerStreak + 1,
-        blockerFingerprint: `violation:locked:${violated}`,
+        sameBlockerStreak: streak,
+        blockerFingerprint: fingerprint,
       };
     }
     return {
@@ -70,8 +100,8 @@ export function evaluateOrchestratorDirective(params: {
         reason: `CONTRACT_VIOLATION: Target modified locked path(s) [${violated}]. Publication is blocked.`,
         remainingTurnBudget,
       },
-      sameBlockerStreak: params.priorSameBlockerStreak + 1,
-      blockerFingerprint: `violation:locked:${violated}`,
+      sameBlockerStreak: streak,
+      blockerFingerprint: fingerprint,
     };
   }
 
@@ -88,7 +118,7 @@ export function evaluateOrchestratorDirective(params: {
   }
 
   const reported = params.reported;
-  const blockerFingerprint = computeBlockerFingerprint(reported, params.observed);
+  const blockerFingerprint = computeBlockerFingerprint(reported, params.observed, params.evidenceSourceRefs);
   const sameBlockerStreak =
     blockerFingerprint && blockerFingerprint === params.priorBlockerFingerprint
       ? params.priorSameBlockerStreak + 1
@@ -101,7 +131,7 @@ export function evaluateOrchestratorDirective(params: {
       directive: {
         action: "ESCALATE_TO_HUMAN",
         reason:
-          "Stagnation detected: identical blocker repeated across 2 consecutive turns with no new verified commit progress. Surface exact evidence and blocker to the user.",
+          "Stagnation detected: identical blocker repeated across 2 consecutive turns with no new observed commit or submitted evidence reference. Surface exact evidence and blocker to the user.",
         remainingTurnBudget,
       },
       sameBlockerStreak,
@@ -109,38 +139,53 @@ export function evaluateOrchestratorDirective(params: {
     };
   }
 
-  // Already published and verified open.
-  if (params.observed.reconciledPrState === "open_verified") {
-    return {
-      directive: {
-        action: "ESCALATE_TO_HUMAN",
-        reason: `Task settled and pull request is verified open (${params.observed.reconciledPrUrl ?? "URL recorded"}). Present final verified outcome to the user.`,
-        remainingTurnBudget,
-      },
-      sameBlockerStreak: 0,
-      blockerFingerprint: undefined,
-    };
-  }
-
   if (
     reported?.disposition === "ready_for_publish_gate" ||
     reported?.disposition === "completed"
   ) {
+    if (params.publisherOwner !== "none" && params.observed.reachableRefVerified &&
+        params.observed.reconciledPrState === "uncertain_in_flight") {
+      return {
+        directive: {
+          action: "ESCALATE_TO_HUMAN",
+          reason: "Publication is uncertain. Reconcile the existing PR before issuing publication instructions.",
+          remainingTurnBudget,
+        },
+        sameBlockerStreak,
+        blockerFingerprint,
+      };
+    }
+    if (params.publisherOwner !== "none" && params.observed.reachableRefVerified &&
+        (reported.candidateCommitSha || params.publisherOwner === "remote_gated") &&
+        reported.candidateCommitSha?.toLowerCase() !== params.observed.observedHeadSha) {
+      return {
+        directive: {
+          action: remainingTurnBudget > 0 ? "CONTINUE_AUTONOMOUSLY" : "ESCALATE_TO_HUMAN",
+          reason: "The target must confirm the full commit it checked matches the reachable candidate head before publication.",
+          remainingTurnBudget,
+        },
+        sameBlockerStreak,
+        blockerFingerprint,
+      };
+    }
+    // Already published and verified open.
+    if (params.observed.reconciledPrState === "open_verified") {
+      return {
+        directive: {
+          action: "COMPLETE",
+          reason: `Task settled and pull request is verified open (${params.observed.reconciledPrUrl ?? "URL recorded"}). Present final verified outcome to the user.`,
+          remainingTurnBudget,
+        },
+        sameBlockerStreak: 0,
+        blockerFingerprint: undefined,
+      };
+    }
+
     if (params.publisherOwner === "remote_gated") {
-      if (params.observed.reconciledPrState === "uncertain_in_flight") {
-        return {
-          directive: {
-            action: "ESCALATE_TO_HUMAN",
-            reason:
-              "Remote publication state is uncertain_in_flight. Reconcile PR status before attempting any second publication.",
-            remainingTurnBudget,
-          },
-          sameBlockerStreak,
-          blockerFingerprint,
-        };
-      }
       if (
+        remainingTurnBudget > 0 &&
         params.observed.reachableRefVerified &&
+        params.observed.baseIsAncestor === true &&
         params.observed.lockedPathsClean === true
       ) {
         return {
@@ -184,11 +229,13 @@ export function evaluateOrchestratorDirective(params: {
       }
     }
 
-    if (params.publisherOwner === "none") {
+    if (params.publisherOwner === "none" && (params.mode !== "verify_only" ||
+        (params.observed.reachableRefVerified && params.observed.treeMatchesExpected === true &&
+          params.observed.lockedPathsClean === true))) {
       return {
         directive: {
-          action: "ESCALATE_TO_HUMAN",
-          reason: "Investigation/verification completed with publisherOwner='none'. Present verified synthesis to the user.",
+          action: "COMPLETE",
+          reason: "Target reports completion. Check the evidence against the acceptance criteria and present the result; no publication was requested.",
           remainingTurnBudget,
         },
         sameBlockerStreak: 0,
@@ -214,8 +261,9 @@ export function evaluateOrchestratorDirective(params: {
   return {
     directive: {
       action: "CONTINUE_AUTONOMOUSLY",
-      reason:
-        "Target raised an objection, evidence request, or actionable blocker within autonomous turn budget. Do NOT relay raw pushback to the user: verify against pinned local commits/tests, gather proof or apply bounded in-scope fix, and call bridge_handoff_continue on this same handoffId.",
+      reason: params.mode === "verify_only" && reported?.disposition === "completed" && !params.observed.reachableRefVerified
+        ? "No reachable Git candidate was verified. Supply the pinned source or a reachable ref before claiming verification is complete."
+        : "Target raised an objection, evidence request, or actionable blocker within autonomous turn budget. Do NOT relay raw pushback to the user: verify against pinned local commits/tests, gather proof or apply bounded in-scope fix, and call bridge_handoff_continue on this same handoffId.",
       remainingTurnBudget,
     },
     sameBlockerStreak,
@@ -226,6 +274,7 @@ export function evaluateOrchestratorDirective(params: {
 function computeBlockerFingerprint(
   reported: ReportedResult | undefined,
   observed: ObservedResult,
+  evidenceSourceRefs: readonly string[] = [],
 ): string | undefined {
   if (!reported) {
     return undefined;
@@ -243,7 +292,8 @@ function computeBlockerFingerprint(
       normalizedBlockers.length > 0
         ? normalizedBlockers
         : [reported.summaryDelta.trim().toLowerCase().slice(0, 200)],
-    head: observed.observedHeadSha ?? reported.candidateCommitSha ?? "none",
+    head: observed.observedHeadSha ?? "none",
+    evidence: [...new Set(evidenceSourceRefs)].sort(),
   });
   return createHash("sha256").update(payload).digest("hex").slice(0, 24);
 }

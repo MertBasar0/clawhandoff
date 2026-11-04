@@ -6,6 +6,10 @@ const state =
   statePath && existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf8")) : {};
 
 const args = process.argv.slice(2);
+if (state.ghFailure) {
+  process.stderr.write("GitHub request failed\n");
+  process.exit(1);
+}
 if (args[0] === "pr" && args[1] === "list") {
   const headIdx = args.indexOf("--head");
   const searchIdx = args.indexOf("--search");
@@ -14,7 +18,13 @@ if (args[0] === "pr" && args[1] === "list") {
     process.exit(0);
   }
   const head = headIdx >= 0 ? args[headIdx + 1] : undefined;
-  const openPrs = (state.openPrs ?? []).filter((p) => !head || p.headRefName === head);
+  const stateIdx = args.indexOf("--state");
+  const requestedState = stateIdx >= 0 ? args[stateIdx + 1].toUpperCase() : "OPEN";
+  const fields = args[args.indexOf("--json") + 1].split(",");
+  const openPrs = (state.openPrs ?? [])
+    .map((p) => ({ isCrossRepository: false, ...p, state: p.state ?? "OPEN" }))
+    .filter((p) => (!head || p.headRefName === head) && (requestedState === "ALL" || p.state === requestedState))
+    .map((p) => Object.fromEntries(fields.map((key) => [key, p[key]])));
   process.stdout.write(JSON.stringify(openPrs));
   process.exit(0);
 }

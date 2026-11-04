@@ -111,6 +111,21 @@ export class BridgeService {
     };
   }
 
+  private async resolveSourceTree(
+    source: { localRepoPath?: string; remoteUrlOrPath?: string; pinnedBaseCommitSha: string },
+    commit: string,
+  ): Promise<string> {
+    if (source.localRepoPath) return this.gitVerifier.resolveLocalCommitTree(source.localRepoPath, commit);
+    if (source.remoteUrlOrPath) {
+      const pinned = await this.gitVerifier.verifyCandidate({
+        remoteUrlOrPath: source.remoteUrlOrPath, candidateRef: commit,
+        pinnedBaseCommitSha: source.pinnedBaseCommitSha,
+      });
+      if (pinned.baseIsAncestor && pinned.observedTreeSha) return pinned.observedTreeSha;
+    }
+    throw new BridgeError("INVALID_CONTRACT_CONFLICT", "Cannot resolve the pinned source tree from the configured repository.");
+  }
+
   async startHandoff(params: {
     targetId: string;
     envelope: unknown;
@@ -130,17 +145,11 @@ export class BridgeService {
       });
     }
 
-    let expectedTreeSha = normalized.gitContext.expectedTreeSha;
-    if (
-      !expectedTreeSha &&
-      normalized.gitContext.pinnedSourceCommitSha &&
-      normalized.gitContext.localRepoPath
-    ) {
-      expectedTreeSha = await this.gitVerifier.resolveLocalCommitTree(
-        normalized.gitContext.localRepoPath,
-        normalized.gitContext.pinnedSourceCommitSha,
-      );
-    }
+    const source = normalized.gitContext;
+    const immutable = normalized.mode === "publish_unchanged" || normalized.mode === "verify_only";
+    const expectedTreeSha = source.expectedTreeSha ?? (immutable && source.pinnedSourceCommitSha
+      ? await this.resolveSourceTree(source, source.pinnedSourceCommitSha)
+      : undefined);
 
     const envelopeWithTree = {
       ...normalized,
@@ -162,7 +171,9 @@ export class BridgeService {
       envelope: envelopeWithTree,
     });
 
+    const remoteSessionKey = `agent:${target.agentId}:bridge-${handoffId.slice(5)}`;
     const createRpcParams = {
+      key: remoteSessionKey,
       agentId: target.agentId,
       label: envelopeWithTree.title,
       message: promptText,
@@ -190,6 +201,7 @@ export class BridgeService {
       lockedPaths: envelopeWithTree.gitContext.lockedPaths ?? [],
       envelope: envelopeWithTree,
       worktreeName: params.worktreeName,
+      remoteSessionKey,
       lifecycleStatus: "running",
       maxAutonomousTurns,
       sameBlockerStreak: 0,
@@ -222,9 +234,9 @@ export class BridgeService {
     const session = this.requireSession(params.handoffId);
     const latestTurn = this.requireLatestTurn(params.handoffId);
 
+    if (latestTurn.dispatchState === "aborted") return this.buildEnvelopeFromRecords(session, latestTurn);
     if (
       (latestTurn.dispatchState === "settled" ||
-        latestTurn.dispatchState === "aborted" ||
         latestTurn.dispatchState === "failed") &&
       latestTurn.observed &&
       latestTurn.directive
@@ -245,7 +257,7 @@ export class BridgeService {
       const waitBudgetMs = params.waitBudgetMs ?? this.config.defaultWaitBudgetMs ?? 30_000;
       const deadline = Date.now() + waitBudgetMs;
 
-      // Phase 1: Reconcile dispatch_pending or uncertain turns without duplicating work.
+      // Only a prepared intent may be sent; reconcile uncertain submissions by reading.
       let activeSession = this.requireSession(params.handoffId);
       let activeTurn = this.requireLatestTurn(params.handoffId);
 
@@ -255,7 +267,7 @@ export class BridgeService {
         activeTurn = this.requireLatestTurn(params.handoffId);
       }
 
-      if (activeTurn.dispatchState === "failed" || activeTurn.dispatchState === "aborted") {
+      if (activeTurn.dispatchState === "settled" || activeTurn.dispatchState === "failed" || activeTurn.dispatchState === "aborted") {
         return this.buildEnvelopeFromRecords(activeSession, activeTurn);
       }
 
@@ -267,12 +279,17 @@ export class BridgeService {
       let terminalReplyText: string | undefined;
       let runFailedError: string | undefined;
       let runSettled = false;
+      let waitRecordMissing = false;
 
       // Always perform at least one quick observation probe (even when waitBudgetMs === 0).
       do {
         const remaining = deadline - Date.now();
         const sliceMs = waitBudgetMs === 0 ? 150 : Math.max(150, Math.min(25_000, remaining));
         const obs = await client.waitRunSlice(activeTurn.runId, sliceMs);
+        if (obs.state === "not_found") {
+          waitRecordMissing = true;
+          break;
+        }
         if (obs.state === "completed") {
           runSettled = true;
           terminalReplyText = obs.terminalReplyText;
@@ -285,7 +302,28 @@ export class BridgeService {
         }
       } while (Date.now() < deadline);
 
+      // A terminal agent.wait snapshot expires on the Gateway. At most once per attach,
+      // consult its durable projection and bind the answer to this physical session and run.
+      if (!runFailedError && !terminalReplyText && activeSession.remoteSessionId &&
+          (latestTurn.runId || runSettled || waitRecordMissing)) {
+        const history = await client.readHistory(activeSession.remoteSessionKey, activeSession.remoteSessionId);
+        if (history.sessionKey === activeSession.remoteSessionKey && history.sessionId === activeSession.remoteSessionId) {
+          if (!runSettled && history.lastTerminalRun?.id === activeTurn.runId) {
+            runSettled = true;
+            if (history.lastTerminalRun.status !== "done") runFailedError = `Remote run ended with status ${history.lastTerminalRun.status}.`;
+          }
+          if (runSettled && !runFailedError) {
+            terminalReplyText = [...history.messages].reverse()
+              .find((m) => m.finalAnswer && m.runId === activeTurn.runId && m.text.trim())?.text;
+          }
+        }
+      }
       if (!runSettled) {
+        if (waitRecordMissing) {
+          this.store.markTurnUncertain({ handoffId: activeSession.handoffId, turnId: activeTurn.turnId,
+            errorText: "Gateway no longer has this run's wait record or exact terminal history. Inspect the bound session before continuing.", now: new Date().toISOString() });
+          return this.buildRunningOrUncertainResult(this.requireSession(activeSession.handoffId), this.requireLatestTurn(activeSession.handoffId));
+        }
         return this.buildRunningOrUncertainResult(activeSession, activeTurn);
       }
 
@@ -293,7 +331,6 @@ export class BridgeService {
       return await this.finalizeSettledTurn({
         session: activeSession,
         turn: activeTurn,
-        client,
         terminalReplyText,
         runFailedError,
       });
@@ -319,131 +356,183 @@ export class BridgeService {
       );
     }
 
-    const session = this.requireSession(params.handoffId);
-    const latestTurn = this.requireLatestTurn(params.handoffId);
+    this.inFlightMutations.add(params.handoffId);
+    try {
+      const session = this.requireSession(params.handoffId);
+      const latestTurn = this.requireLatestTurn(params.handoffId);
 
-    if (
-      session.lifecycleStatus === "running" ||
-      session.lifecycleStatus === "uncertain" ||
-      latestTurn.dispatchState === "dispatch_pending" ||
-      latestTurn.dispatchState === "dispatched" ||
-      latestTurn.dispatchState === "uncertain"
-    ) {
-      throw new BridgeError(
-        "BUSY_ACTIVE_TURN",
-        `Handoff "${params.handoffId}" has an active or uncertain turn (${latestTurn.dispatchState}). Call bridge_handoff_attach first to reconcile before sending another turn.`,
-      );
-    }
-
-    if (session.lifecycleStatus === "aborted") {
-      throw new BridgeError(
-        "INVALID_CONTRACT_CONFLICT",
-        `Handoff "${params.handoffId}" was aborted and cannot be continued.`,
-      );
-    }
-
-    if (!session.remoteSessionKey) {
-      throw new BridgeError(
-        "TARGET_UNAVAILABLE",
-        `Handoff "${params.handoffId}" has no bound remoteSessionKey.`,
-      );
-    }
-
-    const nextTurnNumber = latestTurn.turnNumber + 1;
-    let promptText: string;
-    let markPublishInFlight = false;
-
-    if (params.intent === "authorize_publish") {
-      if (session.publisherOwner !== "remote_gated") {
-        throw new BridgeError(
-          "PUBLISH_GATE_BLOCKED",
-          `Cannot authorize remote publish because publisherOwner is "${session.publisherOwner}" (expected "remote_gated").`,
-        );
-      }
-
-      const pubLedger = this.store.getPublicationLedger(params.handoffId);
-      if (pubLedger.prState === "open_verified") {
-        throw new BridgeError(
-          "PUBLISH_GATE_BLOCKED",
-          `Pull request is already verified open (${pubLedger.prUrl ?? "recorded"}). Refusing duplicate publish.`,
-        );
-      }
-      if (pubLedger.prState === "uncertain_in_flight") {
-        throw new BridgeError(
-          "RECONCILIATION_UNCERTAIN",
-          "A previous remote publish attempt is still uncertain_in_flight. Reconcile PR state first before issuing another publish authorization.",
-        );
-      }
-
-      const lastObserved = latestTurn.observed;
       if (
-        !session.verifiedPublishHeadSha ||
-        !lastObserved?.reachableRefVerified ||
-        lastObserved.lockedPathsClean === false ||
-        lastObserved.treeMatchesExpected === false ||
-        !lastObserved.observedTreeSha
+        session.lifecycleStatus === "running" ||
+        session.lifecycleStatus === "uncertain" ||
+        latestTurn.dispatchState === "dispatch_pending" ||
+        latestTurn.dispatchState === "dispatched" ||
+        latestTurn.dispatchState === "uncertain"
       ) {
         throw new BridgeError(
-          "CONTRACT_VIOLATION",
-          "Stage-2 managed publish is blocked: candidate commit has not passed checkout-free Git Tree-SHA and lockedPaths verification.",
+          "BUSY_ACTIVE_TURN",
+          `Handoff "${params.handoffId}" has an active or uncertain turn (${latestTurn.dispatchState}). Call bridge_handoff_attach first to reconcile before sending another turn.`,
         );
       }
 
-      const candidateRef =
-        latestTurn.reported?.candidateRef ??
-        pubLedger.headRef ??
-        session.sourceRemoteRef ??
-        session.verifiedPublishHeadSha;
+      if (session.lifecycleStatus === "aborted") {
+        throw new BridgeError(
+          "INVALID_CONTRACT_CONFLICT",
+          `Handoff "${params.handoffId}" was aborted and cannot be continued.`,
+        );
+      }
 
-      promptText = compileAuthorizePublishPrompt({
+      if (!session.remoteSessionKey) {
+        throw new BridgeError(
+          "TARGET_UNAVAILABLE",
+          `Handoff "${params.handoffId}" has no bound remoteSessionKey.`,
+        );
+      }
+
+      const nextTurnNumber = latestTurn.turnNumber + 1;
+      if (nextTurnNumber > session.maxAutonomousTurns) {
+        throw new BridgeError("AUTONOMOUS_BUDGET_EXHAUSTED", "Autonomous turn budget exhausted. Report progress and remaining blockers instead of dispatching another turn.");
+      }
+      let promptText: string;
+      let authorizedHead: { ref: string; sha: string } | undefined;
+
+      if (params.intent === "authorize_publish") {
+        if (session.publisherOwner !== "remote_gated") {
+          throw new BridgeError(
+            "PUBLISH_GATE_BLOCKED",
+            `Cannot authorize remote publish because publisherOwner is "${session.publisherOwner}" (expected "remote_gated").`,
+          );
+        }
+
+        if (params.updatedSourceCommitSha || params.updatedSourceRemoteRef || params.updatedExpectedTreeSha) {
+          throw new BridgeError("INVALID_CONTRACT_CONFLICT", "Submit changed Git coordinates for verification in a separate follow-up before authorizing publication.");
+        }
+        const before = this.store.getPublicationLedger(params.handoffId);
+        const candidateRef = before.headRef ?? latestTurn.reported?.candidateRef ?? session.sourceRemoteRef;
+        if (!candidateRef) {
+          throw new BridgeError("CONTRACT_VIOLATION", "A reachable candidate ref is required before publication.");
+        }
+        const observed = await this.observeCandidate(session, candidateRef, latestTurn.reported?.prUrl);
+        if (observed.reconciledPrState === "open_verified") {
+          throw new BridgeError(
+            "PUBLISH_GATE_BLOCKED",
+            `Pull request is already verified open (${observed.reconciledPrUrl ?? "recorded"}). Refusing duplicate publish.`,
+          );
+        }
+        if (observed.reconciledPrState === "uncertain_in_flight" || before.attempted) {
+          throw new BridgeError(
+            "RECONCILIATION_UNCERTAIN",
+            "A previous remote publish attempt is still uncertain_in_flight. Reconcile PR state first before issuing another publish authorization.",
+          );
+        }
+
+        if (
+          latestTurn.directive?.action !== "AUTHORIZE_REMOTE_PUBLISH" ||
+          !session.verifiedPublishHeadSha || !observed.observedTreeSha ||
+          session.verifiedPublishHeadSha !== this.verifiedHead(session, observed)
+        ) {
+          throw new BridgeError(
+            "CONTRACT_VIOLATION",
+            "Stage-2 managed publish is blocked: candidate commit has not passed checkout-free Git Tree-SHA and lockedPaths verification.",
+          );
+        }
+
+        promptText = compileAuthorizePublishPrompt({
+          handoffId: params.handoffId,
+          turnNumber: nextTurnNumber,
+          verifiedHeadSha: session.verifiedPublishHeadSha,
+          verifiedTreeSha: observed.observedTreeSha,
+          candidateRef,
+          operatorNote: params.message,
+        });
+        authorizedHead = { ref: candidateRef, sha: session.verifiedPublishHeadSha };
+      } else {
+        if (params.updatedExpectedTreeSha && !params.updatedSourceCommitSha) {
+          throw new BridgeError("INVALID_CONTRACT_CONFLICT", "A new expected tree requires its pinned source commit.");
+        }
+        if (params.updatedSourceCommitSha && (session.expectedTreeSha || params.updatedExpectedTreeSha)) {
+          const tree = await this.resolveSourceTree(session, params.updatedSourceCommitSha);
+          if (params.updatedExpectedTreeSha && tree !== params.updatedExpectedTreeSha.toLowerCase()) {
+            throw new BridgeError("INVALID_CONTRACT_CONFLICT", "The submitted tree does not match the new pinned source commit.");
+          }
+          params = { ...params, updatedExpectedTreeSha: tree };
+        }
+        promptText = compileFollowupPrompt({
+          handoffId: params.handoffId,
+          turnNumber: nextTurnNumber,
+          message: params.message,
+          updatedSourceCommitSha: params.updatedSourceCommitSha?.toLowerCase(),
+          updatedSourceRemoteRef: params.updatedSourceRemoteRef,
+          updatedExpectedTreeSha: params.updatedExpectedTreeSha?.toLowerCase(),
+          evidenceRefs: params.evidenceRefs,
+        });
+      }
+
+      const turnId = `turn_${randomUUID()}`;
+      const idempotencyKey = `idem_${randomUUID()}`;
+      const now = new Date().toISOString();
+
+      // Write-ahead followup intent BEFORE network dispatch.
+      this.store.createFollowupIntent({
         handoffId: params.handoffId,
+        turnId,
         turnNumber: nextTurnNumber,
-        verifiedHeadSha: session.verifiedPublishHeadSha,
-        verifiedTreeSha: lastObserved.observedTreeSha,
-        candidateRef,
-        operatorNote: params.message,
-      });
-      markPublishInFlight = true;
-    } else {
-      promptText = compileFollowupPrompt({
-        handoffId: params.handoffId,
-        turnNumber: nextTurnNumber,
-        message: params.message,
+        kind: params.intent === "authorize_publish" ? "authorize_publish" : "continue",
+        idempotencyKey,
+        promptText,
         updatedSourceCommitSha: params.updatedSourceCommitSha?.toLowerCase(),
         updatedSourceRemoteRef: params.updatedSourceRemoteRef,
         updatedExpectedTreeSha: params.updatedExpectedTreeSha?.toLowerCase(),
+        markPublishInFlight: !!authorizedHead,
+        authorizedHead,
         evidenceRefs: params.evidenceRefs,
+        now,
       });
+    } finally {
+      this.inFlightMutations.delete(params.handoffId);
     }
-
-    const { client } = this.getClient(session.targetId);
-    const historySnapshot = await client.readHistory(session.remoteSessionKey, 50);
-    const baselineMessageCount = historySnapshot.messages.length;
-
-    const turnId = `turn_${randomUUID()}`;
-    const idempotencyKey = `idem_${randomUUID()}`;
-    const now = new Date().toISOString();
-
-    // Write-ahead followup intent BEFORE network dispatch.
-    this.store.createFollowupIntent({
-      handoffId: params.handoffId,
-      turnId,
-      turnNumber: nextTurnNumber,
-      kind: params.intent === "authorize_publish" ? "authorize_publish" : "continue",
-      idempotencyKey,
-      promptText,
-      baselineMessageCount,
-      updatedSourceCommitSha: params.updatedSourceCommitSha?.toLowerCase(),
-      updatedSourceRemoteRef: params.updatedSourceRemoteRef,
-      updatedExpectedTreeSha: params.updatedExpectedTreeSha?.toLowerCase(),
-      markPublishInFlight,
-      now,
-    });
 
     return await this.attachHandoff({
       handoffId: params.handoffId,
       waitBudgetMs: params.waitBudgetMs,
     });
+  }
+
+  private verifiedHead(session: SessionRecord, observed: ObservedResult): string | undefined {
+    return observed.reachableRefVerified && observed.baseIsAncestor === true &&
+      observed.lockedPathsClean === true && (!session.expectedTreeSha || observed.treeMatchesExpected === true)
+      ? observed.observedHeadSha : undefined;
+  }
+
+  private async observeCandidate(
+    session: SessionRecord,
+    candidateRef?: string,
+    reportedPrUrl?: string,
+    remoteSource = session.remoteUrlOrPath ?? session.localRepoPath,
+  ): Promise<ObservedResult> {
+    const ledger = this.store.getPublicationLedger(session.handoffId);
+    const git: ObservedResult = candidateRef && remoteSource
+      ? await this.gitVerifier.verifyCandidate({
+          remoteUrlOrPath: remoteSource,
+          localRepoPath: session.localRepoPath,
+          candidateRef,
+          pinnedBaseCommitSha: session.pinnedBaseCommitSha,
+          pinnedSourceCommitSha: session.pinnedSourceCommitSha,
+          expectedTreeSha: session.expectedTreeSha,
+          lockedPaths: session.lockedPaths,
+        })
+      : { reachableRefVerified: false, reconciledPrState: "none" };
+    if (session.publisherOwner === "none" && !reportedPrUrl && !ledger.attempted && !ledger.prUrl) return git;
+
+    const pr = await this.githubReconciler.reconcilePullRequest({
+      repoId: session.repoId,
+      handoffId: session.handoffId,
+      headRef: ledger.attempted ? ledger.headRef : candidateRef,
+      headSha: ledger.attempted ? ledger.headSha : git.observedHeadSha,
+      priorState: ledger.attempted || ledger.prUrl ? ledger.prState : "none",
+      priorUrl: ledger.prUrl,
+      reportedPrUrl,
+    });
+    return { ...git, reconciledPrState: pr.prState, reconciledPrUrl: pr.prUrl };
   }
 
   async verifyGit(params: {
@@ -453,6 +542,9 @@ export class BridgeService {
   }): Promise<HandoffResultEnvelopeV2> {
     const session = this.requireSession(params.handoffId);
     const latestTurn = this.requireLatestTurn(params.handoffId);
+    if (session.lifecycleStatus !== "settled" && session.lifecycleStatus !== "failed") {
+      throw new BridgeError("BUSY_ACTIVE_TURN", "Attach to settle the current turn before updating its verification result.");
+    }
     const remoteSource =
       params.remoteUrlOrPath ?? session.remoteUrlOrPath ?? session.localRepoPath;
 
@@ -463,48 +555,20 @@ export class BridgeService {
       );
     }
 
-    const pubLedger = this.store.getPublicationLedger(params.handoffId);
-    const gitObserved = await this.gitVerifier.verifyCandidate({
-      remoteUrlOrPath: remoteSource,
-      localRepoPath: session.localRepoPath,
-      candidateRef: params.candidateRef,
-      pinnedBaseCommitSha: session.pinnedBaseCommitSha,
-      expectedTreeSha: session.expectedTreeSha,
-      lockedPaths: session.lockedPaths,
-      existingPrState: pubLedger.prState,
-      existingPrUrl: pubLedger.prUrl,
-    });
-
-    const prReconciled = await this.githubReconciler.reconcilePullRequest({
-      repoId: session.repoId,
-      headRef: params.candidateRef,
-      headSha: gitObserved.observedHeadSha,
-      handoffId: session.handoffId,
-      priorState: pubLedger.prState,
-      priorUrl: pubLedger.prUrl,
-      reportedPrUrl: latestTurn.reported?.prUrl,
-    });
-
-    const observed: ObservedResult = {
-      ...gitObserved,
-      reconciledPrState: prReconciled.prState,
-      reconciledPrUrl: prReconciled.prUrl,
-    };
-
-    const verifiedPublishHeadSha =
-      observed.reachableRefVerified &&
-      observed.lockedPathsClean !== false &&
-      observed.treeMatchesExpected !== false
-        ? observed.observedHeadSha
-        : undefined;
+    const observed = await this.observeCandidate(session, params.candidateRef, latestTurn.reported?.prUrl, remoteSource);
+    const verifiedPublishHeadSha = this.verifiedHead(session, observed);
 
     const evaluated = evaluateOrchestratorDirective({
+      mode: session.mode,
+      publicationAttempted: this.store.getPublicationLedger(session.handoffId).attempted,
       lifecycleStatus: session.lifecycleStatus,
       publisherOwner: session.publisherOwner,
       turnNumber: latestTurn.turnNumber,
       maxAutonomousTurns: session.maxAutonomousTurns,
-      priorSameBlockerStreak: session.sameBlockerStreak,
+      // Rechecking this turn is not another response from the target.
+      priorSameBlockerStreak: Math.max(0, session.sameBlockerStreak - 1),
       priorBlockerFingerprint: session.lastBlockerFingerprint,
+      evidenceSourceRefs: session.envelope.priorEvidence.map((item) => item.sourceRef),
       reported: latestTurn.reported,
       observed,
     });
@@ -529,43 +593,19 @@ export class BridgeService {
     reason?: string;
   }): Promise<HandoffResultEnvelopeV2> {
     const session = this.requireSession(params.handoffId);
-    const latestTurn = this.store.getLatestTurn(params.handoffId);
-    const reason = params.reason ?? "Aborted explicitly by local orchestrator.";
-
-    if (session.remoteSessionKey) {
-      const { client } = this.getClient(session.targetId);
-      await client.abortRun(session.remoteSessionKey, latestTurn?.runId);
+    const turn = this.requireLatestTurn(params.handoffId);
+    if (turn.dispatchState === "aborted" || turn.dispatchState === "settled" || turn.dispatchState === "failed") {
+      return this.buildEnvelopeFromRecords(session, turn);
     }
-
-    const now = new Date().toISOString();
-    this.store.markAborted(params.handoffId, latestTurn?.turnId, reason, now);
-
-    const updatedSession = this.requireSession(params.handoffId);
-    const updatedTurn = this.requireLatestTurn(params.handoffId);
-    const pubLedger = this.store.getPublicationLedger(params.handoffId);
-    const observed: ObservedResult = updatedTurn.observed ?? {
-      reachableRefVerified: false,
-      reconciledPrState: pubLedger.prState,
-      reconciledPrUrl: pubLedger.prUrl,
-    };
-
-    return {
-      schemaVersion: "0.2",
-      handoffId: updatedSession.handoffId,
-      targetId: updatedSession.targetId,
-      remoteSessionKey: updatedSession.remoteSessionKey,
-      remoteSessionUrl: updatedSession.remoteSessionUrl,
-      turnNumber: updatedTurn.turnNumber,
-      runId: updatedTurn.runId ?? "unassigned",
-      lifecycleStatus: "aborted",
-      reported: updatedTurn.reported,
-      observed,
-      orchestratorDirective: {
-        action: "ESCALATE_TO_HUMAN",
-        reason,
-        remainingTurnBudget: 0,
-      },
-    };
+    if (!session.remoteSessionKey || !turn.runId) {
+      throw new BridgeError("RECONCILIATION_UNCERTAIN", "Cannot abort without an accepted run ID. Attach to this handoff to reconcile its submission.");
+    }
+    const { client } = this.getClient(session.targetId);
+    if (!await client.abortRun(session.remoteSessionKey, turn.runId)) {
+      throw new BridgeError("RECONCILIATION_UNCERTAIN", "Gateway did not confirm cancellation of this run. Attach to observe its outcome.");
+    }
+    this.store.markAborted(session.handoffId, turn.turnId, params.reason ?? "Aborted by local orchestrator.", new Date().toISOString());
+    return this.buildEnvelopeFromRecords(this.requireSession(session.handoffId), this.requireLatestTurn(session.handoffId));
   }
 
   private async reconcileUndispatchedTurn(
@@ -574,164 +614,92 @@ export class BridgeService {
     target: GatewayTargetConfig,
     client: OpenClawGatewayClient,
   ): Promise<void> {
-    const now = new Date().toISOString();
+    const { handoffId, remoteSessionKey } = session;
+    const { turnId } = turn;
+    const recordUncertain = (errorText: string) =>
+      this.store.markTurnUncertain({ handoffId, turnId, errorText, now: new Date().toISOString() });
+    const recordAccepted = (runId: string, key: string, sessionId?: string) =>
+      this.store.recordDispatched({
+        handoffId, turnId, runId, remoteSessionKey: key, remoteSessionId: sessionId,
+        remoteSessionUrl: buildPrettySessionUrl({ originUrl: target.url, agentId: target.agentId, label: session.title, sessionKey: key }),
+        now: new Date().toISOString(),
+      });
 
-    if (turn.kind === "initial") {
-      if (!turn.createParamsJson) {
-        throw new BridgeError(
-          "INVALID_INPUT",
-          `Initial turn "${turn.turnId}" is missing persisted createParamsJson.`,
-        );
+    // Older 'dispatch_pending' rows predate the pre-I/O claim and may have reached the Gateway.
+    if (turn.dispatchState !== "prepared") {
+      if (!remoteSessionKey) {
+        recordUncertain("The original submission has no recorded session key. Inspect the Gateway before starting another handoff.");
+        return;
       }
-      const createParams = JSON.parse(turn.createParamsJson) as {
-        agentId: string;
-        label: string;
-        message: string;
-        idempotencyKey: string;
-        projectId?: string;
-        worktreeBaseRef?: string;
-        worktreeName?: string;
-      };
-
+      const expectedRunId = turn.kind === "initial" ? undefined : turn.idempotencyKey;
+      let history;
       try {
-        const created = await client.createSession(createParams);
-        const prettyUrl = buildPrettySessionUrl({
-          originUrl: target.url,
-          agentId: target.agentId,
-          label: session.title,
-          sessionKey: created.key,
-        });
-
-        // Per OpenClaw `session-create-initial-turn.ts:99-108`, cached idempotent replay
-        // returns `runStarted: false` while still returning `runId`! Only treat as failed
-        // when `runError` is present and no `runId` exists.
-        if (created.runError && !created.runId) {
-          const observed: ObservedResult = {
-            reachableRefVerified: false,
-            reconciledPrState: "none",
-            verificationNotes: [
-              `Initial turn rejected during sessions.create: ${JSON.stringify(created.runError)}`,
-            ],
-          };
-          this.store.recordInitialDispatched({
-            handoffId: session.handoffId,
-            turnId: turn.turnId,
-            remoteSessionKey: created.key,
-            remoteSessionId: created.sessionId,
-            remoteSessionUrl: prettyUrl,
-            runId: "failed_initial_turn",
-            now,
-          });
-          this.store.settleTurn({
-            handoffId: session.handoffId,
-            turnId: turn.turnId,
-            lifecycleStatus: "failed",
-            dispatchState: "failed",
-            observed,
-            directive: {
-              action: "ESCALATE_TO_HUMAN",
-              reason: `Remote session "${created.key}" was created, but its initial turn failed: ${JSON.stringify(created.runError)}`,
-              remainingTurnBudget: Math.max(0, session.maxAutonomousTurns - 1),
-            },
-            sameBlockerStreak: 0,
-            errorText: JSON.stringify(created.runError),
-            now,
-          });
-          return;
-        }
-
-        if (!created.runId) {
-          this.store.markTurnUncertain({
-            handoffId: session.handoffId,
-            turnId: turn.turnId,
-            remoteSessionKey: created.key,
-            remoteSessionId: created.sessionId,
-            remoteSessionUrl: prettyUrl,
-            errorText:
-              "Gateway sessions.create returned session key without runId; awaiting reconciliation.",
-            now,
-          });
-          return;
-        }
-
-        this.store.recordInitialDispatched({
-          handoffId: session.handoffId,
-          turnId: turn.turnId,
-          remoteSessionKey: created.key,
-          remoteSessionId: created.sessionId,
-          remoteSessionUrl: prettyUrl,
-          runId: created.runId,
-          now,
-        });
+        history = await client.readHistory(remoteSessionKey, session.remoteSessionId, expectedRunId);
       } catch (err) {
-        if (err instanceof BridgeError && err.code === "AUTH_LOGIN_REQUIRED") {
-          this.store.markTurnUncertain({
-            handoffId: session.handoffId,
-            turnId: turn.turnId,
-            errorText: err.message,
-            now,
-          });
-          throw err;
-        }
-        this.store.markTurnUncertain({
-          handoffId: session.handoffId,
-          turnId: turn.turnId,
-          errorText: err instanceof Error ? err.message : String(err),
-          now,
-        });
+        if (!(err instanceof BridgeError) || err.code === "AUTH_LOGIN_REQUIRED") throw err;
+        recordUncertain(`Cannot confirm submission in Gateway history: ${err.message}`);
+        return;
       }
+      // Initial runs use a Gateway-generated UUID; followups use the chat.send idempotency key.
+      // Only the exact stored user submission or an input receipt proves which run was accepted.
+      const matching = history.messages.filter((m) =>
+        m.role === "user" && m.text === turn.promptText && m.runId && (!expectedRunId || m.runId === expectedRunId));
+      const runId = history.acceptedRunId ?? (matching.length === 1 ? matching[0]?.runId : undefined);
+      if (history.sessionKey !== remoteSessionKey || !history.sessionId ||
+          (session.remoteSessionId && session.remoteSessionId !== history.sessionId) || !runId) {
+        recordUncertain("No exact acceptance record for this turn in the bound Gateway session. Inspect the session or attach again when its receipt becomes visible.");
+        return;
+      }
+      recordAccepted(runId, remoteSessionKey, history.sessionId);
       return;
     }
 
-    // Follow-up (`continue` or `authorize_publish`): replay with exact idempotencyKey.
-    if (!session.remoteSessionKey) {
-      throw new BridgeError(
-        "TARGET_UNAVAILABLE",
-        `Cannot dispatch follow-up turn "${turn.turnId}" without remoteSessionKey.`,
-      );
+    // Fail authentication read-only, while the never-submitted intent is still safe to resume.
+    await client.health();
+    const initialParams = turn.kind === "initial" && turn.createParamsJson
+      ? JSON.parse(turn.createParamsJson) as Parameters<OpenClawGatewayClient["createSession"]>[0] : undefined;
+    if (!remoteSessionKey || (turn.kind === "initial" && initialParams?.key !== remoteSessionKey)) {
+      throw new BridgeError("INVALID_INPUT", "Prepared turn has no matching target session key.");
     }
-
+    if (!this.store.claimDispatch(handoffId, turnId)) return;
+    let result;
     try {
-      const sent = await client.sendChat({
-        sessionKey: session.remoteSessionKey,
-        sessionId: session.remoteSessionId,
-        agentId: target.agentId,
-        message: turn.promptText,
-        idempotencyKey: turn.idempotencyKey,
-      });
-      this.store.recordFollowupDispatched({
-        handoffId: session.handoffId,
-        turnId: turn.turnId,
-        runId: sent.runId,
-        now,
+      result = initialParams ? await client.createSession(initialParams) : await client.sendChat({
+        sessionKey: remoteSessionKey, sessionId: session.remoteSessionId,
+        agentId: target.agentId, message: turn.promptText, idempotencyKey: turn.idempotencyKey,
       });
     } catch (err) {
-      if (err instanceof BridgeError && err.code === "AUTH_LOGIN_REQUIRED") {
-        this.store.markTurnUncertain({
-          handoffId: session.handoffId,
-          turnId: turn.turnId,
-          errorText: err.message,
-          now,
-        });
-        throw err;
-      }
-      this.store.markTurnUncertain({
-        handoffId: session.handoffId,
-        turnId: turn.turnId,
-        errorText: err instanceof Error ? err.message : String(err),
-        now,
-      });
+      if (!(err instanceof BridgeError)) throw err;
+      recordUncertain(err.message);
+      if (err.code === "AUTH_LOGIN_REQUIRED") throw err;
+      return;
+    }
+    if ("key" in result && result.key !== remoteSessionKey) {
+      recordUncertain("Gateway returned a different session key than the prepared handoff. Inspect the original submission.");
+      return;
+    }
+    if ("runError" in result && result.runError && !result.runId) {
+      const error = `Gateway rejected the opening turn: ${JSON.stringify(result.runError)}`;
+      this.store.settleTurn({ handoffId, turnId, lifecycleStatus: "failed", dispatchState: "failed",
+        observed: { reachableRefVerified: false, reconciledPrState: "none", verificationNotes: [error] },
+        directive: { action: "ESCALATE_TO_HUMAN", reason: error, remainingTurnBudget: Math.max(0, session.maxAutonomousTurns - 1) },
+        sameBlockerStreak: 0, errorText: error, now: new Date().toISOString() });
+      return;
+    }
+    if (result.runId) {
+      recordAccepted(result.runId, remoteSessionKey, "sessionId" in result ? result.sessionId : session.remoteSessionId);
+    } else {
+      recordUncertain("Gateway returned a session without a run ID. Attach to look for this exact submission.");
     }
   }
 
   private async finalizeSettledTurn(params: {
     session: SessionRecord;
     turn: TurnRecord;
-    client: OpenClawGatewayClient;
     terminalReplyText?: string;
     runFailedError?: string;
   }): Promise<HandoffResultEnvelopeV2> {
-    const { session, turn, client, terminalReplyText, runFailedError } = params;
+    const { session, turn, terminalReplyText: rawReply, runFailedError } = params;
     const now = new Date().toISOString();
     const pubLedger = this.store.getPublicationLedger(session.handoffId);
 
@@ -741,7 +709,7 @@ export class BridgeService {
         headRef: pubLedger.headRef ?? session.sourceRemoteRef,
         headSha: pubLedger.headSha ?? session.pinnedSourceCommitSha,
         handoffId: session.handoffId,
-        priorState: pubLedger.prState,
+        priorState: pubLedger.attempted || pubLedger.prUrl ? pubLedger.prState : "none",
         priorUrl: pubLedger.prUrl,
       });
       const observed: ObservedResult = {
@@ -751,12 +719,14 @@ export class BridgeService {
         verificationNotes: [runFailedError],
       };
       const evalRes = evaluateOrchestratorDirective({
+        mode: session.mode,
         lifecycleStatus: "failed",
         publisherOwner: session.publisherOwner,
         turnNumber: turn.turnNumber,
         maxAutonomousTurns: session.maxAutonomousTurns,
         priorSameBlockerStreak: session.sameBlockerStreak,
         priorBlockerFingerprint: session.lastBlockerFingerprint,
+        evidenceSourceRefs: session.envelope.priorEvidence.map((item) => item.sourceRef),
         observed,
       });
 
@@ -779,81 +749,28 @@ export class BridgeService {
       );
     }
 
-    // Correlate assistant reply strictly to this turn (`runId` match first, then post-baseline slice).
-    let correlatedText = terminalReplyText;
-    if (session.remoteSessionKey) {
-      const history = await client.readHistory(session.remoteSessionKey, 50);
-      const exactRunMatch = [...history.messages]
-        .reverse()
-        .find((m) => m.role === "assistant" && turn.runId && m.runId === turn.runId && m.text.trim());
-
-      if (exactRunMatch) {
-        correlatedText = exactRunMatch.text;
-      } else {
-        const postBaseline = history.messages
-          .slice(turn.baselineMessageCount)
-          .filter((m) => m.role === "assistant" && m.text.trim());
-        if (postBaseline.length > 0) {
-          correlatedText = postBaseline[postBaseline.length - 1]!.text;
-        }
-      }
+    if (!rawReply?.trim()) {
+      this.store.markTurnUncertain({ handoffId: session.handoffId, turnId: turn.turnId,
+        errorText: "Run reached a terminal state, but its exact reply is unavailable. Inspect this Gateway run before continuing.", now });
+      return this.buildRunningOrUncertainResult(this.requireSession(session.handoffId), this.requireLatestTurn(session.handoffId));
     }
-
-    const rawReply = correlatedText ?? "";
     const reported = parseReportedResult(rawReply);
 
-    const candidateRef = reported.candidateRef ?? session.sourceRemoteRef;
-    const remoteSource = session.remoteUrlOrPath ?? session.localRepoPath;
-
-    let observed: ObservedResult = {
-      reachableRefVerified: false,
-      reconciledPrState: pubLedger.prState,
-      reconciledPrUrl: pubLedger.prUrl,
-    };
-
-    if (candidateRef && remoteSource) {
-      observed = await this.gitVerifier.verifyCandidate({
-        remoteUrlOrPath: remoteSource,
-        localRepoPath: session.localRepoPath,
-        candidateRef,
-        pinnedBaseCommitSha: session.pinnedBaseCommitSha,
-        expectedTreeSha: session.expectedTreeSha,
-        lockedPaths: session.lockedPaths,
-        existingPrState: pubLedger.prState,
-        existingPrUrl: pubLedger.prUrl,
-      });
-    }
-
-    const prReconciled = await this.githubReconciler.reconcilePullRequest({
-      repoId: session.repoId,
-      headRef: candidateRef ?? pubLedger.headRef,
-      headSha: observed.observedHeadSha ?? reported.candidateCommitSha,
-      handoffId: session.handoffId,
-      priorState: pubLedger.prState,
-      priorUrl: pubLedger.prUrl,
-      reportedPrUrl: turn.kind === "authorize_publish" ? reported.prUrl : undefined,
-    });
-
-    observed = {
-      ...observed,
-      reconciledPrState: prReconciled.prState,
-      reconciledPrUrl: prReconciled.prUrl,
-    };
-
-    const verifiedPublishHeadSha =
-      observed.reachableRefVerified &&
-      observed.lockedPathsClean !== false &&
-      observed.treeMatchesExpected !== false
-        ? observed.observedHeadSha
-        : undefined;
+    const candidateRef = reported.candidateRef ?? session.sourceRemoteRef ??
+      (session.mode === "verify_only" && session.publisherOwner === "none" ? session.pinnedSourceCommitSha : undefined);
+    const observed = await this.observeCandidate(session, candidateRef, reported.prUrl);
+    const verifiedPublishHeadSha = this.verifiedHead(session, observed);
 
     const evaluated = evaluateOrchestratorDirective({
+      mode: session.mode,
       lifecycleStatus: "settled",
+      publicationAttempted: pubLedger.attempted,
       publisherOwner: session.publisherOwner,
       turnNumber: turn.turnNumber,
       maxAutonomousTurns: session.maxAutonomousTurns,
       priorSameBlockerStreak: session.sameBlockerStreak,
       priorBlockerFingerprint: session.lastBlockerFingerprint,
+      evidenceSourceRefs: session.envelope.priorEvidence.map((item) => item.sourceRef),
       reported,
       observed,
     });
@@ -893,12 +810,14 @@ export class BridgeService {
       ...(turn.errorText ? { verificationNotes: [turn.errorText] } : {}),
     };
     const evaluated = evaluateOrchestratorDirective({
+      mode: session.mode,
       lifecycleStatus: status,
       publisherOwner: session.publisherOwner,
       turnNumber: turn.turnNumber,
       maxAutonomousTurns: session.maxAutonomousTurns,
       priorSameBlockerStreak: session.sameBlockerStreak,
       priorBlockerFingerprint: session.lastBlockerFingerprint,
+      evidenceSourceRefs: session.envelope.priorEvidence.map((item) => item.sourceRef),
       observed,
     });
     return {
@@ -929,12 +848,14 @@ export class BridgeService {
     const directive =
       turn.directive ??
       evaluateOrchestratorDirective({
+        mode: session.mode,
         lifecycleStatus: session.lifecycleStatus,
         publisherOwner: session.publisherOwner,
         turnNumber: turn.turnNumber,
         maxAutonomousTurns: session.maxAutonomousTurns,
         priorSameBlockerStreak: session.sameBlockerStreak,
         priorBlockerFingerprint: session.lastBlockerFingerprint,
+        evidenceSourceRefs: session.envelope.priorEvidence.map((item) => item.sourceRef),
         reported: turn.reported,
         observed,
       }).directive;

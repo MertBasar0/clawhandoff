@@ -150,7 +150,48 @@ test("Crash-Reconnect Acceptance Test: closing and restarting BridgeService mid-
   }
 });
 
-test("Uncertain initial dispatch recovers via idempotencyKey even when cached replay returns runStarted:false", async () => {
+test("Late attach recovers the bound final reply after the Gateway wait cache expires", async (t) => {
+  const dataDir = mkdtempSync(join(tmpdir(), "agent-bridge-late-"));
+  const stateFile = join(dataDir, "gateway.json");
+  const prior = process.env.FAKE_GATEWAY_STATE_FILE;
+  process.env.FAKE_GATEWAY_STATE_FILE = stateFile;
+  writeFileSync(stateFile, JSON.stringify({ queuedTurnReplies: [{ pollsBeforeComplete: 10 }] }));
+  let service = new BridgeService(makeConfig(dataDir));
+  t.after(() => {
+    service.close();
+    if (prior === undefined) delete process.env.FAKE_GATEWAY_STATE_FILE;
+    else process.env.FAKE_GATEWAY_STATE_FILE = prior;
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+  const started = await service.startHandoff({ targetId: "robo", waitBudgetMs: 0, envelope: {
+    schemaVersion: "0.2", requestId: "late", workspaceId: "ws", title: "Review ownership",
+    outcome: "Identify the owner module.", mode: "investigate", publisherOwner: "none",
+    gitContext: { repoId: "example/repo", pinnedBaseCommitSha: "1".repeat(40) },
+    requestedCapabilities: { allowCodeEdit: false, allowBranchPush: false, allowManagedPublishStage: false },
+    acceptanceCriteria: ["Return the owner"],
+  } });
+  service.close();
+  service = new BridgeService(makeConfig(dataDir));
+  const state = JSON.parse(readFileSync(stateFile, "utf8"));
+  const session = state.sessions[started.remoteSessionKey!];
+  delete state.runs[started.runId];
+  const reply = (runId: string, stopReason: string, summaryDelta: string) => ({
+    role: "assistant", __openclaw: { runId }, stopReason, content: formatResultBlock({
+      disposition: "completed", blockers: [], claimedChecks: [], summaryDelta,
+    }),
+  });
+  session.status = "done";
+  session.lastRunId = started.runId;
+  session.messages.push(reply(started.runId, "stop", "bound final"),
+    reply(started.runId, "toolUse", "tool progress"), reply("another-run", "stop", "foreign final"));
+  writeFileSync(stateFile, JSON.stringify(state));
+  const recovered = await service.attachHandoff({ handoffId: started.handoffId, waitBudgetMs: 0 });
+  assert.equal(recovered.lifecycleStatus, "settled");
+  assert.equal(recovered.reported?.summaryDelta, "bound final");
+  assert.equal(JSON.parse(readFileSync(stateFile, "utf8")).rpcCounts["sessions.create"], 1);
+});
+
+test("Lost create response recovers only from exact user custody, even after Gateway idempotency records expire", async () => {
   const fixture = createTempGitFixture();
   const dataDir = mkdtempSync(join(tmpdir(), "agent-bridge-uncertain-"));
   const stateFile = join(dataDir, "fake-gateway-state.json");
@@ -209,10 +250,27 @@ test("Uncertain initial dispatch recovers via idempotencyKey even when cached re
       });
 
       assert.equal(firstAttempt.lifecycleStatus, "uncertain");
-      assert.equal(firstAttempt.orchestratorDirective.action, "POLL_ATTACH");
-
-      // Re-attaching replays `sessions.create` with the identical idempotencyKey;
-      // fake Gateway returns cached session with `runStarted: false` + `runId`!
+      const remote = JSON.parse(readFileSync(stateFile, "utf8"));
+      remote.createIdempotency = {}; // Restart/retention expiry.
+      const [key] = Object.keys(remote.sessions);
+      assert.ok(key);
+      const remoteSession = remote.sessions[key];
+      const userInput = remoteSession.messages[0];
+      const recordedKey = userInput.idempotencyKey;
+      delete userInput.idempotencyKey;
+      // Neither a nearby assistant response nor a user prompt with missing custody proves acceptance.
+      remoteSession.messages.push({role: "assistant", content: "different run", __openclaw: {runId: "foreign"}});
+      writeFileSync(stateFile, JSON.stringify(remote));
+      const unproven = await service.attachHandoff({ handoffId: firstAttempt.handoffId, waitBudgetMs: 0 });
+      const checked = JSON.parse(readFileSync(stateFile, "utf8"));
+      assert.equal(checked.rpcCounts["sessions.create"], 1, "An unacknowledged create must never be replayed");
+      assert.equal(unproven.lifecycleStatus, "uncertain");
+      assert.equal(unproven.orchestratorDirective.action, "ESCALATE_TO_HUMAN");
+      await assert.rejects(service.abortHandoff({ handoffId: firstAttempt.handoffId }), /without an accepted run ID/);
+      assert.equal(checked.rpcCounts["agent.wait"] ?? 0, 0);
+      assert.equal(checked.rpcCounts["chat.abort"] ?? 0, 0);
+      checked.sessions[key].messages[0].idempotencyKey = recordedKey;
+      writeFileSync(stateFile, JSON.stringify(checked));
       const recovered = await service.attachHandoff({
         handoffId: firstAttempt.handoffId,
         waitBudgetMs: 1_000,
@@ -297,8 +355,9 @@ test("Two-Step remote_gated Single-Publisher Gate blocks lockedPaths violations 
               claimedChecks: [{ command: "pnpm typecheck", exitCode: 0, environment: "linux" }],
             }),
           },
-          // Turn 3 (Stage-2 authorize_publish): Remote opens PR!
+          // The PR becomes visible only after the Stage-2 turn runs.
           {
+            createdPr: { number: 42, url: "https://github.com/example/repo/pull/42", headRefName: "robo/clean-branch", headRefOid: cleanSourceSha },
             pollsBeforeComplete: 0,
             replyText: formatResultBlock({
               disposition: "completed",
@@ -381,19 +440,6 @@ test("Two-Step remote_gated Single-Publisher Gate blocks lockedPaths violations 
       assert.equal(turn2.observed.observedHeadSha, cleanSourceSha.toLowerCase());
       assert.equal(turn2.orchestratorDirective.action, "AUTHORIZE_REMOTE_PUBLISH");
 
-      // Simulate `gh pr list` seeing the PR once Stage-2 creates it.
-      const currentState = JSON.parse(readFileSync(stateFile, "utf8")) as Record<string, unknown>;
-      currentState.openPrs = [
-        {
-          number: 42,
-          url: "https://github.com/example/repo/pull/42",
-          headRefName: "robo/clean-branch",
-          headRefOid: cleanSourceSha,
-          body: `Handoff-ID: ${turn1.handoffId}`,
-        },
-      ];
-      writeFileSync(stateFile, JSON.stringify(currentState, null, 2));
-
       // Turn 3: Stage-2 `authorize_publish` succeeds and verifies PR open!
       const turn3 = await service.continueHandoff({
         handoffId: turn1.handoffId,
@@ -403,7 +449,7 @@ test("Two-Step remote_gated Single-Publisher Gate blocks lockedPaths violations 
 
       assert.equal(turn3.observed.reconciledPrState, "open_verified");
       assert.equal(turn3.observed.reconciledPrUrl, "https://github.com/example/repo/pull/42");
-      assert.equal(turn3.orchestratorDirective.action, "ESCALATE_TO_HUMAN");
+      assert.equal(turn3.orchestratorDirective.action, "COMPLETE");
 
       // Any duplicate Stage-2 publish call MUST now be blocked!
       await assert.rejects(
@@ -429,7 +475,7 @@ test("Two-Step remote_gated Single-Publisher Gate blocks lockedPaths violations 
   }
 });
 
-test("Autonomous Counter-Evidence Loop triggers CONTINUE_AUTONOMOUSLY on first objection and escalates on 2-turn stagnation, plus rejects contract conflicts", async () => {
+test("New evidence advances the loop across restart; repeated evidence stagnates and the turn budget is enforced", async () => {
   const fixture = createTempGitFixture();
   const dataDir = mkdtempSync(join(tmpdir(), "agent-bridge-loop-"));
   const stateFile = join(dataDir, "fake-gateway-state.json");
@@ -453,11 +499,12 @@ test("Autonomous Counter-Evidence Loop triggers CONTINUE_AUTONOMOUSLY on first o
         queuedTurnReplies: [
           { pollsBeforeComplete: 0, replyText: repeatedBlockerReply },
           { pollsBeforeComplete: 0, replyText: repeatedBlockerReply },
+          { pollsBeforeComplete: 0, replyText: repeatedBlockerReply },
         ],
       }),
     );
 
-    const service = new BridgeService(makeConfig(dataDir));
+    let service = new BridgeService(makeConfig(dataDir));
     try {
       // Contract conflict: publish_unchanged + allowCodeEdit=true MUST reject explicitly!
       await assert.rejects(
@@ -493,6 +540,7 @@ test("Autonomous Counter-Evidence Loop triggers CONTINUE_AUTONOMOUSLY on first o
       // Turn 1: Remote asks for Windows smoke log -> CONTINUE_AUTONOMOUSLY!
       const t1 = await service.startHandoff({
         targetId: "robo",
+        maxAutonomousTurns: 3,
         envelope: {
           schemaVersion: "0.2",
           requestId: "req-stagnation",
@@ -521,8 +569,11 @@ test("Autonomous Counter-Evidence Loop triggers CONTINUE_AUTONOMOUSLY on first o
       });
 
       assert.equal(t1.orchestratorDirective.action, "CONTINUE_AUTONOMOUSLY");
+      const rechecked = await service.verifyGit({ handoffId: t1.handoffId, candidateRef: "refs/heads/main" });
+      assert.equal(rechecked.orchestratorDirective.action, "CONTINUE_AUTONOMOUSLY");
 
-      // Turn 2: Remote repeats the EXACT same blocker with zero new commit -> ESCALATE_TO_HUMAN (stagnation)!
+
+      // New evidence on the same commit is progress, even if the target repeats its objection.
       const t2 = await service.continueHandoff({
         handoffId: t1.handoffId,
         intent: "counter_evidence_or_followup",
@@ -530,8 +581,22 @@ test("Autonomous Counter-Evidence Loop triggers CONTINUE_AUTONOMOUSLY on first o
         evidenceRefs: [{ claim: "Tray exited 0", sourceRef: `${baseSha}:smoke.log` }],
       });
 
-      assert.equal(t2.orchestratorDirective.action, "ESCALATE_TO_HUMAN");
-      assert.match(t2.orchestratorDirective.reason, /Stagnation detected/i);
+      assert.equal(t2.orchestratorDirective.action, "CONTINUE_AUTONOMOUSLY");
+      service.close();
+      service = new BridgeService(makeConfig(dataDir));
+      const t3 = await service.continueHandoff({
+        handoffId: t1.handoffId,
+        intent: "counter_evidence_or_followup",
+        message: "Re-sending the same evidence is not progress.",
+        evidenceRefs: [{ claim: "Reworded claim", sourceRef: `${baseSha}:smoke.log` }],
+      });
+      assert.equal(t3.orchestratorDirective.action, "ESCALATE_TO_HUMAN");
+      assert.match(t3.orchestratorDirective.reason, /Stagnation detected/i);
+      await assert.rejects(service.continueHandoff({
+        handoffId: t1.handoffId, intent: "counter_evidence_or_followup",
+        message: "This exceeds the three-turn budget.",
+      }), (err: unknown) => err instanceof BridgeError && /turn budget/i.test(err.message));
+
     } finally {
       service.close();
     }

@@ -93,7 +93,7 @@ export function createBridgeMcpServer(service: BridgeService): McpServer {
               "   - `POLL_ATTACH`: call `bridge_handoff_attach` (do not start a second session).",
               "   - `CONTINUE_AUTONOMOUSLY`: inspect `reported.blockers` against local commits, builds, and tests. If the objection is a false premise or already satisfied, cite commit-bound proof via `bridge_handoff_continue`. If a genuine in-scope gap exists, fix/test locally, push the updated ref, and call `bridge_handoff_continue` without pausing to ask the human.",
               "   - `AUTHORIZE_REMOTE_PUBLISH`: `observed` Git verification passed; call `bridge_handoff_continue(intent='authorize_publish')` to unlock Stage-2 managed PR creation for the exact verified commit.",
-              "   - `PUBLISH_LOCALLY` or `ESCALATE_TO_HUMAN`: surface to the user ONLY on verified completion, out-of-scope product/policy/auth gates, contract violation, or stagnation (`sameBlockerStreak >= 2`).",
+              "   - `COMPLETE`: present the result and distinguish observed facts from reported checks. `PUBLISH_LOCALLY`: the authorized local owner acts on the exact verified commit. `ESCALATE_TO_HUMAN`: report the specific unresolved decision or blocker.",
             ].join("\n"),
           },
         },
@@ -174,7 +174,7 @@ export function createBridgeMcpServer(service: BridgeService): McpServer {
     {
       title: "Checkout-Free Git Object Verification",
       description:
-        "Fetches a candidate Git ref into an isolated bare mirror without checkout or hooks, verifying `pinnedBaseCommitSha` ancestry, `expectedTreeSha`, and `lockedPaths` across every commit in `base..head`.",
+        "Fetches a candidate Git ref into an isolated bare mirror without checkout or hooks, verifying `pinnedBaseCommitSha` ancestry, `expectedTreeSha`, and `lockedPaths` since the pinned source commit (or base when no source is supplied).",
       inputSchema: VerifyGitInputSchema.shape,
     },
     async (args) => {

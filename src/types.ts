@@ -8,7 +8,8 @@ export type BridgeErrorCode =
   | "CONTRACT_VIOLATION"
   | "PUBLISH_GATE_BLOCKED"
   | "GIT_VERIFICATION_FAILED"
-  | "RECONCILIATION_UNCERTAIN";
+  | "RECONCILIATION_UNCERTAIN"
+  | "AUTONOMOUS_BUDGET_EXHAUSTED";
 
 export class BridgeError extends Error {
   public readonly code: BridgeErrorCode;
@@ -40,6 +41,7 @@ export type LifecycleStatus =
 export type TurnKind = "initial" | "continue" | "authorize_publish";
 
 export type DispatchState =
+  | "prepared"
   | "dispatch_pending"
   | "dispatched"
   | "settled"
@@ -143,6 +145,7 @@ export interface ObservedResult {
 }
 
 export type OrchestratorAction =
+  | "COMPLETE"
   | "POLL_ATTACH"
   | "CONTINUE_AUTONOMOUSLY"
   | "AUTHORIZE_REMOTE_PUBLISH"
@@ -209,7 +212,6 @@ export interface TurnRecord {
   runId?: string;
   promptText: string;
   createParamsJson?: string;
-  baselineMessageCount: number;
   rawReplyText?: string;
   reported?: ReportedResult;
   observed?: ObservedResult;

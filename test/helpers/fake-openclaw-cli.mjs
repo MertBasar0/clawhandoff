@@ -81,7 +81,7 @@ switch (method) {
       break;
     }
 
-    const sessionKey = `agent:${params.agentId ?? "main"}:${randomUUID()}`;
+    const sessionKey = params.key ?? `agent:${params.agentId ?? "main"}:${randomUUID()}`;
     const sessionId = `sid_${randomUUID()}`;
     const runId = `run_${randomUUID()}`;
     const queuedReply = (state.queuedTurnReplies ?? []).shift() ?? {
@@ -100,6 +100,7 @@ switch (method) {
         {
           id: `msg_u_${randomUUID()}`,
           role: "user",
+          idempotencyKey: `${runId}:user`,
           content: params.message,
         },
       ],
@@ -110,6 +111,7 @@ switch (method) {
       sessionKey,
       pollsRemaining: queuedReply.pollsBeforeComplete ?? 0,
       replyText: queuedReply.replyText,
+      createdPr: queuedReply.createdPr,
       failError: queuedReply.failError ?? null,
       completed: false,
       aborted: false,
@@ -185,7 +187,7 @@ switch (method) {
       break;
     }
 
-    const runId = `run_${randomUUID()}`;
+    const runId = params.idempotencyKey;
     const queuedReply = (state.queuedTurnReplies ?? []).shift() ?? {
       pollsBeforeComplete: 0,
       replyText: "Default follow-up reply",
@@ -194,6 +196,7 @@ switch (method) {
     s.messages.push({
       id: `msg_u_${randomUUID()}`,
       role: "user",
+      idempotencyKey: `${runId}:user`,
       content: params.message,
     });
     s.status = "running";
@@ -203,6 +206,7 @@ switch (method) {
       sessionKey: s.key,
       pollsRemaining: queuedReply.pollsBeforeComplete ?? 0,
       replyText: queuedReply.replyText,
+      createdPr: queuedReply.createdPr,
       failError: queuedReply.failError ?? null,
       completed: false,
       aborted: false,
@@ -228,7 +232,7 @@ switch (method) {
     const run = state.runs[params.runId];
     if (!run) {
       save();
-      process.stdout.write(JSON.stringify({ ok: false, error: "Run not found" }));
+      process.stdout.write(JSON.stringify({ runId: params.runId, status: "timeout" }));
       break;
     }
     if (run.aborted) {
@@ -277,6 +281,7 @@ switch (method) {
 
     if (!run.completed) {
       run.completed = true;
+      if (run.createdPr) (state.openPrs ??= []).push(run.createdPr);
       const s = state.sessions[run.sessionKey];
       if (s) {
         s.status = "idle";
@@ -318,7 +323,9 @@ switch (method) {
     process.stdout.write(
       JSON.stringify({
         ok: true,
-        sessionInfo: { status: s.status },
+        sessionKey: s.key,
+        sessionId: s.sessionId,
+        sessionInfo: { sessionId: s.sessionId, status: s.status, lastRunId: s.lastRunId, hasActiveRun: s.status === "running" },
         messages: s.messages,
       }),
     );
@@ -327,15 +334,15 @@ switch (method) {
 
   case "chat.abort": {
     const s = state.sessions[params.sessionKey];
-    if (s) {
+    const run = state.runs[params.runId];
+    const aborted = Boolean(s && run?.sessionKey === s.key && !run.completed && !run.aborted);
+    if (aborted) {
+      run.aborted = true;
       s.aborted = true;
       s.status = "aborted";
     }
-    if (params.runId && state.runs[params.runId]) {
-      state.runs[params.runId].aborted = true;
-    }
     save();
-    process.stdout.write(JSON.stringify({ ok: true }));
+    process.stdout.write(JSON.stringify({ ok: true, aborted, runIds: aborted ? [params.runId] : [] }));
     break;
   }
 

@@ -6,16 +6,18 @@ import { test } from "node:test";
 import { GitVerifier } from "../src/git-verifier.js";
 import { createTempGitFixture } from "./helpers/git-fixture.js";
 
-test("GitVerifier verifies immutable Tree-SHA, catches intermediate modify-then-revert of lockedPaths, and never touches dirty local working trees or executes hooks", async () => {
+test("GitVerifier locks the handed-off source, catches remote edits and reverts, and leaves dirty local files untouched", async () => {
   const fixture = createTempGitFixture();
   const dataDir = mkdtempSync(join(tmpdir(), "agent-bridge-verifier-"));
 
   try {
+    const installerPath = "installer/installer.iss";
     const baseSha = fixture.commitFile(
-      "installer/installer.iss",
+      installerPath,
       "[Setup]\nAppName=ExampleApp\n",
       "initial base",
     );
+    fixture.commitFile(installerPath, "[Setup]\nAppName=VerifiedLocalFix\n", "local installer fix");
     fixture.commitFile("src/app.ts", "export const v = 1;\n", "add app");
     const verifiedSourceSha = fixture.revParse("HEAD");
     const verifiedTreeSha = fixture.revParse("HEAD^{tree}");
@@ -35,14 +37,16 @@ test("GitVerifier verifies immutable Tree-SHA, catches intermediate modify-then-
     const verifier = new GitVerifier(dataDir);
 
     // 1) Exact match on untouched branch (`publish_unchanged` contract).
-    const cleanObs = await verifier.verifyCandidate({
+    const candidate = {
       remoteUrlOrPath: fixture.originBareDir,
       localRepoPath: fixture.workRepoDir,
       candidateRef: "refs/heads/main",
       pinnedBaseCommitSha: baseSha,
+      pinnedSourceCommitSha: verifiedSourceSha,
       expectedTreeSha: verifiedTreeSha,
-      lockedPaths: ["installer/installer.iss"],
-    });
+      lockedPaths: [installerPath],
+    };
+    const cleanObs = await verifier.verifyCandidate(candidate);
 
     assert.equal(cleanObs.reachableRefVerified, true);
     assert.equal(cleanObs.observedHeadSha, verifiedSourceSha.toLowerCase());
@@ -59,19 +63,19 @@ test("GitVerifier verifies immutable Tree-SHA, catches intermediate modify-then-
 
     // 2) Simulate a remote branch that modifies locked `installer.iss` in commit A, then reverts it
     //    back to identical bytes in commit B while editing `src/feature.ts`.
-    //    Net `base..head` tree has identical `installer.iss`, yet intermediate commit history violated the lock!
+    //    Net `source..head` has identical installer bytes, but remote history violated the lock.
     const remoteClone = join(fixture.rootDir, "remote-worker");
     fixture.git(["clone", fixture.originBareDir, remoteClone], fixture.rootDir);
     fixture.git(["checkout", "-b", "robo/sneaky-revert"], remoteClone);
     fixture.commitFile(
-      "installer/installer.iss",
+      installerPath,
       "[Setup]\nAppName=BrokenLinuxRewrite\n",
       "blind edit to locked iss",
       remoteClone,
     );
     fixture.commitFile(
-      "installer/installer.iss",
-      "[Setup]\nAppName=ExampleApp\n",
+      installerPath,
+      "[Setup]\nAppName=VerifiedLocalFix\n",
       "revert iss back to original bytes",
       remoteClone,
     );
@@ -79,16 +83,65 @@ test("GitVerifier verifies immutable Tree-SHA, catches intermediate modify-then-
     fixture.git(["push", "origin", "robo/sneaky-revert"], remoteClone);
 
     const sneakyObs = await verifier.verifyCandidate({
-      remoteUrlOrPath: fixture.originBareDir,
+      ...candidate,
       candidateRef: "refs/heads/robo/sneaky-revert",
-      pinnedBaseCommitSha: verifiedSourceSha,
-      lockedPaths: ["installer/installer.iss"],
+      expectedTreeSha: undefined,
     });
 
     assert.equal(sneakyObs.reachableRefVerified, true);
     assert.equal(sneakyObs.lockedPathsClean, false);
-    assert.deepEqual(sneakyObs.violatedPaths, ["installer/installer.iss"]);
+    assert.deepEqual(sneakyObs.violatedPaths, [installerPath]);
     assert.equal(sneakyObs.inspectedCommitCount, 3);
+  } finally {
+    fixture.cleanup();
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("GitVerifier requires both PR base and handoff source ancestry even without locked files", async () => {
+  const fixture = createTempGitFixture();
+  const dataDir = mkdtempSync(join(tmpdir(), "agent-bridge-ancestry-"));
+  try {
+    const baseSha = fixture.commitFile("README.md", "main", "main history");
+    fixture.git(["push", "origin", "main"]);
+    fixture.git(["checkout", "--orphan", "unrelated"]);
+    const otherSha = fixture.commitFile("README.md", "other", "unrelated history");
+    fixture.git(["push", "origin", "unrelated"]);
+    const verifier = new GitVerifier(dataDir);
+    for (const [base, source] of [[otherSha, baseSha], [baseSha, otherSha]] as const) {
+      const candidate = {
+        remoteUrlOrPath: fixture.originBareDir,
+        candidateRef: "refs/heads/main",
+        pinnedBaseCommitSha: base,
+        pinnedSourceCommitSha: source,
+      };
+      const observed = await verifier.verifyCandidate(candidate);
+      assert.equal(observed.reachableRefVerified, true);
+      assert.equal(observed.baseIsAncestor, base === baseSha);
+      assert.equal(observed.lockedPathsClean, false);
+    }
+  } finally {
+    fixture.cleanup();
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("GitVerifier detects locked paths containing Unicode and whitespace", async () => {
+  const fixture = createTempGitFixture();
+  const dataDir = mkdtempSync(join(tmpdir(), "agent-bridge-paths-"));
+  try {
+    const lockedPath = "installer/kurulum özel.iss";
+    const base = fixture.commitFile(lockedPath, "verified", "base");
+    fixture.commitFile(lockedPath, "remote edit", "change locked path");
+    fixture.git(["push", "origin", "main"]);
+    const observed = await new GitVerifier(dataDir).verifyCandidate({
+      remoteUrlOrPath: fixture.originBareDir,
+      candidateRef: "refs/heads/main",
+      pinnedBaseCommitSha: base,
+      lockedPaths: [lockedPath],
+    });
+    assert.equal(observed.lockedPathsClean, false);
+    assert.deepEqual(observed.violatedPaths, [lockedPath]);
   } finally {
     fixture.cleanup();
     rmSync(dataDir, { recursive: true, force: true });

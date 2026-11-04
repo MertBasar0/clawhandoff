@@ -78,17 +78,19 @@ export class GitHubReconciler {
     priorUrl?: string;
     reportedPrUrl?: string;
   }): Promise<{ prState: ReconciledPrState; prUrl?: string }> {
-    if (params.priorState === "open_verified" && params.priorUrl) {
-      return { prState: "open_verified", prUrl: params.priorUrl };
-    }
-
+    const uncertain = {
+      prState: "uncertain_in_flight" as const,
+      prUrl: params.priorUrl,
+    };
     const headBranch = params.headRef?.replace(/^refs\/heads\//, "");
-    if (!headBranch) {
-      return {
-        prState: params.reportedPrUrl ? "uncertain_in_flight" : params.priorState,
-        prUrl: params.priorUrl,
-      };
+    if (!headBranch || !params.headSha) {
+      return uncertain;
     }
+    if (params.priorUrl && params.reportedPrUrl && params.priorUrl !== params.reportedPrUrl) {
+      return uncertain;
+    }
+    const expectedUrl = params.priorUrl ?? params.reportedPrUrl;
+    const lookupLimit = 10;
 
     try {
       const raw = await this.invokeGh([
@@ -99,45 +101,49 @@ export class GitHubReconciler {
         "--head",
         headBranch,
         "--state",
-        "open",
+        "all",
         "--limit",
-        "10",
+        String(lookupLimit),
         "--json",
-        "number,url,headRefOid,body",
+        "url,headRefOid,state,isCrossRepository",
       ]);
       const parsed: unknown = JSON.parse(raw);
-      if (Array.isArray(parsed)) {
-        for (const item of parsed) {
-          if (!item || typeof item !== "object") {
-            continue;
-          }
-          const rec = item as Record<string, unknown>;
-          const url = typeof rec.url === "string" ? rec.url : undefined;
-          const oid = typeof rec.headRefOid === "string" ? rec.headRefOid.toLowerCase() : undefined;
-          const body = typeof rec.body === "string" ? rec.body : "";
-          if (
-            url &&
-            (!params.headSha ||
-              oid === params.headSha.toLowerCase() ||
-              body.includes(params.handoffId))
-          ) {
-            return { prState: "open_verified", prUrl: url };
-          }
-        }
+      if (!Array.isArray(parsed)) {
+        return uncertain;
       }
+      let candidateUrl: string | undefined;
+      for (const item of parsed) {
+        if (!item || typeof item !== "object") {
+          continue;
+        }
+        const rec = item as Record<string, unknown>;
+        const url = typeof rec.url === "string" ? rec.url : undefined;
+        const oid = typeof rec.headRefOid === "string" ? rec.headRefOid.toLowerCase() : undefined;
+        if (!url || rec.state !== "OPEN" || oid !== params.headSha.toLowerCase()) {
+          continue;
+        }
+        if (expectedUrl) {
+          if (url === expectedUrl) return { prState: "open_verified", prUrl: url };
+          continue;
+        }
+        // The handoff does not specify a fork owner or destination branch. Only
+        // infer the PR from a unique same-repository match in a complete listing.
+        if (rec.isCrossRepository !== false || candidateUrl || parsed.length >= lookupLimit) {
+          return uncertain;
+        }
+        candidateUrl = url;
+      }
+      if (candidateUrl) return { prState: "open_verified", prUrl: candidateUrl };
 
-      // `gh` succeeded and returned no matching open PR:
-      if (params.reportedPrUrl) {
-        // Model claimed a PR URL that `gh` did not yet return (e.g. fork/eventual consistency) -> keep uncertain.
-        return { prState: "uncertain_in_flight" };
+      // A closed/merged/drifted PR is not permission to publish again. An empty
+      // search also cannot disprove a prior publication whose response was lost.
+      if (parsed.length > 0 || params.priorState !== "none" || expectedUrl) {
+        return uncertain;
       }
       return { prState: "none" };
     } catch {
-      // `gh` failed or is unconfigured: fail closed if a publish was attempted or claimed.
-      if (params.priorState === "uncertain_in_flight" || params.reportedPrUrl) {
-        return { prState: "uncertain_in_flight", prUrl: params.priorUrl };
-      }
-      return { prState: params.priorState, prUrl: params.priorUrl };
+      // Failure is not a fresh observation of either presence or absence.
+      return uncertain;
     }
   }
 
