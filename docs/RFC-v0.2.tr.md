@@ -1,46 +1,24 @@
-# Yerel-Merkezli Otonom Ajan Devir, Uzlaştırma ve Doğrulama Köprüsü (`agent-bridge-mcp`)
-**Bağımsız Proje Sunumu, Saha Analizi ve MVP Mimari Tasarım Dokümanı (RFC v0.2 — Kaynak Doğrulamalı Revizyon)**
+# agent-bridge-mcp mimarisi (RFC v0.2)
 
-> **Bu Dokümanı Okuyan Yapay Zekâ Asistanları İçin Bağlam Notu:**
-> Bu doküman; geliştiricinin yerel iş istasyonundaki asistanlarla (**Claude Code**, **Codex**, **yerel OpenClaw**) uzak/paylaşımlı OpenClaw Gateway ajanlarının (**`robo`**) insanı arada manuel kopyala-yapıştır ve ZIP kuryesi (*meat proxy*) olarak kullanmadan **otonom bir kanıt ve çözüm döngüsü** yürütmesini sağlayan `agent-bridge-mcp` projesinin **v0.2 mimari şartnamesidir**.
->
-> **v0.2 Revizyon Özeti:** İlk akran incelemesi (*peer review*) ve doğrudan kaynak kodu doğrulamaları (`openclaw` ve `codex` depoları) sonucunda:
-> 1. Köprünün yalnızca "mesaj götürüp getiren pasif bir boru" olarak kalmaması için **Otonom Orkestrasyon ve Karşı-Kanıt Döngüsü (`Autonomous Resolution Loop`)** birinci sınıf yürütme sözleşmesi haline getirildi.
-> 2. Git ihlalini gözlemleme, uzak ajana yayınlama onayı gönderme ve kesintiden sonra aynı işe yeniden bağlanma birbirinden ayrıldı; **Tek Yayınlama Sahibi + İki Aşamalı Yayınlama Kapısı (`prepare_only` -> `verify` -> `authorize_publish`)** eklendi.
-> 3. Görev yaşam döngüsü tek bir uzun MCP çağrısından koparılarak **`start -> handoffId -> attach/status -> continue`** durum makinesine bağlandı (`cancel_wait` ile `abort_remote` ayrıldı).
-> 4. Kaynak kodu kanıtlarına dayanarak `runStarted: false` önbellek davranışı (`src/gateway/server-methods/session-create-initial-turn.ts:99-108`), GC tabanlı `worktree` arşivleme (`src/gateway/server-methods/sessions-patch-archive.ts:424`) ve Codex tarafında bellek-içi `mcp-server` yerine kalıcı oturum destekleyen **`codex app-server --stdio` (`thread/resume`)** (`codex-rs/mcp-server/src/message_processor.rs:475`, `codex-rs/core/src/thread_manager.rs:1366`, `codex-rs/app-server/README.md:20-84`) düzeltmeleri işlendi.
-> 5. Çıktı şemasında model beyanı (`reported`) ile köprünün kriptografik/süreçsel gözlemi (`observed`) kesin olarak ayrıldı; Faz-1 MVP kapsamı daraltılıp sertleştirildi.
+Bir OpenClaw ajanı Windows üzerinde derleme kanıtı istediğinde yerel asistan testi çalıştırır ve sonucu aynı uzak oturuma iletir. Köprü, isteğin hangi tura ait olduğunu kaydeder, Git ve PR durumunu doğrular ve yerel asistana bir sonraki adımı bildirir.
+
+Kurulum ve ilk görev için [Türkçe başlangıç rehberini](quickstart.tr.md) kullanın. Bu RFC tasarım kararlarını, uygulanan v0.2 sözleşmesini ve sonraki sürüme bırakılmış seçenekleri açıklar. MCP girdilerinde [şema](https://github.com/MertBasar0/agent-bridge-mcp/blob/c210b9022aadbf9a6518ed8582095bab29402526/src/schema.ts), çıktı alanlarında [TypeScript türleri](https://github.com/MertBasar0/agent-bridge-mcp/blob/c210b9022aadbf9a6518ed8582095bab29402526/src/types.ts) esas alınır.
 
 ---
 
-## 1. Fikrin Özeti ve Ürünün Asıl Vaadi
+## 1. Görev kimde kalır?
 
-### 1.1 Problem: Yalnızca Dosya Taşımak Değil, "İtiraz ve Kanıt Ping-Pongu"
-Geliştirici aynı anda iki farklı ortamı birlikte kullanmaktadır:
-1. **Yerel İş İstasyonu Ajanları (Claude Code, Codex, Yerel OpenClaw):** Windows masaüstü + WSL2 gibi yerel derleyicilere (`MSBuild`, WinUI, `ISCC.exe` Inno Setup, yerel GUI testleri) doğrudan erişen ortam.
-2. **Uzak Paylaşımlı OpenClaw Gateway Ajanları (`robo`):** Cloudflare Access (`trusted-proxy`) arkasındaki yüksek kaynaklı Linux sunucusunda çalışan, hazır `worktree` havuzuna ve yönetimli PR araçlarına sahip olan ancak geliştiricinin yerel araç zincirini göremeyen ortam.
+Yerel asistan geliştiricinin makinesinde derleme araçlarına ve test ortamına erişebilir. Uzak OpenClaw ajanı kendi çalışma alanına, kaynak koduna veya yönetilen yayınlama araçlarına erişebilir. Örneğin uzak Linux ajanı bir Windows derlemesinin sonucunu kendi ortamında üretemediğinde kanıt ister.
 
-İnsanı asıl yoran şey yalnızca ilk devir mesajını taşımak değildir; **devirden sonra başlayan çok turlu itiraz/doğrulama ping-pongudur**:
-- Uzak ajan (`robo`), aslında yerel commit'te zaten karşılanmış bir koşul için *"Windows derleme kanıtı eksik, ilerleyemem"* diyerek durur,
-- Veya Linux ortamında yanlış bir varsayımla yerel kodda olmayan bir aksaklık iddia eder ya da gerçekten küçük bir Linux test pürüzü bulur,
-- Veya "dalı değiştirme" denmesine rağmen derleyemediği `.iss` dosyasını değiştirip bozuk PR açar,
-- Veya yönetimli yayınlama adımı (`github_publish`) karakter/yaşam döngüsü hatasıyla belirsiz (*uncertain*) kesilir.
+Yerel asistan önce hangi commit'in sınandığını kontrol eder. Uygun bir test kaydı varsa o kaydı aynı uzak oturuma iletir. Test eksikse kullanıcıdan aldığı yetki kapsamında testi çalıştırır. Kaynakta gerçek bir hata bulursa düzeltmeyi ayrıca doğrular. Böylece kullanıcı her ara sonucu iki ortam arasında taşımak zorunda kalmaz.
 
-Eğer kurulan sistem yalnızca "mesajı uzaktaki ajana ilet ve gelen cevabı kullanıcıya göster" düzeyinde kalırsa, geliştirici bu kez de **"onay ve yönlendirme kuryesi"** olmaya devam eder.
-
-### 1.2 Temel Fikir: Yerel-Merkezli Otonom Orkestrasyon ve Doğrulama Köprüsü
-`agent-bridge-mcp`, geliştiricinin kendi makinesinde çalışan durum bilgili (*stateful*) bir MCP sunucusu **ve** birincil yerel asistana bağlanan **Otonom Orkestratör Yürütme Sözleşmesidir**:
-
-1. **Yerelden Başlatılan Bağlantılar (`Outbound-Only`):** Köprü uzak sunucuya yerelden bağlanır; uzak sunucu için yerel komut çalıştırma bağlantısı açmaz. Uzak kodu yerelde test etmek ve uzak yanıtları yerel ajan tarafından yorumlamak ayrıca güven ve yetki değerlendirmesi gerektirir.
-2. **Otonom Çözüm Döngüsü:** Uzak ajandan bir engel, itiraz veya ek kanıt talebi döndüğünde yerel orkestratör asistan bunu hemen kullanıcıya paslamaz. İtirazı yerel kod, sabit commit kimlikleri ve test çıktılarıyla **kanıt temelli** değerlendirir:
-   - İddia yanlışsa veya koşul zaten sağlanmışsa sabit commit'e bağlı kanıtı derleyip **aynı uzak oturuma** (`continue`) sunar.
-   - Gerçek ve yetki dahilinde çözülebilir bir eksiklik varsa yerelde testi/derlemeyi/onaylı düzeltmeyi çalıştırır, doğrular ve aynı uzak oturumu ilerletir.
-   - Kullanıcıya yalnızca **tamamlanmış iş**, **yetki kapsamı dışındaki gerçek kararlar** (yeni ürün/şema/yapılandırma kararı, süresi dolmuş kimlik oturumu) veya **ilerleme üretmeyen somut tıkanma** (üst üste tekrar eden aynı engel) taşınır.
-3. **Tek Yayınlama Sahibi (`Single Publisher`):** Köprü commit/Tree-SHA doğrulanmadan yayınlama yönlendirmesi vermez. `remote_gated` uzak ajanın uyduğu iki aşamalı bir talimat protokolüdür; uzaktaki yayınlama aracını veya kimlik bilgilerini teknik olarak kapatmaz. Gerçek bir yayınlama sınırı gerekiyorsa yerel sahip seçilir ve uzak işçi yayınlama yetkisi olmadan çalıştırılır.
+Bağlantı yerelden başlatılır. İstek, yanıt ve sonraki adım yerel köprüde kaydedilir. Uzak ajan yerel komut çalıştırma erişimi kazanmaz. Yerel asistan, uzak kodu çalıştırmadan önce kaynağını ve görev yetkisini denetler. İzin isteyen bir tarayıcı, doğrulanamayan bir PR yayını veya çözülemeyen bir kapsam kararı insan müdahalesi gerektirebilir.
 
 ---
 
-## 2. Mevcut Çözümlerle Doğrulanmış Karşılaştırma
+## 2. Tasarım sırasında değerlendirilen seçenekler
+
+Bu bölüm RFC hazırlanırken incelenen OpenClaw ve Codex sürümlerini anlatır. Tablodaki kaynak yolları ilgili dış deponun o tarihteki yerleşimine aittir. Köprünün bugün sunduğu araçlar 6. bölümde listelenir.
 
 | Mevcut Mekanizma | Kaynak / Davranış Kanıtı | Bu Tasarımla İlişkisi ve Farkı |
 | :--- | :--- | :--- |
@@ -48,7 +26,7 @@ Eğer kurulan sistem yalnızca "mesajı uzaktaki ajana ilet ve gelen cevabı kul
 | **OpenClaw `extensions/mcp-relay`** | `extensions/mcp-relay/src/operations.ts:254-478` | `reply.get` üzerinden 50 sn'lik pencerelerle uzun koşuları gözlemleyebilir; ancak paylaşımlı sunucuda varsayılan olarak kapalıdır (`disabled-by-default`) ve yalnızca ham sohbet taşır. Sözleşme, Git nesne doğrulaması, yayınlama kapısı ve otonom çözüm döngüsü içermez. |
 | **OpenClaw `@openclaw/codex` & `@openclaw/acpx`** | `extensions/codex/README.md:23`, `extensions/acpx/skills/acp-router/SKILL.md:11-33` | Eşleştirilmiş düğümlerde oturumlar listelenip okunabilir fakat `continue` ve `archive` yalnızca Gateway-yerel makinede çalışır. Uzak Linux Gateway yerel Windows ajanını süremez. |
 | **İstemci `edgeAuth` (`trusted-proxy`)** | `docs/gateway/remote.md:162-195` | `cloudflared access token` ile WebSocket yükseltmesinde vekil kimlik doğrulamasını çözer. **Önkoşul:** Sunucu değişikliği gerekmemesi, hedef Gateway'de ilgili RPC'lerin (`sessions.create`, `chat.send`, `agent.wait`, `chat.history`) ve kullanıcı rol izinlerinin zaten açık olmasına bağlıdır. Mevcut `bridge_preflight` sağlık, kimlik erişimi ve ajan listesini kontrol eder; bütün yazma RPC izinlerinin kullanılabilirliğini kanıtlamaz. |
-| **Codex `mcp-server` vs `app-server`** | `codex-rs/mcp-server/src/message_processor.rs:475`, `codex-rs/core/src/thread_manager.rs:1366`, `codex-rs/app-server/README.md:20-84` | `codex mcp-server` içindeki `codex-reply` yalnızca bellek-içi (`self.threads`) haritaya bakar; süreç yeniden başlarsa `threadId` kaybolur ve arayüz kullanımdan kaldırılmaktadır. Bu nedenle Faz-2 Codex adaptörü doğrudan **`codex app-server --stdio` (`thread/start`, `thread/resume`, `turn/start`)** üzerine kurulur. |
+| **Codex `mcp-server` vs `app-server`** | `codex-rs/mcp-server/src/message_processor.rs:475`, `codex-rs/core/src/thread_manager.rs:1366`, `codex-rs/app-server/README.md:20-84` | `codex mcp-server` içindeki `codex-reply` yalnızca bellek-içi (`self.threads`) haritaya bakar; süreç yeniden başlarsa `threadId` kaybolur ve arayüz kullanımdan kaldırılmaktadır. Bu nedenle Faz-2 Codex adaptörü doğrudan **`codex app-server --stdio` (`thread/start`, `thread/resume`, `turn/start`)** üzerine kurulması önerilmiştir. Bu adaptör v0.2 kapsamında değildir. |
 
 ---
 
@@ -59,12 +37,12 @@ v0.2 mimarisi; **talimat vermeyi**, **ihlali önlemeyi**, **ihlali gözlemlemeyi
 ### 3.1 Yetki ve Yayınlama Sözleşmesi: "Tek Yayınlama Sahibi" (`Single Publisher`)
 Modelin istek zarfına yayınlama talebi yazması kendi başına yetki üretmez. Yerel orkestratör mevcut kullanıcı yetkisini, hedef ortamın izinlerini ve görev kapsamını birlikte gözetir. Köprü mod/alan çelişkilerini reddeder; hedef ajanın bütün araç çağrılarını denetleyen bir yetkilendirme servisi değildir. Teknik olarak zorlanamayan kurallar **ajana iletilen çalışma talimatıdır**; kriptografik garanti gibi sunulmaz.
 
-Her yayınlama görevinde **tek bir `publisherOwner` (`"local"` veya `"remote_gated"`)** seçilir:
+PR açılması istenmeyen bir görevde `publisherOwner: "none"` seçilir. PR isteniyorsa tek bir sahip belirlenir:
 1. **`publisherOwner: "local"` (Önerilen Yol):** Uzak ajana inceleme, test ve aday dal üretimi görevi verilir; PR açmaması söylenir. Köprü aday commit'i doğrular, mevcut kullanıcı yetkisi kapsamında yerel sahip yayınlar. Uzak ajanın yayınlama yapamayacağı teknik olarak garanti edilecekse onun araç/kimlik yetkileri ayrıca sınırlandırılmalıdır; bu alan tek başına yetki kaldırmaz.
 2. **`publisherOwner: "remote_gated"` (Yönetimli Uzak Bot Kimliği İçin İşbirliğine Dayalı İki Aşama):**
-   - **Aşama 1 (`prepare_only`):** Uzak ajan incelemesini/hazırlığını tamamlar, erişilebilir uzak dal referansını ve aday `headSha` / `treeSha` değerini döner; **henüz `github_publish` çağırmaz**.
-   - **Doğrulama Kapısı:** Yerel köprü `git fetch` ile nesneleri çeker; sabit `baseCommitSha`, `expectedTreeSha` ve `lockedPaths` kurallarını doğrular.
-   - **Aşama 2 (`authorize_publish`):** Yalnızca doğrulama tam geçerse köprü aynı uzak oturuma **o sabit `headSha` için** yayınlama onay turunu gönderir. Doğrulama başarısızsa köprü bu onay mesajını göndermez; düzeltme veya eskalasyon yönlendirmesi döner. Uzak ajanın ilk aşamada kendi yayınlama aracını çağırmasını önleme garantisi verilmez. *(Not: Yerel `gh` yoluna geçiş asla sessiz bir yedek olarak çalışmaz; uzak servisin inceleme/yetki kurallarını atlamamak için `publisherOwner` değişikliği açık kullanıcı onayına tabidir.)*
+   - **Aşama 1 — aday hazırlığı.** Uzak ajan hazırlığını tamamlar ve `candidateCommitSha` ile erişilebilir `candidateRef` bilgilerini bildirir. Başlangıçta `allowManagedPublishStage` değeri `false` olmalıdır.
+   - **Git doğrulaması.** Köprü Git nesnelerinden `observedHeadSha` ve `observedTreeSha` değerlerini okur. Taban olarak `pinnedBaseCommitSha` ile soy ilişkisini, kilitli yolları ve verilmişse beklenen ağacı denetler.
+   - **Aşama 2 — yayınlama onayı.** Yerel asistan `AUTHORIZE_REMOTE_PUBLISH` aldıktan sonra kullanıcı yetkisi kapsamında `bridge_handoff_continue` aracını `intent: "authorize_publish"` ve bir `message` ile çağırır. Köprü aynı commit ve açık PR durumunu yeniden kontrol edip onayı aynı uzak oturuma gönderir. Doğrulama başarısızsa köprü bu onay mesajını göndermez; düzeltme veya eskalasyon yönlendirmesi döner. Uzak ajanın ilk aşamada kendi yayınlama aracını çağırmasını önleme garantisi verilmez. *(Not: Yerel `gh` yoluna geçiş asla sessiz bir yedek olarak çalışmaz; uzak servisin inceleme/yetki kurallarını atlamamak için `publisherOwner` değişikliği açık kullanıcı onayına tabidir.)*
 
 ### 3.2 Kalıcı Yaşam Döngüsü ve Kesinti Kurtarma Sözleşmesi (`Durability & Reconnect`)
 20 dakikalık bir uzak görevin kaderi tek bir açık MCP çağrısına bağlanamaz. Temel yaşam döngüsü kalıcıdır:
@@ -73,13 +51,13 @@ Her yayınlama görevinde **tek bir `publisherOwner` (`"local"` veya `"remote_ga
 bridge_handoff_start ──► [SQLite: handoffId + idempotencyKey ön-kaydı]
                              │
                              ▼
-                   (kısa bekleme bütçesi dolarsa: status="running" döner)
+                   (koşu sürüyor: lifecycleStatus="running")
                              │
                              ▼
 bridge_handoff_attach ◄──► [Aynı runId üzerinde yeniden bağlanma / uzlaştırma]
                              │
                              ▼
-                   status="settled" (observed + reported zarfı)
+                   lifecycleStatus="settled" (turun yanıtı kaydedildi)
                              │
          ┌───────────────────┴───────────────────┐
          ▼ (çözülebilir engel / kanıt talebi)    ▼ (tamamlandı veya gerçek insan kapısı)
@@ -90,12 +68,12 @@ Zorunlu durum makinesi kuralları:
 1. **Ön-Kayıt (*Write-Ahead Intent*):** `handoffId`, `idempotencyKey` ve köprüye ait uzak oturum anahtarı ağ çağrısından **önce** SQLite içine yazılır. Gönderim hakkı atomik olarak alınır; çökme sonrası aynı niyet körlemesine tekrar gönderilmez.
 2. **Belirsiz Kesinti (*Uncertain State*):** Kaydedilmiş `runId` varsa `attach` aynı koşuyu gözlemler. Gönderimin kabul edilip edilmediği bilinmiyorsa köprü aynı isteği yeniden göndermez. Kayıtlı oturum geçmişinde gönderilen mesajı ve ilgili koşu kimliğini eşleştirerek toparlamayı dener. Eşleşme yoksa `uncertain` ve somut `ESCALATE_TO_HUMAN` açıklaması döner; yeni oturum veya sonsuz `attach` döngüsü başlatılmaz. Gateway'in tekrar önleme önbelleği yeniden başlatmada veya süre sonunda kaybolabileceği için SQLite'ta aynı `idempotencyKey` bulunması tek başına tekrar güvenliği değildir.
 3. **Önbellek ve Arşivleme Gerçekliği:** OpenClaw kaynağında doğrulandığı üzere (`src/gateway/server-methods/session-create-initial-turn.ts:99-108`), önbellekten dönen yanıt da `runStarted: false` üretebilir; ayrıca `sessions.patch(archived: true)` `worktree` temizliğini anında değil GC'ye bırakır (`src/gateway/server-methods/sessions-patch-archive.ts:424`). Bu nedenle köprü `runStarted: false` gördüğünde oturumu körlemesine arşivlemez; kaydedilmiş koşu kimliğini ve ilgili mesaj geçmişini kullanır. Gönderim kabulü belirsiz kaldığında yeniden deneme için yetkili durum kaynağından uzlaştırma gerekir.
-4. **Beklemeyi Bırakmak != İşi Durdurmak:** Yerel MCP çağrısının bekleme süresinin dolması (`cancel_wait` / `waitBudgetMs` bitimi) uzaktaki koşuyu iptal etmez; yalnızca `status: "running"` döner. Uzaktaki işi gerçekten durdurmak ayrı bir `bridge_handoff_abort` çağrısı gerektirir.
+4. **Bekleme ve iptal.** `waitBudgetMs` dolduğunda süren bir koşu `lifecycleStatus: "running"` ve `POLL_ATTACH` ile dönebilir. Kabulü doğrulanamayan bir gönderim `uncertain` olabilir. Beklemenin sona ermesi uzaktaki işi iptal etmez. Gateway koşusu `bridge_handoff_abort` ile durdurulabilir. Tarayıcıda yanıtı durdurmak için sohbet arayüzü kullanılır. `localOnly: true` ile iptal, tarayıcı devrinin yalnızca yerel takibini kapatır.
 5. **TekUçuş Kilidi (*Single-Flight Serialization*):** Aynı `handoffId` üzerinde aktif veya `uncertain` bir tur varken ikinci bir `bridge_handoff_continue` çağrısı reddedilir (`BUSY_ACTIVE_TURN`).
 6. **Tur Kimliği Eşleştirmesi:** Geçmişten yanıt okunurken "son asistan mesajı" varsayımı yapılmaz; ilgili `runId` veya gönderilen tam mesajla bağlantılı koşu aranır. Pencerelenmiş mesaj listesinin uzunluğu kalıcı bir sıra numarası sayılmaz.
 
 ### 3.3 Git Bütünlüğü ve Güvenilmeyen İçerik (*Untrusted Git Object*) Sözleşmesi
-- **Hareketli Referans Yasağı:** `origin/main` gibi hareketli dal adları görev başlangıcında kesin commit kimliğine (`pinnedBaseCommitSha`, `pinnedSourceCommitSha`) çözülür ve SQLite defterine kaydedilir.
+- **Referansları sabitleme.** Yerel asistan `origin/main` gibi dal adlarını önce kesin commit kimliklerine çözer. Köprü istekteki 40 haneli SHA değerlerini doğrular ve SQLite defterine kaydeder.
 - **`Tree-SHA` ve `lockedPaths` Ne Kanıtlar, Ne Kanıtlamaz?**
   - `expectedTreeSha === observedTreeSha`, yalnızca kayıtlı Git ağaç nesnesinin bayt-bayt aynı olduğunu kanıtlar; uzak test sırasında çalışma dizininin temiz olduğunu, aynı bağımlılıkların kurulduğunu veya ara commit'lerde kilitli bir dosyanın değiştirilip geri alınmadığını tek başına kanıtlamaz.
   - Kilit başlangıcı `pinnedSourceCommitSha`, kaynak commit yoksa `pinnedBaseCommitSha` olur. Denetim bu başlangıç ile aday arasındaki net farkı ve **her ara commit'i** kapsar; böylece devir öncesindeki yetkili yerel değişiklikler ihlal sayılmaz, devir sonrasındaki değiştirip-geri-alma girişimleri yakalanır. PR tabanı soy ilişkisi ayrıca kontrol edilir.
@@ -105,40 +83,33 @@ Zorunlu durum makinesi kuralları:
     `git fetch --no-recurse-submodules` ve `git diff-tree --no-ext-diff --no-textconv` çağrılarında kancalar kapatılır; izin verilen aktarım protokolleri açıkça seçilir. Dosya adları satır sonu yerine NUL ayırıcıyla okunur.
   - Checkout etmek ve test çalıştırmak ayrı bir güven sınırıdır; yerel alt ajan yazma/test yapacaksa her zaman ayrı bir `git worktree` açılır, kullanıcının yerel kirli çalışma dizini (*uncommitted changes*) asla sessizce `stash` edilmez veya ezilmez.
 
----
-
-PR adresi biliniyorsa aynı adres ve tam commit doğrulanır. Adres yoksa aynı repoda tek bir eşleşme gerekir. Hedef dal adı sözleşmede bulunmadığı için ayrıca kontrol edilmelidir.
-
-## 4. Otonom Orkestratör Döngüsü (`Autonomous Resolution Loop`)
-
-Sistem iki parçayı birlikte sunar: **MCP Araçları** + **Orkestratör Yürütme Sözleşmesi (`SKILL.md` + Araç Çıktısı Yönergeleri)**. Muhakeme, yerel test ve sonraki çağrı birincil yerel asistan tarafından yürütülür; köprü kendi başına ikinci bir ajan çalıştırmaz.
-
-MCP sunucusunu kaydetmek skill'i otomatik etkinleştirmez. İlk görevden önce yerel asistana kurulumdaki `skills/autonomous-handoff/SKILL.md` dosyasının tamamını okuması ve uygulaması söylenir. İstemci MCP prompt'larını sunuyorsa `autonomous-handoff`, hedef ve görevle seçilebilir. Çağıran asistan kapanırsa köprü onun yerine yerel çözüm döngüsünü yürütmez.
-
-### 4.1 Yerel Orkestratörün Zorunlu Davranış Kuralları
-Birincil yerel asistan (`Claude Code`, `Codex` veya `yerel OpenClaw`) bir görevi `robo`'ya devrettiğinde **görevin sahibi yerel orkestratördür**:
-
-1. **Ham Cevap Aktarıcılığı Yasaktır:** Uzak ajandan dönen bir itirazı, soruyu veya doğrulama talebini değerlendirmeden kullanıcıya *"Robo şöyle dedi, ne yapalım?"* diye taşımaz.
-2. **Kanıt Temelli İtiraz Sınıflandırması:** Uzak yanıt geldiğinde yerel orkestratör bunu dört sınıftan birine ayırır:
-   - **Sınıf A — Yanlış Varsayım veya Zaten Karşılanmış Koşul:** (Örn. *"Windows derleme kanıtı eksik"* dendi ama kanıt `pinnedSourceCommitSha` için zaten alındı veya yerelde doğrulanabilir). Yerel ajan her itirazı körlemesine reddetmez; kanıtın gerçekten ilgili commit'e ait olduğunu kontrol eder ve kanıt referanslarıyla `bridge_handoff_continue` çağırarak aynı uzak oturumu ilerletir.
-   - **Sınıf B — Yetki Dahilinde Çözülebilir Gerçek Eksik / Hata:** Uzak ajan gerçek bir derleme/test/kod hatası bulduysa ve düzeltme etkin yetki kapsamındaysa, yerel ajan düzeltmeyi izole yerel ortamda yapar, test eder, yeni commit'i iter ve aynı uzak oturuma yeni `pinnedSourceCommitSha` + kanıtla döner.
-   - **Sınıf C — Sözleşme İhlali (`lockedPaths` veya `expectedTreeSha` Sapması):** Yerel ajan doğrulama başarısızken yayınlamaya geçmez. Yönerge düzeltmeye izin veriyorsa somut farkları bildirip sabit commit'e dönülmesini ister; aksi halde ihlali kullanıcıya açıklar.
-   - **Sınıf D — Gerçek İnsan Kapısı (*Human Gate*):** Yerel ajan yetki sınırını aşan bir karar gerektiğinde, kimlik oturumu düştüğünde veya gönderim/yayınlama durumu doğrulanamadığında somut engeli bildirir. Aynı engel yeni commit veya yeni kanıt referansı olmadan iki tur üst üste dönüyorsa ya da tur bütçesi (`maxAutonomousTurns`, varsayılan `5`) dolduysa döngüyü durdurur. Başarı ayrı bir sonuçtur: `COMPLETE` geldiğinde kanıtı kontrol eder ve sonucu kullanıcıya sunar.
-
-   Köprü sunulan kanıtların `sourceRef` değerlerini `priorEvidence` içinde saklar; süreç yeniden başlatılsa da aynı referansı farklı cümleyle göndermek ilerleme sayılmaz. Köprü bu kayıtla kanıt içeriğini bağımsız olarak doğrulamaz. Toplam bütçe dolunca yeni `continue` çağrısı reddedilir.
-
-3. **Daraltılmış Onay Kuralı:** Hedef ajanlara verilen talimat *"asla soru sorma"* değil; **"Zaten yetkilendirilmiş kapsam içi adımlar için yeniden onay isteme ('başlayayım mı?' deme); ancak gerçek yetki veya erişim eksikliğini açık engel (`blocker`) olarak hemen bildir"** şeklindedir.
+PR adresi biliniyorsa köprü açık PR'ın başındaki commit'i doğrular. Adres verilmediyse aynı depoda, aynı kaynak dal ve doğrulanmış commit ile tek bir açık PR eşleşmelidir. Hedef dal adı sözleşmede bulunmadığı için ayrıca kontrol edilmelidir.
 
 ---
 
-## 5. Veri Şemaları: `reported` ile `observed` Ayrımı
+## 4. Yerel asistanın itiraz ve kanıt döngüsü
 
-### 5.1 İstek Zarfı (`HandoffEnvelope` v0.2)
+İlk görevden önce yerel asistana [otonom devir talimatını](../skills/autonomous-handoff/SKILL.md) okutun. İstemci MCP prompt’larını destekliyorsa `autonomous-handoff` prompt’unu hedef ve görevle seçebilirsiniz. Her iki yolda da itirazı değerlendiren, testi çalıştıran ve sonraki aracı çağıran yerel asistandır. Yerel asistan kapandığında köprü kaydı saklar. İş, kaydedilmiş `handoffId` ile sürdürülebilir.
+
+| Robo’nun yanıtı veya köprünün gözlemi | Yerel asistanın yapacağı işlem |
+| --- | --- |
+| Robo, zaten çalıştırılmış bir test için kanıt istiyor. | Test kaydının ilgili commit’e ait olduğunu doğrular. Aynı işe `bridge_handoff_continue` ile neyin doğrulandığını (`claim`) ve nereden kontrol edilebileceğini (`sourceRef`) gönderir. |
+| Test eksik veya kodda gerçek bir hata var. | Kullanıcının verdiği yetki kapsamında izole ortamda testi çalıştırır ya da hatayı düzeltip sınar. Yeni commit yetkili bir dala gönderildiyse `updatedSourceCommitSha` ve `updatedSourceRemoteRef` ile aynı oturumu ilerletir. |
+| Kilitli bir yol değişmiş veya adayın Git ağacı beklenenden farklı. | Yayını durdurur, farklılığı bildirir. Düzeltmeye yetkisi varsa sabit kaynak commit’inden sözleşmeye uyan yeni bir aday hazırlar. Kilitli dosyayı sonradan geri alan bir commit, aradaki ihlali silmez. |
+| Oturum açma, ek yetki veya kullanıcının kapsam kararı gerekiyor. | Hangi eylemin engellendiğini ve hangi bilginin ya da iznin ilerlemeyi sağlayacağını bildirir. Kabul edilip edilmediği belirsiz bir gönderimi aynı oturumdan uzlaştırır. |
+
+Köprü sunulan `sourceRef` değerlerini saklar. Aynı referansı farklı cümleyle göndermek yeni kanıt sayılmaz. Kanıtın içeriğini yerel asistan doğrular. Aynı engel yeni commit veya farklı bir kanıt referansı olmadan iki tur üst üste sürerse ya da tur bütçesi tükenirse köprü insan müdahalesi ister. `maxAutonomousTurns` varsayılan olarak 5’tir ve ilk turu da içerir. `COMPLETE` geldiğinde yerel asistan kullanıcının kabul ölçütlerini kontrol ederek sonucu bildirir.
+
+---
+
+## 5. İstek ve sonuç zarfları
+
+### 5.1 İstek zarfı (`bridge_handoff_start.envelope`)
 
 ```typescript
 export interface HandoffEnvelopeV2 {
   schemaVersion: "0.2";
-  requestId: string;          // İdempotent takip kimliği (UUID)
+  requestId: string;          // Yeni iş için benzersiz, tekrar denemede aynı kalan kimlik (1–128 karakter)
   workspaceId: string;        // Depo / çalışma alanı kimliği
   title: string;
   outcome: string;
@@ -148,29 +119,31 @@ export interface HandoffEnvelopeV2 {
 
   gitContext: {
     repoId: string;                 // ör. "openclaw/openclaw"
-    pinnedBaseCommitSha: string;    // Hareketli dal adı DEĞİL, çözülmüş 40-hex SHA
+    localRepoPath?: string;         // Köprünün okuyabildiği yerel kaynak deposu
+    remoteUrlOrPath?: string;       // Aday referansı doğrulamak için fetch kaynağı
+    pinnedBaseCommitSha: string;    // Önceden çözülmüş 40 haneli Git commit SHA
     pinnedSourceCommitSha?: string; // Gönderilen erişilebilir commit SHA
     sourceRemoteRef?: string;       // Uzak tarafın fetch edebileceği dal/ref
-    expectedTreeSha?: string;       // Sabit ağaç: doğrudan sağlanır veya yerel kaynak commit'ten çözülür
+    expectedTreeSha?: string;       // verify_only / publish_unchanged için doğrudan verilir veya kaynak commit’ten çözülür
     lockedPaths?: string[];         // Kaynak commit'ten sonra ara commit'ler dahil kilitli yollar
   };
 
   requestedCapabilities: {
     allowCodeEdit: boolean;
     allowBranchPush: boolean;
-    allowManagedPublishStage: boolean; // Yalnızca remote_gated Aşama-2'de true olabilir
+    allowManagedPublishStage: boolean; // İlk istekte false. Aşama 2 ayrı bir continue çağrısıdır.
   };
 
   /** Köprünün teknik olarak zorlayamadığı, hedef ajana iletilen çalışma kuralları */
-  advisoryInstructions: Array<{
+  advisoryInstructions?: Array<{
     instruction: string;
     reason: string;
   }>;
 
   /** Yalnızca kanıt referansı taşıyan ön bulgular */
-  priorEvidence: Array<{
+  priorEvidence?: Array<{
     claim: string;
-    sourceRef: string; // dosya:satır, commit SHA, komut çıkış kodu veya log özeti
+    sourceRef: string; // Örneğin sabit CI iş bağlantısı veya commit ve dosya yolu
   }>;
 
   nonBindingHints?: string[];
@@ -180,14 +153,17 @@ export interface HandoffEnvelopeV2 {
 *Doğrulama Kuralı:* `mode === "publish_unchanged"` iken `requestedCapabilities.allowCodeEdit === true` verilirse köprü bunu sessizce değiştirmez; açık `INVALID_CONTRACT_CONFLICT` hatası döner.
 
 ### 5.2 Sonuç Zarfı (`HandoffResultEnvelope` v0.2)
-Bağlam bütçesini (*token budget*) korumak için tam transkript taşınmaz; yalnızca tur deltası döner ve modelin beyanıyla köprünün gözlemi ayrılır:
+Başarılı bir devir çağrısının `content` dizisindeki metin JSON olarak çözümlenir. `reported` uzak ajanın beyanını, `observed` köprünün bağımsız incelemesini içerir. `settled`, o turun yanıtının alındığı anlamına gelir. Görevin kabul ölçütleri ayrıca denetlenir.
 
 ```typescript
 export interface HandoffResultEnvelopeV2 {
   schemaVersion: "0.2";
   handoffId: string;
+  targetId: string;
+  remoteSessionKey?: string;
+  remoteSessionUrl?: string;
   turnNumber: number;
-  runId: string;
+  runId: string; // Koşu kimliği henüz bilinmiyorsa "unassigned"
 
   /** İşin yaşam döngüsü durumu */
   lifecycleStatus: "running" | "settled" | "uncertain" | "aborted" | "failed";
@@ -197,6 +173,7 @@ export interface HandoffResultEnvelopeV2 {
     disposition: "completed" | "needs_evidence" | "blocked" | "ready_for_publish_gate";
     candidateCommitSha?: string;
     candidateRef?: string;
+    prUrl?: string;
     summaryDelta: string;
     blockers: string[];
     claimedChecks: Array<{ command: string; exitCode?: number; environment?: string }>;
@@ -211,6 +188,8 @@ export interface HandoffResultEnvelopeV2 {
     treeMatchesExpected?: boolean;
     lockedPathsClean?: boolean;
     violatedPaths?: string[];
+    inspectedCommitCount?: number;
+    verificationNotes?: string[];
     reconciledPrState: "none" | "open_verified" | "uncertain_in_flight";
     reconciledPrUrl?: string;
   };
@@ -232,7 +211,7 @@ export interface HandoffResultEnvelopeV2 {
 
 ---
 
-## 6. Daraltılmış Faz-1 MVP Araç Yüzeyi ve Kabul Testi
+## 6. Uygulanan araçlar ve kabul ölçütleri
 
 ### 6.1 Faz-1 Kapsamı (Tek Hedef Ailesi, Açık Kurtarma Sınırları)
 İlk sürüm tek hedef ailesiyle sınırlıdır. **İşin ve yayınlama durumunun görünür kalması**, belirsizlikte ikinci bir etki oluşturmaktan önce gelir:
@@ -243,10 +222,10 @@ export interface HandoffResultEnvelopeV2 {
 - **Yayınlama Kurtarma Sınırı (Faz 1):** Yalnızca **erişilebilir bir Git referansına push edilmiş** işleri yerelde devralır (uzak diskteki push edilmemiş `worktree` dosyalarını kurtarma vaadi Faz 1'de yoktur). Uzak yayınlama `uncertain_in_flight` durumundaysa yeni yayınlama yetkilendirmesi verilmez; boş PR araması tek başına belirsizliği kaldırmaz. Açık PR için tam aday commit eşleşmesi aranır; gövdedeki görev işareti bunun alternatifi değildir. PR metninin üretimi ve gizli bilgi kontrolü yayınlama sahibinin sorumluluğundadır; bu sürüm genel bir metin temizleyici sunmaz.
 
 **Faz-1 MCP Araçları:**
-1. **`bridge_preflight`:** Gateway `health`, kimlik erişimi ve ajan listesini (veya `browser` hedeflerinde açık sekme/composer hazırlığını: `browserReady`) kontrol eder; isteğe bağlı olarak açık/birleşmiş rakip PR'ları *engelleyici olmayan uyarı* olarak raporlar.
+1. **`bridge_preflight`.** Gateway hedefinde bağlantı, kimlik erişimi ve ajan listesi kontrol edilir. Tarayıcı hedefinde `browserReady` doğru sohbet sekmesinin ve yazma alanının bulunduğunu bildirir. Her iki yolda da isteğe bağlı PR araması uyarı amaçlıdır.
 2. **`bridge_handoff_start`:** Kalıcı `handoffId` oluşturur, ön-kaydı SQLite'a yazar, sabit commit SHA'larıyla oturumu açar ve kısa bekleme bütçesi (`waitBudgetMs`) içinde bitmezse `lifecycleStatus: "running"` döner.
 3. **`bridge_handoff_attach`:** Kesinti, yeniden başlatma veya bekleme bütçesi dolumu sonrasında kaydedilmiş aynı `handoffId` / `runId` koşusunu gözlemler. Kabulü bilinmeyen gönderimi tekrar etmez; geçmişten eşleştirme mümkün değilse belirsizliği ve gerekli uzlaştırmayı bildirir.
-4. **`bridge_handoff_continue`:** Otonom çözüm döngüsünün devam adımıdır (veya `remote_gated` modunda `observed` doğrulaması geçtikten sonra Aşama-2 yayınlama onayını iletir).
+4. **`bridge_handoff_continue`.** Aynı `handoffId`, bir `message` ve bir `intent` ister. `counter_evidence_or_followup` kanıt veya yeni doğrulanmış Git bilgilerini iletir. `authorize_publish` önceden doğrulanan aday için ayrı bir yayınlama onayı gönderir.
 5. **`bridge_verify_git`:** Checkout yapmadan izole depoda `pinnedBaseCommitSha`, `observedHeadSha`, `observedTreeSha` ve kaynak commit'ten sonraki ara commit'lerde `lockedPaths` kurallarını doğrular.
 6. **`bridge_handoff_abort`:** Beklemeyi bırakmaktan bağımsız olarak, Gateway hedeflerinde uzaktaki koşuyu durdurmak veya henüz gönderilmemiş bir turu iptal etmek için çağrılır. Gönderilmiş bir `browser` turu köprü tarafından uzaktan güvenli biçimde durdurulamaz; operatör sohbeti inceledikten sonra `localOnly=true` ile yalnızca yerel takibi serbest bırakabilir.
 

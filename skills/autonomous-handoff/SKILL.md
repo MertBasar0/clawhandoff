@@ -1,43 +1,36 @@
 ---
 name: autonomous-handoff
-description: "Orchestrate durable handoffs to remote/shared or local OpenClaw Gateways via agent-bridge-mcp as an autonomous Goal Owner: evaluate remote blockers with commit-bound local evidence, resolve false premises or bounded gaps without relaying intermediate pushback to the user, and apply single-publisher Git verification before publication authorization."
+description: "Use agent-bridge-mcp to hand work to an OpenClaw Gateway or an existing browser chat, answer objections with commit-bound evidence, and reconcile the outcome before publication."
 ---
 
-# Autonomous Handoff Orchestrator (`agent-bridge-mcp`)
+# Run an autonomous handoff
 
-Read this complete skill before delegating coding, cross-OS verification, review, or pull-request publication to an OpenClaw Gateway (`robo` or a sibling Gateway) through `agent-bridge-mcp`. MCP server registration alone does not activate these instructions. The calling local assistant executes the reasoning, checks, and follow-up calls; the bridge stores state and returns directions.
+The local assistant owns the user's task. It runs authorized local checks, interprets Robo's response, and calls the next MCP tool. The bridge persists each turn and verifies Git and PR facts. Read the skill before starting, or use the client's `autonomous-handoff` MCP prompt with `targetId` and `goal`. Registering the server alone does not start this loop.
 
-## Core Contract: Goal Ownership, Not Message Relay
+## Start and retain the handoff
 
-You are the **Goal Owner** of the task—never a passive courier carrying raw objections between the remote session and the user.
+1. Choose the configured `targetId` and call `bridge_preflight`. For a browser target, check `browserReady` and keep the exact chat open in one Chrome tab with an empty composer. A browser handoff reuses that chat. A Gateway handoff opens a dedicated session.
+2. Resolve the PR base and any source ref to 40-character Git commit SHAs. Give the task a unique, stable `requestId` and concrete `acceptanceCriteria`. For Git verification, supply a repository the bridge can read through `localRepoPath` or `remoteUrlOrPath`. Use `pinnedSourceCommitSha` to identify tested work. Use `expectedTreeSha` for an immutable tree and `lockedPaths` for files or directories that must stay unchanged after the source commit.
+3. Choose `publisherOwner: "none"` when no publication is requested, `"local"` when the local operator owns publication, or `"remote_gated"` for a two-stage managed remote publication. Set `allowManagedPublishStage: false` on every initial request. Requested capabilities are instructions to Robo. For an enforced publication boundary, use a local publisher and a remote worker without publication credentials. Changing publishers requires the user's authority.
+4. Call `bridge_handoff_start` with the target and envelope. Save the returned `handoffId` for all later calls. If the initial response is lost before you receive the ID, retry the same initial request with the same `requestId` and data directory. Reusing an ID reattaches to the existing handoff.
 
-For a browser target, use the operator's configured `targetId`. Keep the existing Chrome chat open and use the same `handoffId` for start/attach/continue. A draft belongs to the person composing it. When delivery is uncertain, inspect the marked turn and use `attach` before taking further action.
+## Act on the returned directive
 
-1. **Pin Moving Git Refs Before Starting:**
-   - Resolve moving refs (`origin/main`, `HEAD`, branch names) to exact 40-character hexadecimal commit SHAs (`git rev-parse HEAD`, `git rev-parse origin/main`) before calling `bridge_handoff_start`.
-   - When handing off verified platform-specific code (for example Windows WinUI / Inno Setup `.iss` scripts to a Linux Gateway), list those files in `gitContext.lockedPaths` and set `pinnedSourceCommitSha` and `expectedTreeSha` (`git rev-parse HEAD^{tree}`). File locks begin at that source commit; `pinnedBaseCommitSha` separately identifies the PR base. This preserves authorized changes made before handoff.
+| `orchestratorDirective.action` | Local assistant's action |
+| --- | --- |
+| `POLL_ATTACH` | Call `bridge_handoff_attach` with the saved `handoffId`. An expired wait budget ends the wait only. |
+| `CONTINUE_AUTONOMOUSLY` | Check the objection against source and evidence. Use `bridge_handoff_continue` with `intent: "counter_evidence_or_followup"`, a `message` and relevant `evidenceRefs` to advance the same handoff. |
+| `AUTHORIZE_REMOTE_PUBLISH` | If the user authorized publication, call `bridge_handoff_continue` with `intent: "authorize_publish"` and a `message` for the verified candidate. The bridge checks the ref and PR state again immediately before sending the authorization. Submit changed Git coordinates in a separate evidence turn first. |
+| `PUBLISH_LOCALLY` | Within the user's authority, publish the exact verified commit through the local owner. Verify the open PR's head and intended base branch. |
+| `COMPLETE` | Check the user's acceptance criteria before reporting success. For example, a verified open PR can still have failing CI. |
+| `ESCALATE_TO_HUMAN` | Inspect `orchestratorDirective.reason`, any `reported.blockers`, and `observed.verificationNotes`. Explain the remaining access, recovery, or scope decision. |
 
-2. **Choose One Publisher Owner (`publisherOwner`):**
-   - `"local"` (recommended): Instruct the remote session to review, test, or push a candidate branch without publishing. Once `observed` checks pass (`PUBLISH_LOCALLY`), publish locally within existing user authority. For a technical publication boundary, the remote worker must lack publication credentials/tools; the bridge does not remove them.
-   - `"remote_gated"`: Use when managed remote bot publication is required and the remote agent follows this cooperative protocol. Stage 1 is a prompt instruction, not enforcement on the remote publication tool. Stage 1 (`bridge_handoff_start`) runs with `allowManagedPublishStage: false`. Only when `orchestratorDirective.action === "AUTHORIZE_REMOTE_PUBLISH"` (after checkout-free `Tree-SHA` and `lockedPaths` verification pass) may you call `bridge_handoff_continue(intent="authorize_publish")`.
-   - Never silently switch `publisherOwner` from `"remote_gated"` to `"local"` without explicit user approval.
+**When Robo asks for proof.** Check which commit the existing log or test artifact covers. If evidence is missing, run the authorized check in isolation. Return a specific `claim` and a stable `sourceRef` such as a CI job or artifact URL together with the tested commit in the claim. Rewording an old reference does not count as new evidence. If the fix changes the candidate, submit `updatedSourceCommitSha` and its reachable `updatedSourceRemoteRef` within the user's existing push authority. An explicitly supplied `updatedExpectedTreeSha` must match that new source commit.
 
-3. **Follow `orchestratorDirective` Until Terminal Settlement:**
-   - **`POLL_ATTACH`**: The recorded remote run is still active. Call `bridge_handoff_attach(handoffId)`—never start a duplicate session. If submission acceptance is unresolved, inspect the concrete reconciliation diagnostic rather than repeatedly attaching or starting another task. Letting `waitBudgetMs` expire does *not* cancel the remote run (use `bridge_handoff_abort` only when intentional cancellation is desired).
-   - **`CONTINUE_AUTONOMOUSLY`**: Do **not** stop to ask the user *"The remote agent said X, what should we do?"*. Instead, classify the remote feedback against local truth:
-     - *False Premise or Already-Satisfied Proof*: Verify that existing build/test output matches `pinnedSourceCommitSha`, then call `bridge_handoff_continue(intent="counter_evidence_or_followup")` with commit-bound `evidenceRefs`. Give each distinct check artifact a stable `sourceRef`; rewording a claim or resending the same reference is not new progress. The bridge records submitted reference identities across restarts, but you remain responsible for verifying their content and commit binding.
-     - *Valid In-Scope Defect or Missing Check*: Run the required local build/test or apply the bounded fix in an isolated worktree (never stashing or clobbering uncommitted user work), push the updated commit, and call `bridge_handoff_continue` with `updatedSourceCommitSha`, `updatedSourceRemoteRef`, and the corresponding `updatedExpectedTreeSha` when an immutable tree contract is in use.
-     - *Contract Violation (`observed.lockedPathsClean === false`)*: Instruct the remote session to reset strictly to the pinned commit/tree without touching locked paths.
-   - **`AUTHORIZE_REMOTE_PUBLISH`**: Call `bridge_handoff_continue(intent="authorize_publish")` to send Stage-2 publication authorization for the exact verified `observedHeadSha`.
-   - **`COMPLETE`**: Inspect the acceptance evidence and present the final outcome. Completion is distinct from a request for human intervention.
-   - **`PUBLISH_LOCALLY`**: Publish through the local owner within existing authority, then verify the actual PR head and report the result.
-   - **`ESCALATE_TO_HUMAN`**: Return the concrete blocker or decision when:
-     1. `AUTH_LOGIN_REQUIRED` indicates an interactive login (`cloudflared access login <url>`) is needed (never switch to SSH on your own),
-     2. A genuine product, schema, config, or scope decision exceeds user-granted authority, or
-     3. A submission or publication has unknown acceptance that cannot be reconciled from authoritative state; report the exact uncertainty instead of authorizing a second effect, or
-     4. Stagnation is reached (the same blocker repeats without a new commit or distinct evidence reference), or the total turn budget is exhausted. The bridge rejects further continue submissions after the budget; it is not permission to create another handoff to evade the limit.
+**When a candidate becomes reachable.** For a settled or failed turn, call `bridge_verify_git` with its `handoffId` and `candidateRef` to refresh the Git and PR observations. Supply `remoteUrlOrPath` if the handoff has no repository locator, then follow the returned directive.
 
-4. **Trust `observed` Over `reported`:**
-   - Treat `reported` fields as unverified agent claims. Use `observed` for Git/PR facts (`reachableRefVerified`, `observedHeadSha`, `observedTreeSha`, `treeMatchesExpected`, `lockedPathsClean`, `reconciledPrState`).
-   - Git/PR observations do not prove test success or all acceptance criteria. Inspect the actual local evidence and remote check receipts before claiming the task is complete.
-   - A PR must contain the verified commit. A matching `Handoff-ID` in its body is correlation only, never a substitute for exact head verification.
+**When Git verification fails.** Inspect `violatedPaths`, base ancestry, and any tree mismatch. A later commit that reverts a locked file still leaves the offending commit in the checked history. If an authorized correction is possible, prepare a clean candidate from the pinned source and submit it for verification. Preserve other work and obtain authority before altering any shared branch or changing the contract.
+
+**When delivery is uncertain.** Use the recorded `handoffId` and inspect the original session. A browser reply belongs to the current `Bridge-Reply` marker and ends in a flush-left fenced `handoff-result` block. A saved intent can still be waiting for Chrome permission or the connection to return. Recover using `bridge_handoff_attach`. For `AUTH_LOGIN_REQUIRED`, surface the operator action in the tool error's `remediation`. If a browser handoff must be abandoned after inspection, `bridge_handoff_abort(localOnly=true)` with its ID closes local tracking. Stopping an active response requires the chat UI. Gateway cancellation uses `bridge_handoff_abort` for the recorded run.
+
+Treat `reported` as the agent's account and `observed` as the bridge's Git/PR inspection. Verify test results at the cited evidence source yourself. If a prior publication is uncertain, reconcile the existing PR before attempting another publication. Honor the selected publisher and the turn budget. If the same blocker appears on two consecutive turns without a new observed commit or a new evidence reference, or if the turn budget runs out, report the verified work and the outstanding decision.

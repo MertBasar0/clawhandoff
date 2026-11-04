@@ -1,147 +1,196 @@
-# `agent-bridge-mcp`
+# agent-bridge-mcp
 
-Local-first Model Context Protocol (MCP) server and autonomous orchestrator contract for durable, Git-verified task handoffs between local developer assistants (**Claude Code**, **Codex**, **local OpenClaw**) and remote or shared **OpenClaw Gateways** (such as team `robo` instances behind Cloudflare Access).
+`agent-bridge-mcp` connects a local assistant to an OpenClaw agent such as Robo. Suppose Robo asks for a Windows test it cannot run. Your local assistant can run the test, send the result back to the same conversation and check Robo’s reply. The bridge records each turn in SQLite and can verify Git commits and pull requests. The local assistant owns the investigation and must stay active to advance it.
 
-Full architectural specification (Turkish): [`docs/RFC-v0.2.tr.md`](./docs/RFC-v0.2.tr.md)  
-Orchestrator execution skill: [`skills/autonomous-handoff/SKILL.md`](./skills/autonomous-handoff/SKILL.md)
+[Türkçe hızlı başlangıç](docs/quickstart.tr.md) · [Architecture and design (Türkçe)](docs/RFC-v0.2.tr.md) · [Local orchestrator skill](skills/autonomous-handoff/SKILL.md)
 
----
+## Build from source
 
-## Why This Exists
+Install Node.js 22.13 or newer, pnpm and Git 2.38 or newer. Clone the repository and build the server.
 
-Cross-environment engineering workflows routinely pair a **local workstation agent** (with native OS toolchains such as Windows MSBuild/WinUI/Inno Setup or local hardware) with a **remote Linux OpenClaw Gateway** (with managed worktrees, review context, and bot publication workflows).
-
-Without a structured local bridge, the human developer becomes a manual courier ("meat proxy")—copying prompts, shuffling ZIP archives, recovering stranded remote worktrees, and mediating multi-turn objection loops.
-
-`agent-bridge-mcp` inverts the control plane (`Outbound-Only` from the developer's machine) and separates four concerns that naive chat wrappers conflate:
-
-1. **Host-driven counter-evidence loop:** The calling local assistant evaluates remote objections, runs authorized local checks, and submits evidence through `bridge_handoff_continue`. The bridge stores progress and returns `orchestratorDirective`; it does not run a local reasoning agent itself. New evidence references count as progress even when the commit is unchanged; resending the same reference does not. The turn budget bounds further submissions. `COMPLETE` reports completion separately from `ESCALATE_TO_HUMAN`.
-2. **Single publisher (`local` or cooperative `remote_gated`):** With `remote_gated`, the bridge sends Stage-2 authorization only after Git verification. Stage 1's instruction not to publish is a prompt contract, **not a revocation of the remote agent's tools or credentials**. When publication must be technically prevented until verification, use a local publisher and a remote worker without publication authority. For reconciliation, the bridge checks the exact open PR when its URL is known; otherwise it requires a unique same-repository match for the verified head. The contract does not name a destination branch; check it separately when it matters.
-3. **Durable lifecycle (`start -> handoffId -> attach -> continue`):** SQLite records submission intent before the RPC. A recorded `runId` can be observed after restart. The bridge claims each submission before sending it and stores its remote session key. If a submission response is lost, the bridge looks for the submitted message and its run ID in session history. Without a match it returns `uncertain` with `ESCALATE_TO_HUMAN` and does not resend. A saved idempotency key alone cannot guarantee replay safety after the Gateway loses its deduplication state. Letting `waitBudgetMs` expire never cancels the remote job. Gateway targets support explicit cancellation by run ID.
-4. **Checkout-free Git verification:** Candidate refs are fetched into an isolated bare mirror without checkout, recursive submodule fetching, hooks, external diff, or textconv. PR-base ancestry is checked separately from file locks. `lockedPaths` start at `pinnedSourceCommitSha` (or `pinnedBaseCommitSha` when no source is provided), so authorized local changes made before handoff are preserved. Remote modify-then-revert commits are still detected.
-
----
-
-## Requirements & Build
-
-- **Node.js `>= 22.13.0`** (uses built-in `node:sqlite`)
-- **Git `>= 2.38`**
-- Gateway targets require the **OpenClaw CLI**. Browser targets require a signed-in Chrome session and **Chrome DevTools MCP** with page ID and structured output support (tested with 1.11.0).
-- Optional: `cloudflared` (for `edge-cloudflare` Gateways) and `gh` (for PR reconciliation & rival-PR preflight warnings)
-
-```bash
-pnpm install
+```sh
+git clone https://github.com/MertBasar0/agent-bridge-mcp.git
+cd agent-bridge-mcp
+pnpm install --frozen-lockfile
 pnpm run build
-pnpm test
+node -p "process.execPath"
 ```
 
----
+To try the handoff loop without a Team account, use the [local acceptance exercise](#test-the-loop-locally) after building.
 
-## Configuration
+The build creates `dist/cli.js`. Keep the printed absolute Node path for your MCP client configuration.
 
-### Option A: Zero-Config Environment Variables
-If you already use `OPENCLAW_HANDOFF_*` variables, `agent-bridge-mcp` automatically provisions an isolated client profile (never modifying your primary local `openclaw.json`):
+## Configure a target
 
-```bash
-export OPENCLAW_HANDOFF_URL="https://gateway.example"
-export OPENCLAW_HANDOFF_AGENT="main"
-export OPENCLAW_HANDOFF_PROJECT="example-project"
-# Optional:
-# export OPENCLAW_HANDOFF_TARGET_ID="robo"
-# export OPENCLAW_HANDOFF_CLI="/usr/local/bin/openclaw"
-# export OPENCLAW_HANDOFF_CLOUDFLARED="/usr/local/bin/cloudflared"
-# export AGENT_BRIDGE_DATA_DIR="$HOME/.agent-bridge-mcp"
-```
-
-### Option B: Multi-Target JSON Config (`--config` or `AGENT_BRIDGE_CONFIG_PATH`)
-
-```json
-{
-  "dataDir": "/path/to/bridge-data",
-  "defaultWaitBudgetMs": 30000,
-  "defaultMaxAutonomousTurns": 5,
-  "targets": {
-    "robo": {
-      "targetId": "robo",
-      "url": "https://gateway.example",
-      "authMode": "edge-cloudflare",
-      "agentId": "main",
-      "projectId": "openclaw"
-    },
-    "local-openclaw": {
-      "targetId": "local-openclaw",
-      "url": "ws://127.0.0.1:18789",
-      "authMode": "direct-token",
-      "tokenEnvVar": "LOCAL_OPENCLAW_TOKEN",
-      "agentId": "main"
-    }
-  }
-}
-```
+| Choose | What it does | What you need |
+| --- | --- | --- |
+| Browser | Uses a specific, existing Robo conversation. Messages appear in its ordinary Team history. | The exact chat URL, your signed-in Chrome profile and [Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp) with explicit page IDs and structured output (tested with 1.11.0). |
+| Gateway | Creates a dedicated agent session over RPC. Supports named worktrees and cancellation by run ID. | An OpenClaw CLI with access to the Gateway. Cloudflare Access targets also need `cloudflared`. |
 
 ### Use an existing Robo chat in Chrome
 
-Open the desired chat in exactly one tab of the Chrome profile you use for Team. Enable Chrome's remote debugging at `chrome://inspect/#remote-debugging` and accept the local connection prompt if Chrome shows one. The browser inherits the access of your signed-in account. Messages and evidence appear in that chat's ordinary history.
-
-Add this entry to `targets` in the bridge config, replacing the URL and executable path with yours:
+1. Open the intended conversation in exactly one tab. Copy its full HTTPS URL and leave the message box empty.
+2. In that Chrome instance, open `chrome://inspect/#remote-debugging` and enable remote debugging. Allow the connection in Chrome when prompted. Browser mode uses the signed-in session and requires no Team device pairing. [Chrome connection instructions](https://developer.chrome.com/blog/chrome-devtools-mcp-debug-your-browser-session)
+3. Save the following as `bridge-config.json`. Replace the example URL and executable with yours. `targetId` is the bridge’s local name for this connection. `agentId` identifies the agent in the URL.
 
 ```json
 {
-  "robo-web": {
-    "targetId": "robo-web",
-    "transport": "browser",
-    "agentId": "roboclaw",
-    "sessionUrl": "https://team.example/chat/roboclaw/dashboard/YOUR-EXISTING-CHAT-ID",
-    "browserMcp": {
-      "command": "/absolute/path/to/chrome-devtools-mcp",
-      "args": ["--no-usage-statistics", "--no-performance-crux"]
+  "targets": {
+    "robo-web": {
+      "targetId": "robo-web",
+      "transport": "browser",
+      "agentId": "roboclaw",
+      "sessionUrl": "https://team.example/chat/roboclaw/YOUR-EXISTING-CHAT-ID",
+      "browserMcp": {
+        "command": "/absolute/path/to/chrome-devtools-mcp",
+        "args": ["--no-usage-statistics", "--no-performance-crux"]
+      }
     }
   }
 }
 ```
 
-If the URL contains two possible session routes, set `basePath` to the path where the Control UI is hosted. For example, use `"basePath": "/dashboard"` for a UI hosted there with the session URL `https://team.example/dashboard/chat/roboclaw/topic`. Use `"basePath": "/"` for a root-hosted UI. Ordinary unambiguous session URLs need only `sessionUrl`.
+Use Chrome DevTools MCP on the same OS as Chrome. If the bridge runs in WSL and Chrome runs on Windows, set `browserMcp.command` to the WSL path to Windows `node.exe`. Set the first entry in `browserMcp.args` to the Windows path to the installed `chrome-devtools-mcp.js`, followed by the options above. The bridge adds the auto-connect and structured-output flags. Robo uses the tools and GitHub identity available in that Team session.
 
-Use a locally installed [Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp) on the same OS as Chrome. From WSL with Windows Chrome, `command` can be the WSL path to Windows `node.exe`; give the Windows path to the installed `chrome-devtools-mcp.js` as the first argument. The bridge enables auto-connect and structured output. No Gateway CLI credentials or Team device pairing are needed for this target.
+If more than one part of the URL could be the start of the session route, set the target’s `basePath` to the Control UI mount. For `https://team.example/dashboard/chat/roboclaw/topic` served under `/dashboard`, use `"basePath": "/dashboard"`. Use `"/"` for a root deployment. Unambiguous URLs work without this field.
 
-Call `bridge_preflight(targetId="robo-web")` and check `browserReady`. Start with `bridge_handoff_start` and use the returned `handoffId` for every attach or follow-up, just as for a Gateway target. Keep the chat open and its composer free. Each outgoing turn carries a unique marker. The reply must end with a `handoff-result` block after the current turn’s `Bridge-Reply` marker. Put both fences at the start of their lines so a block quoted inside a list cannot be mistaken for the result. An ambiguous send is recorded as uncertain; `attach` only looks for the original message. For a virtualized transcript you may need to bring the relevant messages back into view.
+### Connect to a Gateway
 
-Browser targets reuse the existing chat and its workspace. A named worktree requires a Gateway target. You can cancel an unsent browser turn with `bridge_handoff_abort`. After submission only the chat UI can stop the current response; the bridge cannot safely cancel a specific browser run. After inspecting an unresolved turn, an operator can explicitly call `bridge_handoff_abort(handoffId, localOnly=true)` to release the chat from local tracking. This does not stop Robo or deliver a message. Browser `runId` values identify the bridge's marked turns and cannot be passed to the Gateway API.
+For Gateway access, save this as your config or merge the target into the same `targets` object. The bridge stores its client profile under its data directory by default.
 
-### Registering in Claude Code or Codex
-
-```bash
-# Claude Code
-claude mcp add agent-bridge -- node /path/to/agent-bridge-mcp/dist/cli.js --config /path/to/bridge-config.json
-
-# Codex
-codex mcp add agent-bridge -- node /path/to/agent-bridge-mcp/dist/cli.js --config /path/to/bridge-config.json
+```json
+{
+  "targets": {
+    "robo": {
+      "targetId": "robo",
+      "transport": "gateway",
+      "url": "https://gateway.example",
+      "authMode": "edge-cloudflare",
+      "cloudflaredPath": "/absolute/path/to/cloudflared",
+      "agentId": "main",
+      "projectId": "example-project"
+    }
+  }
+}
 ```
 
-Registration makes the tools available; it does not automatically load the orchestrator skill. Before the first handoff, ask the local assistant to read the complete `skills/autonomous-handoff/SKILL.md` from this installation and follow it for the task. If the host exposes MCP prompts, select `autonomous-handoff` with the target and goal. The local assistant must remain active to collect evidence and call the next tool; the MCP server does not independently resume a stopped assistant.
+- **Cloudflare Access.** Supply your Gateway URL, agent and project. If preflight reports `AUTH_LOGIN_REQUIRED` or returns login instructions, run `cloudflared access login` with the URL in the remediation and check again.
+- **Direct token.** Use `"authMode": "direct-token"` with the appropriate `ws://` or `wss://` Gateway URL. Set `tokenEnvVar` to the **name** of the environment variable containing the token. The bridge process must inherit it. The default name is `OPENCLAW_BRIDGE_TARGET_TOKEN`.
+- **Existing profile.** Use `"authMode": "existing-profile"` and a `profileDir` containing an `openclaw.json` for the configured Gateway. The bridge checks that the stored remote URL matches.
 
----
+For one Gateway, you can omit the config file and set `OPENCLAW_HANDOFF_URL`, `OPENCLAW_HANDOFF_AGENT` and, when applicable, `OPENCLAW_HANDOFF_PROJECT` in the MCP server’s environment. `OPENCLAW_HANDOFF_TARGET_ID` defaults to `robo` and `OPENCLAW_HANDOFF_AUTH_MODE` defaults to `edge-cloudflare`. `OPENCLAW_HANDOFF_CLI` and `OPENCLAW_HANDOFF_CLOUDFLARED` override the executable paths. An explicit `--config` or `AGENT_BRIDGE_CONFIG_PATH` selects file-based targets instead.
 
-## MCP Tools & Prompts
+## Register the bridge with your local assistant
 
-| Surface | Purpose |
-| :--- | :--- |
-| **Prompt:** `autonomous-handoff` | Supplies the calling local assistant with the goal-ownership and counter-evidence instructions when the host selects it. |
-| **Tool:** `bridge_preflight` | Verifies Gateway `health`, Access auth state (`AUTH_LOGIN_REQUIRED` remediation without SSH fallback), agent roster, and non-blocking rival PR warnings. |
-| **Tool:** `bridge_handoff_start` | Validates `HandoffEnvelopeV2` (enforcing 40-hex pinned SHAs and rejecting mode/capability conflicts), records write-ahead SQLite state, opens the session, and observes up to `waitBudgetMs`. |
-| **Tool:** `bridge_handoff_attach` | Observes a recorded run after timeout/restart; unknown dispatch acceptance requires reconciliation, not a second submission. |
-| **Tool:** `bridge_handoff_continue` | Sends commit-bound counter-evidence/follow-ups (`counter_evidence_or_followup`) or sends Stage-2 managed publication authorization (`authorize_publish`) once Git checks pass; rejects submissions beyond the turn budget. |
-| **Tool:** `bridge_verify_git` | Runs checkout-free bare-mirror verification of `pinnedBaseCommitSha` ancestry, `expectedTreeSha`, `lockedPaths` since the handed-off source commit, and the exact PR head through `gh`. |
-| **Tool:** `bridge_handoff_abort` | Cancels a Gateway run via `chat.abort` or a browser turn before it has been sent. |
+Register a **stdio MCP server** named `agent-bridge` using the Node path from the build step. For clients that accept an `mcpServers` JSON object, the entry looks like this. Replace all three paths with absolute paths on the machine running the client.
 
-## Verification and real-host acceptance
+```json
+{
+  "mcpServers": {
+    "agent-bridge": {
+      "command": "/absolute/path/to/node",
+      "args": ["/absolute/path/to/agent-bridge-mcp/dist/cli.js", "--config", "/absolute/path/to/bridge-config.json"]
+    }
+  }
+}
+```
 
-`pnpm test` exercises the bridge with temporary Git repositories and simulated Gateway/GitHub responses. It covers transport, persistence, and decision behavior; it is not proof that a real Claude/Codex agent autonomously gathers evidence or that a live Gateway enforces publication permissions.
+Claude Code and Codex can register the same server from the command line. Run the command for your client.
 
-For restart proof, stop the bridge after a run ID is recorded, restart, and attach to that handoff. Separately test a lost submission response: unresolved acceptance must remain visible and must not cause another remote session or turn. Inspect the existing Gateway state before any deliberate retry. An uncertain publication must not be retried merely because a PR search is empty.
+```sh
+# Claude Code
+claude mcp add agent-bridge -- /absolute/path/to/node /absolute/path/to/agent-bridge-mcp/dist/cli.js --config /absolute/path/to/bridge-config.json
 
-### Run the counter-evidence loop with a local agent
+# Codex
+codex mcp add agent-bridge -- /absolute/path/to/node /absolute/path/to/agent-bridge-mcp/dist/cli.js --config /absolute/path/to/bridge-config.json
+```
 
-After building the bridge, run `node test/helpers/host-acceptance.mjs setup` in this checkout. It prints a temporary Git workspace, an MCP server configuration, a goal, and a verification command. Open the printed workspace in your local agent, register the printed server for that session, and give the agent the goal. The fixture Gateway raises an objection and accepts the follow-up only when it includes a receipt from the project's smoke check for the submitted commit.
+Ask your assistant to read the [orchestrator skill](skills/autonomous-handoff/SKILL.md) before the first handoff. Hosts that expose MCP prompts can also select `autonomous-handoff` with `targetId` and `goal`. Registration alone makes the tools available.
 
-When the agent finishes, run the printed `verify` command. It checks that one remote session received the receipt and that the bridge recorded `CONTINUE_AUTONOMOUSLY` followed by `COMPLETE`. The run uses the real local agent, MCP transport, Git, and SQLite with a simulated remote reviewer. Remove the temporary workspace and its enclosing fixture directory when finished.
+## Run a first handoff
+
+These are arguments for MCP tools in your local assistant. Use `robo` in place of `robo-web` if you configured the Gateway example.
+
+**1. Check the target.** Call `bridge_preflight` with `{"targetId":"robo-web"}`. For Chrome, expect `browserReady: true`. Its `gatewayHealthy: false` field is expected because no Gateway RPC ran. For a Gateway target, look for `gatewayHealthy: true`, `authReady: true` and `agentFound: true`. Preflight sends no task message.
+
+**2. Start a read-only code investigation.** Call `bridge_handoff_start` with the following object. It uses a published commit of this project and requests no edits, pushes or publication. For other work, run `git rev-parse HEAD` in the repository you want reviewed and use the full SHA. Use a fresh `requestId` for each new task and reuse that ID if the same start call needs a retry.
+
+```json
+{
+  "targetId": "robo-web",
+  "waitBudgetMs": 5000,
+  "maxAutonomousTurns": 3,
+  "envelope": {
+    "schemaVersion": "0.2",
+    "requestId": "browser-receipt-review-01",
+    "workspaceId": "agent-bridge-mcp",
+    "title": "Review browser reply ownership",
+    "outcome": "Explain how the bridge handles a past success report quoted in a new Robo reply.",
+    "mode": "investigate",
+    "publisherOwner": "none",
+    "gitContext": {
+      "repoId": "MertBasar0/agent-bridge-mcp",
+      "pinnedBaseCommitSha": "c210b9022aadbf9a6518ed8582095bab29402526"
+    },
+    "requestedCapabilities": {
+      "allowCodeEdit": false,
+      "allowBranchPush": false,
+      "allowManagedPublishStage": false
+    },
+    "acceptanceCriteria": ["Identify the code that binds the result to the current turn, or say what evidence is missing."]
+  }
+}
+```
+
+**3. Save the returned `handoffId` and follow `orchestratorDirective.action`.** `waitBudgetMs` controls how long to observe a turn during a call. If the work is still running, the bridge returns `POLL_ATTACH`. Call `bridge_handoff_attach` with that `handoffId`, including after restarting the bridge. Use the same data directory across restarts (default `~/.agent-bridge-mcp`, configurable via `dataDir` or `AGENT_BRIDGE_DATA_DIR`).
+
+| Action | What the local assistant does |
+| --- | --- |
+| `POLL_ATTACH` | Observe the existing turn with `bridge_handoff_attach`. |
+| `CONTINUE_AUTONOMOUSLY` | Read `reported.blockers`, inspect the pinned source or run the authorized local check, then call `bridge_handoff_continue` with the evidence. |
+| `COMPLETE` | Check the acceptance criteria against the evidence and report the outcome. Read the remote agent’s claims in `reported` and the bridge’s Git and PR observations in `observed`. |
+| `ESCALATE_TO_HUMAN` | Explain the specific permission, unresolved submission, repeated blocker or exhausted turn budget. |
+| `PUBLISH_LOCALLY` / `AUTHORIZE_REMOTE_PUBLISH` | Follow the selected [publication contract](#git-verification-and-publication) within the authority already granted. |
+
+For example, if Robo asks whether the regression test passes, the local assistant can run it at the pinned revision and send its receipt with `bridge_handoff_continue`. Replace the placeholders below with the returned ID and the actual test receipt.
+
+```json
+{
+  "handoffId": "REPLACE_WITH_RETURNED_HANDOFF_ID",
+  "intent": "counter_evidence_or_followup",
+  "message": "REPLACE_WITH_THE_TEST_NAME_AND_ACTUAL_RESULT",
+  "evidenceRefs": [
+    {"claim": "REPLACE_WITH_WHAT_THE_RESULT_SHOWS", "sourceRef": "REPLACE_WITH_COMMIT_BOUND_TEST_RECEIPT"}
+  ]
+}
+```
+
+Use a stable `sourceRef` for each distinct artifact. The assistant verifies its contents and summarizes the relevant result for Robo. Reusing the same reference does not count as new evidence. The turn budget includes the first turn and all follow-ups. The loop pauses when the local assistant stops calling tools.
+
+## Recover an interrupted handoff
+
+Keep exactly one tab open at the configured chat URL with its input empty. If a Chrome connection request times out, call `bridge_handoff_attach` with the saved `handoffId` (or the ID in the error message). Keep Chrome visible and accept the new connection prompt while the call is waiting. A virtualized chat may require scrolling back to the relevant turn. The bridge correlates a submitted `Bridge-Turn` with a reply marked `Bridge-Reply`. The reply’s final `handoff-result` block must open and close at the start of a line.
+
+SQLite records the intent before sending. An attach may deliver a prepared, unsent intent. If a send was attempted and its acceptance is unknown, attach looks for the existing receipt. If `lifecycleStatus` is `uncertain`, inspect the original conversation before retrying to avoid sending the task twice.
+
+Use `bridge_handoff_abort` for an intentional cancellation. It can cancel a recorded Gateway run or close a browser turn before submission. For a submitted browser turn, stop Robo in the chat UI if necessary. After reviewing the conversation, `localOnly: true` closes local browser tracking while the remote conversation continues.
+
+## Git verification and publication
+
+For a task that needs Git verification, configure a repository to fetch from with `gitContext.remoteUrlOrPath` or `gitContext.localRepoPath`. `bridge_verify_git` accepts a `handoffId` and a reachable `candidateRef`. It fetches into an isolated bare mirror without checking out candidate code, running hooks or fetching submodules. It checks the candidate’s ancestry and optional expected tree. `lockedPaths` are protected from changes after `pinnedSourceCommitSha` (or `pinnedBaseCommitSha` if no source commit was supplied), including changes reverted before the tip.
+
+The initial `publisherOwner` determines who can be asked to publish.
+
+| `publisherOwner` | Who acts |
+| --- | --- |
+| `none` | Use for a report or verification without publication. |
+| `local` | The local assistant publishes the verified candidate when authorized. To enforce a local-only boundary, use a remote worker without publishing credentials or tools. |
+| `remote_gated` | The remote agent prepares the candidate with `allowManagedPublishStage: false`. On `AUTHORIZE_REMOTE_PUBLISH`, call `bridge_handoff_continue` with `intent: "authorize_publish"`, the handoff ID and an authorization message. The bridge rechecks the verified commit before sending the authorization. The remote agent cooperates with this protocol using its existing permissions. |
+
+PR reconciliation requires an authenticated GitHub CLI (`gh`) with read access to the repository. The bridge checks an open PR’s exact head. Without a PR URL it requires a unique same-repository match. Verify the destination branch separately when it matters. If a publish might have succeeded, an empty search is insufficient to repeat it safely. Preflight can optionally search for rival PRs when given both `repoId` and `issueQuery`. An empty advisory list can also mean `gh` was unavailable.
+
+## Test the loop locally
+
+`pnpm test` exercises the bridge against temporary Git repositories and simulated browser, Gateway and GitHub responses.
+
+For a test with a real local assistant and a simulated remote reviewer, run `node test/helpers/host-acceptance.mjs setup` from the built checkout. Open the printed workspace in your assistant, register the printed MCP configuration, give it the printed goal and let it run the smoke test. Then run the printed verification command. Success includes `"accepted": true`, one remote session and the recorded actions `CONTINUE_AUTONOMOUSLY` followed by `COMPLETE`. The test runs entirely against the fixture and requires no Team account.
