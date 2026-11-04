@@ -112,3 +112,53 @@ test("browser MCP resumes a lost send receipt and accepts counter-evidence in th
     fixture.cleanup();
   }
 });
+
+test("browser MCP survives OpenClaw auto-title slug replacement on 32-hex UUID session URLs", async () => {
+  const fixture = createTempGitFixture();
+  const initialUrl = "https://team.example/chat/roboclaw/clawhandoffantigravitysession-4f99c346fa5d4daea8d9ba738d8bae4d";
+  const retitledUrl = "https://team.example/chat/roboclaw/distinguish-workflow-policy-refusal-4f99c346fa5d4daea8d9ba738d8bae4d";
+  const commit = fixture.commitFile("status.txt", "ready\n", "candidate");
+  const configPath = join(fixture.rootDir, "bridge.json");
+  const statePath = join(fixture.rootDir, "browser-state.json");
+  writeFileSync(statePath, JSON.stringify({ sessionUrl: initialUrl, messages: [], draft: "" }));
+  writeFileSync(configPath, JSON.stringify({
+    dataDir: fixture.rootDir,
+    targets: { robo: {
+      targetId: "robo", transport: "browser", agentId: "roboclaw", sessionUrl: initialUrl,
+      browserMcp: { command: process.execPath, args: [resolve("test/helpers/browser-devtools.mjs"), statePath] },
+    } },
+  }));
+  const client = new Client({ name: "browser-retitle", version: "1" });
+  await client.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("dist/cli.js"), "--config", configPath] }));
+  async function invoke(name: string, args: Record<string, unknown>) {
+    const result = await client.callTool({ name, arguments: { ...args, waitBudgetMs: 0 } });
+    const content = (result.content as Array<{ type: string; text?: string }>).find(p => p.type === "text")?.text;
+    assert.ok(content);
+    assert.ok(!result.isError, content);
+    return JSON.parse(content) as HandoffResultEnvelopeV2;
+  }
+  try {
+    const started = await invoke("bridge_handoff_start", { targetId: "robo", envelope: {
+      schemaVersion: "0.2", requestId: "uuid-retitle-1", workspaceId: "test",
+      title: "Verify auto-title slug replacement", outcome: "Attach and continue after Control UI replaces slug.",
+      mode: "verify_only", publisherOwner: "none",
+      gitContext: { repoId: "example/status", localRepoPath: fixture.workRepoDir, pinnedBaseCommitSha: commit, pinnedSourceCommitSha: commit },
+      requestedCapabilities: { allowCodeEdit: false, allowBranchPush: false, allowManagedPublishStage: false },
+      acceptanceCriteria: ["Passing local runtime evidence"],
+    } });
+    // Simulate OpenClaw Control UI history.replaceState after Turn 1 auto-title updates displayName.
+    writeFileSync(statePath, JSON.stringify({ ...JSON.parse(readFileSync(statePath, "utf8")), sessionUrl: retitledUrl }));
+    const attached = await invoke("bridge_handoff_attach", { handoffId: started.handoffId });
+    assert.equal(attached.orchestratorDirective.action, "CONTINUE_AUTONOMOUSLY");
+    const completed = await invoke("bridge_handoff_continue", {
+      handoffId: started.handoffId,
+      intent: "counter_evidence_or_followup",
+      message: "Local test passed.",
+      evidenceRefs: [{ claim: "Verified on commit.", sourceRef: `receipt:${commit}:passed` }],
+    });
+    assert.equal(completed.orchestratorDirective.action, "COMPLETE");
+  } finally {
+    await client.close();
+    fixture.cleanup();
+  }
+});

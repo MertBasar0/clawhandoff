@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
-import { loadBridgeConfig } from "../src/config.js";
+import { loadBridgeConfig, parseBrowserSessionRoute, sameBrowserSessionUrl } from "../src/config.js";
 
 const team = "https://team.example";
 
@@ -74,4 +74,30 @@ test("literal session namespaces cannot override an explicit deployment base pat
   assert.equal(read(team + "/chat/roboclaw/dashboard/session-id", "roboclaw"), "browser");
   assert.throws(() => read(team + "/chat/roboclaw/topic?", "roboclaw"), /Invalid bridge config/);
   assert.throws(() => read(team + "/chat/roboclaw/topic#", "roboclaw"), /Invalid bridge config/);
+});
+
+test("32-hex UUID browser session routes tolerate display-slug replacement without relaxing session identity", () => {
+  const initial = `${team}/chat/roboclaw/clawhandoff-session-4f99c346fa5d4daea8d9ba738d8bae4d`;
+  const retitled = `${team}/chat/roboclaw/distinguish-workflow-policy-refusal-4f99c346fa5d4daea8d9ba738d8bae4d`;
+  const bareUuid = `${team}/chat/roboclaw/4f99c346fa5d4daea8d9ba738d8bae4d`;
+  assert.equal(sameBrowserSessionUrl(initial, retitled), true);
+  assert.equal(sameBrowserSessionUrl(initial, bareUuid), true);
+  assert.deepEqual(parseBrowserSessionRoute(initial)?.uuidRoute, {
+    prefix: `${team}/chat/roboclaw/`,
+    uuid: "4f99c346fa5d4daea8d9ba738d8bae4d",
+  });
+  for (const distinct of [
+    `${team}/dashboard/roboclaw/distinguish-workflow-policy-refusal-4f99c346fa5d4daea8d9ba738d8bae4d`,
+    `${team}/chat/other/distinguish-workflow-policy-refusal-4f99c346fa5d4daea8d9ba738d8bae4d`,
+    `${team}/chat/roboclaw/~key/distinguish-workflow-policy-refusal-4f99c346fa5d4daea8d9ba738d8bae4d`,
+    `${team}/chat/roboclaw/distinguish-workflow-policy-refusal-99999999fa5d4daea8d9ba738d8bae4d`,
+    `${team}/chat/roboclaw/distinguish-workflow-policy-refusal-4f99c346fa5d4daea8d9ba738d8bae4d?x=1`,
+  ]) {
+    assert.equal(sameBrowserSessionUrl(initial, distinct), false, distinct);
+  }
+  // Short 8-hex prefixes rely on slugHint tie-breaking and stay exact.
+  assert.equal(
+    sameBrowserSessionUrl(`${team}/chat/roboclaw/old-title-4f99c346`, `${team}/chat/roboclaw/new-title-4f99c346`),
+    false,
+  );
 });

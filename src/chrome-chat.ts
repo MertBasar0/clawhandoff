@@ -1,12 +1,14 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { browserTranscriptScript } from "./browser-turn.js";
+import { parseBrowserSessionRoute, sameBrowserSessionUrl } from "./config.js";
 import { BridgeError } from "./types.js";
 
 export interface ChromeChatOptions {
   command: string;
   args: string[];
   sessionUrl: string;
+  basePath?: string;
 }
 
 type RecordValue = Record<string, unknown>;
@@ -48,11 +50,17 @@ function oneEnabled(node: RecordValue, role: string, names: readonly string[]): 
 
 export class ChromeChat {
   private readonly client = new Client({ name: "clawhandoff-browser", version: "0.2.0" });
+  private readonly route: ReturnType<typeof parseBrowserSessionRoute>;
   private connected?: Promise<void>;
 
   constructor(private readonly options: ChromeChatOptions) {
+    this.route = parseBrowserSessionRoute(options.sessionUrl, options.basePath);
     // A later attach can reconnect if Chrome or its local MCP process exited.
     this.client.onclose = () => { this.connected = undefined; };
+  }
+
+  private matchesSessionUrl(url: unknown): url is string {
+    return typeof url === "string" && sameBrowserSessionUrl(url, this.options.sessionUrl, this.options.basePath);
   }
 
   private connect(): Promise<void> {
@@ -103,7 +111,7 @@ export class ChromeChat {
   private async page(expectedId?: number): Promise<number> {
     const { pages } = await this.tool("list_pages", {});
     const matches = Array.isArray(pages)
-      ? pages.filter((entry): entry is RecordValue => isRecord(entry) && entry.url === this.options.sessionUrl)
+      ? pages.filter((entry): entry is RecordValue => isRecord(entry) && this.matchesSessionUrl(entry.url))
       : [];
     const id = matches[0]?.id;
     if (matches.length !== 1 || typeof id !== "number" || (expectedId !== undefined && id !== expectedId)) {
@@ -113,7 +121,7 @@ export class ChromeChat {
   }
 
   private async readProjection(pageId: number, turnKey?: string): Promise<RecordValue> {
-    const script = `() => (${browserTranscriptScript})(${JSON.stringify(this.options.sessionUrl)}, ${JSON.stringify(turnKey ?? null)})`;
+    const script = `() => (${browserTranscriptScript})(${JSON.stringify(this.options.sessionUrl)}, ${JSON.stringify(turnKey ?? null)}, ${JSON.stringify(this.route?.uuidRoute ?? null)})`;
     const { message } = await this.tool("evaluate_script", { pageId, function: script, waitForStableDom: false });
     const body = typeof message === "string" && /^Script ran on page and returned:\n```json\n([\s\S]*)\n```$/.exec(message)?.[1];
     let projection: unknown;
@@ -122,7 +130,7 @@ export class ChromeChat {
     } catch {
       throw new BridgeError("TARGET_UNAVAILABLE", "Chrome returned an unreadable chat snapshot.");
     }
-    if (!isRecord(projection) || projection.url !== this.options.sessionUrl ||
+    if (!isRecord(projection) || !this.matchesSessionUrl(projection.url) ||
         projection.ready !== true || typeof projection.busy !== "boolean" || !Array.isArray(projection.messages)) {
       throw new BridgeError("TARGET_UNAVAILABLE", "Open the configured chat and wait for its transcript and composer to finish loading.");
     }
@@ -136,7 +144,7 @@ export class ChromeChat {
 
   private async composerSnapshot(pageId: number, stopNames: readonly string[]): Promise<RecordValue> {
     const { snapshot } = await this.tool("take_snapshot", { pageId });
-    if (!isRecord(snapshot) || snapshot.role !== "RootWebArea" || snapshot.url !== this.options.sessionUrl) {
+    if (!isRecord(snapshot) || snapshot.role !== "RootWebArea" || !this.matchesSessionUrl(snapshot.url)) {
       throw new BridgeError("TARGET_UNAVAILABLE", "The tab no longer displays the configured Robo chat.");
     }
     if (controls(snapshot, "button", stopNames).length > 0) {

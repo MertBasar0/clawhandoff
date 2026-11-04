@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { ChromeChat } from "./chrome-chat.js";
 import { inspectBrowserTurn, wrapBrowserPrompt } from "./browser-turn.js";
+import { parseBrowserSessionRoute, sameBrowserSessionUrl } from "./config.js";
 import { join } from "node:path";
 import { evaluateOrchestratorDirective } from "./directive.js";
 import { buildPrettySessionUrl, OpenClawGatewayClient } from "./gateway-client.js";
@@ -62,10 +63,11 @@ export class BridgeService {
   }
 
   private browser(target: BrowserTargetConfig): ChromeChat {
-    const key = JSON.stringify([target.sessionUrl, target.browserMcp.command, target.browserMcp.args]);
+    const identity = parseBrowserSessionRoute(target.sessionUrl, target.basePath)?.identity ?? target.sessionUrl;
+    const key = JSON.stringify([identity, target.browserMcp.command, target.browserMcp.args]);
     let chat = this.browserChats.get(key);
     if (!chat) {
-      chat = new ChromeChat({ ...target.browserMcp, sessionUrl: target.sessionUrl });
+      chat = new ChromeChat({ ...target.browserMcp, sessionUrl: target.sessionUrl, basePath: target.basePath });
       this.browserChats.set(key, chat);
     }
     return chat;
@@ -74,7 +76,12 @@ export class BridgeService {
   private targetForSession(session: SessionRecord): BridgeTargetConfig {
     const target = this.getTarget(session.targetId);
     const key = session.remoteSessionKey;
-    if (target.transport === "browser" ? key !== `browser:${target.sessionUrl}` : key?.startsWith("browser:")) {
+    if (
+      target.transport === "browser"
+        ? !key?.startsWith("browser:") ||
+          !sameBrowserSessionUrl(key.slice("browser:".length), target.sessionUrl, target.basePath)
+        : key?.startsWith("browser:")
+    ) {
       throw new BridgeError("INVALID_CONTRACT_CONFLICT", "The configured transport or browser chat differs from this handoff's recorded destination.");
     }
     return target;

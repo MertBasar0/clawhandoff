@@ -53,12 +53,23 @@ export function terminalBrowserResultJson(text: string): string | undefined {
 
 // Runs in the operator's selected chat tab. Read only the rendered transcript, never browser
 // credentials, page stores or network APIs. OpenClaw's copy-as-Markdown text retains code fences.
-export const browserTranscriptScript = String.raw`(expectedUrl, turnKey) => {
+export const browserTranscriptScript = String.raw`(expectedUrl, turnKey, uuidRoute) => {
   const browserMarkdownParts = ${browserMarkdownParts};
   const replySection = ${browserReplySection};
   const url = location.href;
   const page = { url, ready: false, busy: false, messages: [] };
-  if (url !== expectedUrl) return page;
+  const sameUuidRoute = !!uuidRoute && url.startsWith(uuidRoute.prefix) && (() => {
+    const tail = url.slice(uuidRoute.prefix.length);
+    if (!tail || /[/?#]/.test(tail)) return false;
+    try {
+      const seg = decodeURIComponent(tail.startsWith("~~") ? tail.slice(1) : tail);
+      return !["main", "global", "boot", "sessions"].includes(seg.toLowerCase()) &&
+        /^(?:.*-)?([0-9a-f]{32})$/i.exec(seg)?.[1]?.toLowerCase() === uuidRoute.uuid;
+    } catch {
+      return false;
+    }
+  })();
+  if (url !== expectedUrl && !sameUuidRoute) return page;
   // The router can retain the previous chat's DOM in an inactive pane.
   const threads = Array.from(document.querySelectorAll('main .chat-thread[role="log"]')).filter(thread => {
     const pane = thread.closest('.chat-pane-cache__pane');

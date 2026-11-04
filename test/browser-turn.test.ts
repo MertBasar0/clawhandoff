@@ -158,6 +158,17 @@ test("browser transcript script guards route, streaming placeholder footers, and
     runScript({ href: targetUrl }, makeDom({ footerSettled: true, composerCount, assistantText: "" }));
   assert.equal(projectComposer(1).controls?.composerLabel, "Nachricht eingeben");
   assert.equal(projectComposer(0).ready, false);
+
+  const uuidRoute = { prefix: "https://team.example/chat/roboclaw/", uuid: "4f99c346fa5d4daea8d9ba738d8bae4d" };
+  const runUuidScript = new Function(
+    "location",
+    "document",
+    `return (${browserTranscriptScript})(${JSON.stringify("https://team.example/chat/roboclaw/old-4f99c346fa5d4daea8d9ba738d8bae4d")}, ${JSON.stringify(key)}, ${JSON.stringify(uuidRoute)})`,
+  ) as typeof runScript;
+  const dom = makeDom({ footerSettled: true, assistantText: "" });
+  assert.equal(runUuidScript({ href: "https://team.example/chat/roboclaw/new-slug-4f99c346fa5d4daea8d9ba738d8bae4d" }, dom).ready, true);
+  assert.equal(runUuidScript({ href: "https://team.example/chat/roboclaw/new-slug-00000000fa5d4daea8d9ba738d8bae4d" }, dom).ready, false);
+  assert.equal(runUuidScript({ href: "https://team.example/chat/roboclaw/new-slug-4f99c346fa5d4daea8d9ba738d8bae4d?focus=composer" }, dom).ready, false);
   assert.equal(projectComposer(2).ready, false);
 
   // 1. Streaming placeholder footer (aria-hidden="true", no meta) must stay running, never premature completed/uncertain.

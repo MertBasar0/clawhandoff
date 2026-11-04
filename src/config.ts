@@ -31,6 +31,63 @@ function decodeSessionSegment(segment: string): string | null {
   }
 }
 
+const RESERVED_SESSION_RESTS = new Set(["main", "global", "boot", "sessions"]);
+
+export function parseBrowserSessionRoute(
+  sessionUrl: string,
+  basePath?: string,
+  expectedAgentId?: string,
+): { identity: string; uuidRoute?: { prefix: string; uuid: string } } | null {
+  try {
+    const url = new URL(sessionUrl);
+    if (
+      url.protocol !== "https:" || url.origin + url.pathname !== sessionUrl ||
+      url.pathname.endsWith("/")
+    ) {
+      return null;
+    }
+    const prefix = (basePath ?? "").replace(/\/$/, "") + "/";
+    if (!url.pathname.startsWith(prefix)) return null;
+    const parts = url.pathname.slice(prefix.length).split("/");
+    if (!parts.every((part) => decodeSessionSegment(part) !== null)) return null;
+    // OpenClaw uses the deployment mount, not the configured agent, to locate the namespace.
+    // Without a mount, namespace words inside a session key must not authorize another agent.
+    const candidates = (basePath === undefined ? parts : parts.slice(0, 1)).flatMap((part, index) => {
+      if (part !== "chat" && part !== "dashboard") return [];
+      const sessionStart = index + (parts[index + 2] === "~key" ? 3 : 2);
+      const agent = decodeSessionSegment(parts[index + 1] ?? "")?.toLowerCase();
+      return sessionStart < parts.length && agent ? [{ index, namespace: part, agent }] : [];
+    });
+    if (candidates.length !== 1) return null;
+    const { index, namespace, agent } = candidates[0]!;
+    if (expectedAgentId !== undefined && agent !== expectedAgentId.trim().toLowerCase()) return null;
+    // OpenClaw Control UI rewrites the mutable display-name slug before a full 32-hex session UUID.
+    if (parts.length === index + 3) {
+      const segment = decodeSessionSegment(parts[index + 2]!)!;
+      const uuid = !RESERVED_SESSION_RESTS.has(segment.toLowerCase())
+        ? /^(?:.*-)?([0-9a-f]{32})$/iu.exec(segment)?.[1]?.toLowerCase()
+        : undefined;
+      if (uuid) {
+        const mount = `${url.origin}${prefix}${parts.slice(0, index).join("/")}`.replace(/\/$/, "");
+        return {
+          identity: `${mount}/${namespace}/${encodeURIComponent(agent)}#${uuid}`,
+          uuidRoute: { prefix: `${url.origin}${prefix}${parts.slice(0, index + 2).join("/")}/`, uuid },
+        };
+      }
+    }
+    return { identity: sessionUrl };
+  } catch {
+    return null;
+  }
+}
+
+export function sameBrowserSessionUrl(a: string, b: string, basePath?: string): boolean {
+  if (a === b) return true;
+  const left = parseBrowserSessionRoute(a, basePath);
+  const right = parseBrowserSessionRoute(b, basePath);
+  return left !== null && right !== null && left.identity === right.identity;
+}
+
 const BrowserTargetSchema = z.object({
   transport: z.literal("browser"),
   targetId: z.string().min(1),
@@ -41,31 +98,7 @@ const BrowserTargetSchema = z.object({
     command: z.string().min(1),
     args: z.array(z.string()).default([]),
   }).strict(),
-}).strict().refine((target) => {
-  try {
-    const url = new URL(target.sessionUrl);
-    if (
-      url.protocol !== "https:" || url.origin + url.pathname !== target.sessionUrl ||
-      url.pathname.endsWith("/")
-    ) {
-      return false;
-    }
-    const prefix = (target.basePath ?? "").replace(/\/$/, "") + "/";
-    if (!url.pathname.startsWith(prefix)) return false;
-    const parts = url.pathname.slice(prefix.length).split("/");
-    if (!parts.every((part) => decodeSessionSegment(part) !== null)) return false;
-    // OpenClaw uses the deployment mount, not the configured agent, to locate the namespace.
-    // Without a mount, namespace words inside a session key must not authorize another agent.
-    const candidates = (target.basePath === undefined ? parts : parts.slice(0, 1)).flatMap((part, index) => {
-      if (part !== "chat" && part !== "dashboard") return [];
-      const sessionStart = index + (parts[index + 2] === "~key" ? 3 : 2);
-      return sessionStart < parts.length ? [decodeSessionSegment(parts[index + 1] ?? "")?.toLowerCase()] : [];
-    });
-    return candidates.length === 1 && candidates[0] === target.agentId.trim().toLowerCase();
-  } catch {
-    return false;
-  }
-}, { path: ["sessionUrl"], message: "Use the exact HTTPS /chat/<agentId>/<session...> (or /dashboard/<agentId>/<session...>) URL without credentials, query, or fragment. If the route is ambiguous, set basePath to the UI mount (/ for the root)." });
+}).strict().refine((target) => parseBrowserSessionRoute(target.sessionUrl, target.basePath, target.agentId) !== null, { path: ["sessionUrl"], message: "Use the exact HTTPS /chat/<agentId>/<session...> (or /dashboard/<agentId>/<session...>) URL without credentials, query, or fragment. If the route is ambiguous, set basePath to the UI mount (/ for the root)." });
 
 const BridgeConfigFileSchema = z.object({
   dataDir: z.string().min(1).optional(),
