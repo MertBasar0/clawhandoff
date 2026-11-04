@@ -1,6 +1,6 @@
 ---
 name: autonomous-handoff
-description: "Use agent-bridge-mcp to hand work to an OpenClaw Gateway or an existing browser chat, answer objections with commit-bound evidence, and reconcile the outcome before publication."
+description: "Use clawhandoff to hand work to an OpenClaw Gateway or an existing browser chat, answer objections with commit-bound evidence, and reconcile the outcome before publication."
 ---
 
 # Run an autonomous handoff

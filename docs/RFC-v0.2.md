@@ -1,8 +1,8 @@
-# agent-bridge-mcp architecture (RFC v0.2)
+# clawhandoff architecture (RFC v0.2)
 
 When an OpenClaw agent asks for proof that a build works on Windows, the local assistant runs the check and sends the result back to the same remote session. The bridge records which turn requested the evidence, verifies Git and pull request (PR) state, and tells the local assistant what to do next.
 
-For setup and a first handoff, see the [quickstart](quickstart.md). This RFC covers the design decisions, the implemented v0.2 contract, and options deferred to a later phase. The [input schemas](https://github.com/MertBasar0/agent-bridge-mcp/blob/c210b9022aadbf9a6518ed8582095bab29402526/src/schema.ts) and [output types](https://github.com/MertBasar0/agent-bridge-mcp/blob/c210b9022aadbf9a6518ed8582095bab29402526/src/types.ts) define the MCP contract at the revision documented here.
+For setup and a first handoff, see the [quickstart](quickstart.md). This RFC covers the design decisions, the implemented v0.2 contract, and options deferred to a later phase. The [input schemas](https://github.com/MertBasar0/clawhandoff/blob/c210b9022aadbf9a6518ed8582095bab29402526/src/schema.ts) and [output types](https://github.com/MertBasar0/clawhandoff/blob/c210b9022aadbf9a6518ed8582095bab29402526/src/types.ts) define the MCP contract at the revision documented here.
 
 ## 1. Who owns the task?
 

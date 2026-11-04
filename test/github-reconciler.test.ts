@@ -7,7 +7,7 @@ import { GitHubReconciler } from "../src/github-reconciler.js";
 import type { ReconciledPrState } from "../src/types.js";
 
 test("PR reconciliation verifies the exact open head and preserves uncertain publication outcomes", async (t) => {
-  const dataDir = mkdtempSync(join(tmpdir(), "agent-bridge-pr-state-"));
+  const dataDir = mkdtempSync(join(tmpdir(), "clawhandoff-pr-state-"));
   const stateFile = join(dataDir, "github-state.json");
   const previousStateFile = process.env.FAKE_GATEWAY_STATE_FILE;
   process.env.FAKE_GATEWAY_STATE_FILE = stateFile;

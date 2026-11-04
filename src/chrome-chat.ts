@@ -47,7 +47,7 @@ function oneEnabled(node: RecordValue, role: string, names: readonly string[]): 
 }
 
 export class ChromeChat {
-  private readonly client = new Client({ name: "agent-bridge-mcp-browser", version: "0.2.0" });
+  private readonly client = new Client({ name: "clawhandoff-browser", version: "0.2.0" });
   private connected?: Promise<void>;
 
   constructor(private readonly options: ChromeChatOptions) {

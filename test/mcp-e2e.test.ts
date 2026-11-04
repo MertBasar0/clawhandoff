@@ -13,7 +13,7 @@ const FAKE_GH_CLI = resolve(process.cwd(), "test/helpers/fake-gh-cli.mjs");
 
 test("MCP Stdio E2E: exposes all 6 tools and autonomous-handoff prompt cleanly over JSON-RPC stdio", async () => {
   const fixture = createTempGitFixture();
-  const dataDir = mkdtempSync(join(tmpdir(), "agent-bridge-mcp-e2e-"));
+  const dataDir = mkdtempSync(join(tmpdir(), "clawhandoff-e2e-"));
   const stateFile = join(dataDir, "fake-gateway-state.json");
   const configFile = join(dataDir, "bridge-config.json");
 

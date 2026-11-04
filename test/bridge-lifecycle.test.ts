@@ -36,7 +36,7 @@ function makeConfig(dataDir: string): BridgeConfig {
 
 test("Crash-Reconnect Acceptance Test: closing and restarting BridgeService mid-run attaches cleanly with zero duplicate sessions, runs, or PRs", async () => {
   const fixture = createTempGitFixture();
-  const dataDir = mkdtempSync(join(tmpdir(), "agent-bridge-crash-"));
+  const dataDir = mkdtempSync(join(tmpdir(), "clawhandoff-crash-"));
   const stateFile = join(dataDir, "fake-gateway-state.json");
   const prevStateEnv = process.env.FAKE_GATEWAY_STATE_FILE;
   process.env.FAKE_GATEWAY_STATE_FILE = stateFile;
@@ -151,7 +151,7 @@ test("Crash-Reconnect Acceptance Test: closing and restarting BridgeService mid-
 });
 
 test("Late attach recovers the bound final reply after the Gateway wait cache expires", async (t) => {
-  const dataDir = mkdtempSync(join(tmpdir(), "agent-bridge-late-"));
+  const dataDir = mkdtempSync(join(tmpdir(), "clawhandoff-late-"));
   const stateFile = join(dataDir, "gateway.json");
   const prior = process.env.FAKE_GATEWAY_STATE_FILE;
   process.env.FAKE_GATEWAY_STATE_FILE = stateFile;
@@ -212,7 +212,7 @@ test("Late attach recovers the bound final reply after the Gateway wait cache ex
 
 test("Lost create response recovers only from exact user custody, even after Gateway idempotency records expire", async () => {
   const fixture = createTempGitFixture();
-  const dataDir = mkdtempSync(join(tmpdir(), "agent-bridge-uncertain-"));
+  const dataDir = mkdtempSync(join(tmpdir(), "clawhandoff-uncertain-"));
   const stateFile = join(dataDir, "fake-gateway-state.json");
   const prevStateEnv = process.env.FAKE_GATEWAY_STATE_FILE;
   process.env.FAKE_GATEWAY_STATE_FILE = stateFile;
@@ -318,7 +318,7 @@ test("Lost create response recovers only from exact user custody, even after Gat
 
 test("Two-Step remote_gated Single-Publisher Gate blocks lockedPaths violations before PR creation and unlocks exact verified commit when clean", async () => {
   const fixture = createTempGitFixture();
-  const dataDir = mkdtempSync(join(tmpdir(), "agent-bridge-gate-"));
+  const dataDir = mkdtempSync(join(tmpdir(), "clawhandoff-gate-"));
   const stateFile = join(dataDir, "fake-gateway-state.json");
   const prevStateEnv = process.env.FAKE_GATEWAY_STATE_FILE;
   process.env.FAKE_GATEWAY_STATE_FILE = stateFile;
@@ -496,7 +496,7 @@ test("Two-Step remote_gated Single-Publisher Gate blocks lockedPaths violations 
 
 test("New evidence advances the loop across restart; repeated evidence stagnates and the turn budget is enforced", async () => {
   const fixture = createTempGitFixture();
-  const dataDir = mkdtempSync(join(tmpdir(), "agent-bridge-loop-"));
+  const dataDir = mkdtempSync(join(tmpdir(), "clawhandoff-loop-"));
   const stateFile = join(dataDir, "fake-gateway-state.json");
   const prevStateEnv = process.env.FAKE_GATEWAY_STATE_FILE;
   process.env.FAKE_GATEWAY_STATE_FILE = stateFile;

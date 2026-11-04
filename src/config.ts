@@ -77,9 +77,9 @@ const BridgeConfigFileSchema = z.object({
 
 export function loadBridgeConfig(explicitConfigPath?: string): BridgeConfig {
   const defaultDataDir =
-    process.env.AGENT_BRIDGE_DATA_DIR ?? join(homedir(), ".agent-bridge-mcp");
+    process.env.CLAWHANDOFF_DATA_DIR ?? join(homedir(), ".clawhandoff");
 
-  const configPath = explicitConfigPath ?? process.env.AGENT_BRIDGE_CONFIG_PATH;
+  const configPath = explicitConfigPath ?? process.env.CLAWHANDOFF_CONFIG_PATH;
   if (configPath) {
     if (!existsSync(configPath)) {
       throw new BridgeError(
@@ -97,7 +97,7 @@ export function loadBridgeConfig(explicitConfigPath?: string): BridgeConfig {
     }
     return {
       dataDir: parsed.data.dataDir ?? defaultDataDir,
-      ghCliPath: parsed.data.ghCliPath ?? process.env.AGENT_BRIDGE_GH_CLI,
+      ghCliPath: parsed.data.ghCliPath ?? process.env.CLAWHANDOFF_GH_CLI,
       defaultWaitBudgetMs: parsed.data.defaultWaitBudgetMs,
       defaultMaxAutonomousTurns: parsed.data.defaultMaxAutonomousTurns,
       targets: parsed.data.targets,
@@ -126,7 +126,7 @@ export function loadBridgeConfig(explicitConfigPath?: string): BridgeConfig {
 
   return {
     dataDir: defaultDataDir,
-    ghCliPath: process.env.AGENT_BRIDGE_GH_CLI,
+    ghCliPath: process.env.CLAWHANDOFF_GH_CLI,
     targets,
   };
 }

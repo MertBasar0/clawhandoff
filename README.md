@@ -1,6 +1,6 @@
-# agent-bridge-mcp
+# clawhandoff
 
-`agent-bridge-mcp` connects a local assistant to an OpenClaw agent such as Robo. Suppose Robo asks for a Windows test it cannot run. Your local assistant can run the test, send the result back to the same conversation and check Robo’s reply. The bridge records each turn in SQLite and can verify Git commits and pull requests. The local assistant owns the investigation and must stay active to advance it.
+`clawhandoff` connects a local assistant to an OpenClaw agent such as Robo. Suppose Robo asks for a Windows test it cannot run. Your local assistant can run the test, send the result back to the same conversation and check Robo’s reply. The bridge records each turn in SQLite and can verify Git commits and pull requests. The local assistant owns the investigation and must stay active to advance it.
 
 [Guided browser quickstart](docs/quickstart.md) · [Architecture and protocol (RFC v0.2)](docs/RFC-v0.2.md) · [Local orchestrator skill](skills/autonomous-handoff/SKILL.md)
 
@@ -9,8 +9,8 @@
 Install Node.js 22.13 or newer, pnpm and Git 2.38 or newer. Clone the repository and build the server.
 
 ```sh
-git clone https://github.com/MertBasar0/agent-bridge-mcp.git
-cd agent-bridge-mcp
+git clone https://github.com/MertBasar0/clawhandoff.git
+cd clawhandoff
 pnpm install --frozen-lockfile
 pnpm run build
 node -p "process.execPath"
@@ -78,18 +78,18 @@ For Gateway access, save this as your config or merge the target into the same `
 - **Direct token.** Use `"authMode": "direct-token"` with the appropriate `ws://` or `wss://` Gateway URL. Set `tokenEnvVar` to the **name** of the environment variable containing the token. The bridge process must inherit it. The default name is `OPENCLAW_BRIDGE_TARGET_TOKEN`.
 - **Existing profile.** Use `"authMode": "existing-profile"` and a `profileDir` containing an `openclaw.json` for the configured Gateway. The bridge checks that the stored remote URL matches.
 
-For one Gateway, you can omit the config file and set `OPENCLAW_HANDOFF_URL`, `OPENCLAW_HANDOFF_AGENT` and, when applicable, `OPENCLAW_HANDOFF_PROJECT` in the MCP server’s environment. `OPENCLAW_HANDOFF_TARGET_ID` defaults to `robo` and `OPENCLAW_HANDOFF_AUTH_MODE` defaults to `edge-cloudflare`. `OPENCLAW_HANDOFF_CLI` and `OPENCLAW_HANDOFF_CLOUDFLARED` override the executable paths. An explicit `--config` or `AGENT_BRIDGE_CONFIG_PATH` selects file-based targets instead.
+For one Gateway, you can omit the config file and set `OPENCLAW_HANDOFF_URL`, `OPENCLAW_HANDOFF_AGENT` and, when applicable, `OPENCLAW_HANDOFF_PROJECT` in the MCP server’s environment. `OPENCLAW_HANDOFF_TARGET_ID` defaults to `robo` and `OPENCLAW_HANDOFF_AUTH_MODE` defaults to `edge-cloudflare`. `OPENCLAW_HANDOFF_CLI` and `OPENCLAW_HANDOFF_CLOUDFLARED` override the executable paths. An explicit `--config` or `CLAWHANDOFF_CONFIG_PATH` selects file-based targets instead.
 
 ## Register the bridge with your local assistant
 
-Register a **stdio MCP server** named `agent-bridge` using the Node path from the build step. For clients that accept an `mcpServers` JSON object, the entry looks like this. Replace all three paths with absolute paths on the machine running the client.
+Register a **stdio MCP server** named `clawhandoff` using the Node path from the build step. For clients that accept an `mcpServers` JSON object, the entry looks like this. Replace all three paths with absolute paths on the machine running the client.
 
 ```json
 {
   "mcpServers": {
-    "agent-bridge": {
+    "clawhandoff": {
       "command": "/absolute/path/to/node",
-      "args": ["/absolute/path/to/agent-bridge-mcp/dist/cli.js", "--config", "/absolute/path/to/bridge-config.json"]
+      "args": ["/absolute/path/to/clawhandoff/dist/cli.js", "--config", "/absolute/path/to/bridge-config.json"]
     }
   }
 }
@@ -99,10 +99,10 @@ Claude Code and Codex can register the same server from the command line. Run th
 
 ```sh
 # Claude Code
-claude mcp add agent-bridge -- /absolute/path/to/node /absolute/path/to/agent-bridge-mcp/dist/cli.js --config /absolute/path/to/bridge-config.json
+claude mcp add clawhandoff -- /absolute/path/to/node /absolute/path/to/clawhandoff/dist/cli.js --config /absolute/path/to/bridge-config.json
 
 # Codex
-codex mcp add agent-bridge -- /absolute/path/to/node /absolute/path/to/agent-bridge-mcp/dist/cli.js --config /absolute/path/to/bridge-config.json
+codex mcp add clawhandoff -- /absolute/path/to/node /absolute/path/to/clawhandoff/dist/cli.js --config /absolute/path/to/bridge-config.json
 ```
 
 Ask your assistant to read the [orchestrator skill](skills/autonomous-handoff/SKILL.md) before the first handoff. Hosts that expose MCP prompts can also select `autonomous-handoff` with `targetId` and `goal`. Registration alone makes the tools available.
@@ -123,13 +123,13 @@ These are arguments for MCP tools in your local assistant. Use `robo` in place o
   "envelope": {
     "schemaVersion": "0.2",
     "requestId": "browser-receipt-review-01",
-    "workspaceId": "agent-bridge-mcp",
+    "workspaceId": "clawhandoff",
     "title": "Review browser reply ownership",
     "outcome": "Explain how the bridge handles a past success report quoted in a new Robo reply.",
     "mode": "investigate",
     "publisherOwner": "none",
     "gitContext": {
-      "repoId": "MertBasar0/agent-bridge-mcp",
+      "repoId": "MertBasar0/clawhandoff",
       "pinnedBaseCommitSha": "c210b9022aadbf9a6518ed8582095bab29402526"
     },
     "requestedCapabilities": {
@@ -142,7 +142,7 @@ These are arguments for MCP tools in your local assistant. Use `robo` in place o
 }
 ```
 
-**3. Save the returned `handoffId` and follow `orchestratorDirective.action`.** `waitBudgetMs` controls how long to observe a turn during a call. If the work is still running, the bridge returns `POLL_ATTACH`. Call `bridge_handoff_attach` with that `handoffId`, including after restarting the bridge. Use the same data directory across restarts (default `~/.agent-bridge-mcp`, configurable via `dataDir` or `AGENT_BRIDGE_DATA_DIR`).
+**3. Save the returned `handoffId` and follow `orchestratorDirective.action`.** `waitBudgetMs` controls how long to observe a turn during a call. If the work is still running, the bridge returns `POLL_ATTACH`. Call `bridge_handoff_attach` with that `handoffId`, including after restarting the bridge. Use the same data directory across restarts (default `~/.clawhandoff`, configurable via `dataDir` or `CLAWHANDOFF_DATA_DIR`).
 
 | Action | What the local assistant does |
 | --- | --- |

@@ -9,8 +9,8 @@ The example below investigates a specific commit and requires no code changes or
 Install Node.js 22.13 or later, pnpm, and Git 2.38 or later in the environment where your local assistant runs. If you already have a checkout, start with the install command in the repository root.
 
 ```sh
-git clone https://github.com/MertBasar0/agent-bridge-mcp.git
-cd agent-bridge-mcp
+git clone https://github.com/MertBasar0/clawhandoff.git
+cd clawhandoff
 pnpm install --frozen-lockfile
 pnpm run build
 ```
@@ -23,7 +23,7 @@ The build produces `dist/cli.js`. To try the full loop without a Team account, r
 2. In Chrome, enable remote debugging at `chrome://inspect/#remote-debugging`. Chrome may ask you to approve a new connection. The bridge uses your signed-in browser session, and its messages appear in the Team chat history. [Chrome connection guide](https://developer.chrome.com/blog/chrome-devtools-mcp-debug-your-browser-session)
 3. Locate the Chrome DevTools MCP executable on the system running Chrome. The bridge relies on support for page IDs and structured output. The project has tested version `1.11.0`. [Chrome DevTools MCP setup](https://github.com/ChromeDevTools/chrome-devtools-mcp)
 
-Save the following configuration as `bridge.json`. On Linux or WSL, you can create the directory with `mkdir -p ~/.config/agent-bridge` and save the file there. Replace `sessionUrl` with the chat URL you copied and `command` with the absolute path to your executable. In this example, `robo-web` is the name your local assistant uses for the target and `roboclaw` is the agent ID in the chat URL.
+Save the following configuration as `bridge.json`. On Linux or WSL, you can create the directory with `mkdir -p ~/.config/clawhandoff` and save the file there. Replace `sessionUrl` with the chat URL you copied and `command` with the absolute path to your executable. In this example, `robo-web` is the name your local assistant uses for the target and `roboclaw` is the agent ID in the chat URL.
 
 ```json
 {
@@ -45,23 +45,23 @@ Save the following configuration as `bridge.json`. On Linux or WSL, you can crea
 - **Chrome on Windows, bridge in WSL.** Set `browserMcp.command` to the WSL path to Windows `node.exe`. Add the Windows path to the installed Chrome DevTools MCP entry file as the first argument, before the flags. Use paths in the bridge's own environment for `dist/cli.js` and `bridge.json`.
 - **Custom Control UI path.** If your Control UI is mounted at `/dashboard` and the URL looks like `/dashboard/chat/roboclaw/topic`, add `"basePath": "/dashboard"` to the browser target. If the URL is ambiguous and the UI is mounted at the root, use `"basePath": "/"`.
 
-Register a **stdio** MCP server named `agent-bridge` in your local assistant. Use the following `command` and `args` in your client's configuration format, replacing all three paths with absolute paths. Your assistant uses these settings to start the bridge, which reads the target from `bridge.json`.
+Register a **stdio** MCP server named `clawhandoff` in your local assistant. Use the following `command` and `args` in your client's configuration format, replacing all three paths with absolute paths. Your assistant uses these settings to start the bridge, which reads the target from `bridge.json`.
 
 ```json
 {
   "command": "/absolute/path/to/node",
   "args": [
-    "/absolute/path/to/agent-bridge-mcp/dist/cli.js",
+    "/absolute/path/to/clawhandoff/dist/cli.js",
     "--config",
     "/absolute/path/to/bridge.json"
   ]
 }
 ```
 
-With Codex CLI on Linux or WSL, you can register the server from the repository root with this command if you saved the configuration in `~/.config/agent-bridge`.
+With Codex CLI on Linux or WSL, you can register the server from the repository root with this command if you saved the configuration in `~/.config/clawhandoff`.
 
 ```sh
-codex mcp add agent-bridge -- "$(node -p 'process.execPath')" "$PWD/dist/cli.js" --config "$HOME/.config/agent-bridge/bridge.json"
+codex mcp add clawhandoff -- "$(node -p 'process.execPath')" "$PWD/dist/cli.js" --config "$HOME/.config/clawhandoff/bridge.json"
 ```
 
 Confirm that your assistant can see the `bridge_preflight` tool. Before the first handoff, have it read the [local orchestration instructions](../skills/autonomous-handoff/SKILL.md). In clients that support MCP prompts, you can also open `autonomous-handoff` with the target name and task.
@@ -88,7 +88,7 @@ Look for `browserReady: true`, which means the bridge can read the selected chat
     "mode": "investigate",
     "publisherOwner": "none",
     "gitContext": {
-      "repoId": "MertBasar0/agent-bridge-mcp",
+      "repoId": "MertBasar0/clawhandoff",
       "pinnedBaseCommitSha": "c210b9022aadbf9a6518ed8582095bab29402526"
     },
     "requestedCapabilities": {
@@ -129,7 +129,7 @@ If that source answers the objection, call `bridge_handoff_continue` with the ev
   "message": "A success report from the earlier turn carries the wrong reply marker. I checked how the bridge selects this turn's reply and reads its result.",
   "evidenceRefs": [{
     "claim": "The browser passes the current turn's Bridge-Reply marker to browserReplySection. The function selects text starting at that marker and rejects the reply as ambiguous if another marker follows. terminalBrowserResultJson reads a handoff-result block only at the end of the selected reply.",
-    "sourceRef": "https://github.com/MertBasar0/agent-bridge-mcp/blob/c210b9022aadbf9a6518ed8582095bab29402526/src/browser-turn.ts#L34-L113"
+    "sourceRef": "https://github.com/MertBasar0/clawhandoff/blob/c210b9022aadbf9a6518ed8582095bab29402526/src/browser-turn.ts#L34-L113"
   }]
 }
 ```

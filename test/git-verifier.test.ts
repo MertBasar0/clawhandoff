@@ -8,7 +8,7 @@ import { createTempGitFixture } from "./helpers/git-fixture.js";
 
 test("GitVerifier locks the handed-off source, catches remote edits and reverts, and leaves dirty local files untouched", async () => {
   const fixture = createTempGitFixture();
-  const dataDir = mkdtempSync(join(tmpdir(), "agent-bridge-verifier-"));
+  const dataDir = mkdtempSync(join(tmpdir(), "clawhandoff-verifier-"));
 
   try {
     const installerPath = "installer/installer.iss";
@@ -100,7 +100,7 @@ test("GitVerifier locks the handed-off source, catches remote edits and reverts,
 
 test("GitVerifier requires both PR base and handoff source ancestry even without locked files", async () => {
   const fixture = createTempGitFixture();
-  const dataDir = mkdtempSync(join(tmpdir(), "agent-bridge-ancestry-"));
+  const dataDir = mkdtempSync(join(tmpdir(), "clawhandoff-ancestry-"));
   try {
     const baseSha = fixture.commitFile("README.md", "main", "main history");
     fixture.git(["push", "origin", "main"]);
@@ -128,7 +128,7 @@ test("GitVerifier requires both PR base and handoff source ancestry even without
 
 test("GitVerifier detects locked paths containing Unicode and whitespace", async () => {
   const fixture = createTempGitFixture();
-  const dataDir = mkdtempSync(join(tmpdir(), "agent-bridge-paths-"));
+  const dataDir = mkdtempSync(join(tmpdir(), "clawhandoff-paths-"));
   try {
     const lockedPath = "installer/kurulum özel.iss";
     const base = fixture.commitFile(lockedPath, "verified", "base");

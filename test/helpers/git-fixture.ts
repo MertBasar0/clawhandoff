@@ -14,7 +14,7 @@ export interface TempGitFixture {
 }
 
 export function createTempGitFixture(): TempGitFixture {
-  const rootDir = mkdtempSync(join(tmpdir(), "agent-bridge-git-"));
+  const rootDir = mkdtempSync(join(tmpdir(), "clawhandoff-git-"));
   const originBareDir = join(rootDir, "origin.git");
   const workRepoDir = join(rootDir, "work");
   mkdirSync(originBareDir, { recursive: true });

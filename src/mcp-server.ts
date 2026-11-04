@@ -62,7 +62,7 @@ function formatToolError(err: unknown) {
 
 export function createBridgeMcpServer(service: BridgeService): McpServer {
   const server = new McpServer({
-    name: "agent-bridge-mcp",
+    name: "clawhandoff",
     version: "0.2.0",
   });
 

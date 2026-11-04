@@ -1,5 +1,5 @@
 {
-  "name": "agent-bridge-mcp",
+  "name": "clawhandoff",
   "version": "0.2.0",
   "description": "Local-first autonomous agent handoff, crash-safe reconciliation, checkout-free Git object verification, and two-step single-publisher gate over MCP.",
   "type": "module",
@@ -8,7 +8,7 @@
     "node": ">=22.13.0"
   },
   "bin": {
-    "agent-bridge-mcp": "./dist/cli.js"
+    "clawhandoff": "./dist/cli.js"
   },
   "exports": {
     ".": {

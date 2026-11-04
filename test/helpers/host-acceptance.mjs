@@ -23,7 +23,7 @@ function reply(accepted) {
 }
 
 if (process.argv[2] === "setup") {
-  const root = mkdtempSync(join(tmpdir(), "agent-bridge-host-"));
+  const root = mkdtempSync(join(tmpdir(), "clawhandoff-host-"));
   const workspace = join(root, "project");
   mkdirSync(workspace);
   const git = (...args) => execFileSync("git", args, { cwd: workspace, encoding: "utf8" }).trim();
