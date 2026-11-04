@@ -22,7 +22,7 @@ const ReportedResultSchema = z.object({
   claimedChecks: z
     .array(
       z.object({
-        command: z.string().min(1).max(500),
+        command: z.string().min(1).max(4_000),
         exitCode: z.number().int().optional(),
         environment: z.string().max(200).optional(),
       }),

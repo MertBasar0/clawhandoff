@@ -62,6 +62,21 @@ test("a browser handoff result belongs only to the section starting at the curre
   const notFinal = marker + "\n" + completed + "\nNo evidence for *this* request.";
   assert.equal(parseReportedResult(read(notFinal).text!, "browser").disposition, "needs_evidence");
   assert.equal(parseReportedResult(read(marker + "\n" + completed + "\r\n\n").text!, "browser").disposition, "completed");
+
+  const longCommand = `node --input-type=module <<'NODE'\n${"console.log('verified');\n".repeat(35)}NODE`;
+  assert.ok(longCommand.length > 500);
+  const longCheckBlock =
+    "```handoff-result\n" +
+    JSON.stringify({
+      disposition: "completed",
+      summaryDelta: "Verified with multi-line inline probe",
+      blockers: [],
+      claimedChecks: [{ command: longCommand, exitCode: 0, environment: "linux" }],
+    }) +
+    "\n```";
+  const parsedLong = parseReportedResult(read(marker + "\n" + longCheckBlock).text!, "browser");
+  assert.equal(parsedLong.disposition, "completed");
+  assert.equal(parsedLong.claimedChecks[0]?.command, longCommand);
 });
 
 test("browser transcript script guards route, streaming placeholder footers, and oversized loading bubbles", () => {
