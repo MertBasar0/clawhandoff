@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { normalizeLockedPath } from "./schema.js";
@@ -78,6 +78,10 @@ export class GitVerifier {
     const notes: string[] = [];
 
     try {
+      if (localRepoPath && isLocalPath(localRepoPath)) {
+        await this.attachLocalAlternates(mirrorDir, localRepoPath);
+      }
+
       // The PR base and handed-off source have different roles: local fixes before
       // the handoff are allowed, while subsequent remote edits remain locked.
       for (const sha of new Set([pinnedBaseCommitSha, lockBaseSha])) {
@@ -85,6 +89,9 @@ export class GitVerifier {
           await this.ensureCommitPresent(mirrorDir, localRepoPath, sha);
         }
         await this.ensureCommitPresent(mirrorDir, remoteUrlOrPath, sha);
+        if (await this.hasCommit(mirrorDir, sha)) {
+          await this.runGit(mirrorDir, ["update-ref", `refs/bridge/hints/${sha}`, sha], false).catch(() => {});
+        }
       }
 
       const remoteIsLocal = isLocalPath(remoteUrlOrPath);
@@ -268,6 +275,27 @@ export class GitVerifier {
       await this.runGit(mirrorDir, ["init", "--bare", "--quiet"], false);
     }
     return mirrorDir;
+  }
+
+  /** Borrow local object packs read-only (including linked worktrees) so monorepo fetches negotiate deltas in O(1). */
+  private async attachLocalAlternates(mirrorDir: string, localRepoPath: string): Promise<void> {
+    try {
+      const commonDir = (
+        await this.runGit(localRepoPath, ["rev-parse", "--path-format=absolute", "--git-common-dir"], false)
+      ).trim();
+      if (!commonDir) return;
+      const objectsDir = join(commonDir, "objects").replace(/\\/g, "/");
+      if (!existsSync(objectsDir) || !statSync(objectsDir).isDirectory()) return;
+      const infoDir = join(mirrorDir, "objects", "info");
+      mkdirSync(infoDir, { recursive: true });
+      const alternatesPath = join(infoDir, "alternates");
+      const existing = existsSync(alternatesPath) ? splitLines(readFileSync(alternatesPath, "utf8")) : [];
+      if (!existing.includes(objectsDir)) {
+        writeFileSync(alternatesPath, [...existing, objectsDir, ""].join("\n"), "utf8");
+      }
+    } catch {
+      // Fall back to standard fetch when localRepoPath has no accessible common object store.
+    }
   }
 
   private async hasCommit(mirrorDir: string, sha: string): Promise<boolean> {

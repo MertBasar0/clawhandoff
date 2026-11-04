@@ -147,3 +147,33 @@ test("GitVerifier detects locked paths containing Unicode and whitespace", async
     rmSync(dataDir, { recursive: true, force: true });
   }
 });
+
+test("GitVerifier borrows common object store from linked Git worktrees for delta-only verification", async () => {
+  const fixture = createTempGitFixture();
+  const dataDir = mkdtempSync(join(tmpdir(), "clawhandoff-worktree-"));
+  try {
+    const base = fixture.commitFile("README.md", "base\n", "base commit");
+    fixture.git(["push", "origin", "main"]);
+    const worktreeDir = join(fixture.rootDir, "linked-wt");
+    fixture.git(["worktree", "add", "-b", "wt-branch", worktreeDir, "HEAD"]);
+    const candidateSha = fixture.commitFile("src/wt.ts", "export const wt = 1;\n", "wt commit", worktreeDir);
+    const candidateTree = fixture.revParse("HEAD^{tree}", worktreeDir);
+    fixture.git(["push", "origin", "wt-branch"], worktreeDir);
+
+    const verifier = new GitVerifier(dataDir);
+    const observed = await verifier.verifyCandidate({
+      remoteUrlOrPath: fixture.originBareDir,
+      localRepoPath: worktreeDir,
+      candidateRef: "refs/heads/wt-branch",
+      pinnedBaseCommitSha: base,
+      pinnedSourceCommitSha: candidateSha,
+      expectedTreeSha: candidateTree,
+    });
+    assert.equal(observed.reachableRefVerified, true);
+    assert.equal(observed.observedHeadSha, candidateSha.toLowerCase());
+    assert.equal(observed.treeMatchesExpected, true);
+  } finally {
+    fixture.cleanup();
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});
