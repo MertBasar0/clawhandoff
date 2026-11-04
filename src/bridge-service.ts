@@ -398,7 +398,8 @@ export class BridgeService {
     const chat = this.browser(target);
     const deadline = Date.now() + waitBudgetMs;
     let submitted = turn.dispatchState !== "prepared";
-    let accepted = turn.dispatchState === "dispatched";
+    let accepted = turn.dispatchState === "dispatched" || Boolean(turn.runId);
+    let needsDispatchRecord = turn.dispatchState !== "dispatched";
     let reply: string | undefined;
     const uncertain = (errorText: string) =>
       this.store.markTurnUncertain({ handoffId, turnId, errorText, now: new Date().toISOString() });
@@ -412,13 +413,14 @@ export class BridgeService {
         });
       }
       for (;;) {
-        const receipt = inspectBrowserTurn(await chat.read(idempotencyKey), idempotencyKey);
-        if (!accepted && (receipt.state === "running" || receipt.state === "completed")) {
+        const receipt = inspectBrowserTurn(await chat.read(idempotencyKey), idempotencyKey, accepted);
+        if (needsDispatchRecord && (receipt.state === "running" || receipt.state === "completed")) {
           this.store.recordDispatched({
             handoffId, turnId, remoteSessionKey: `browser:${target.sessionUrl}`,
             remoteSessionUrl: target.sessionUrl, runId: `browser:${idempotencyKey}`, now: new Date().toISOString(),
           });
           accepted = true;
+          needsDispatchRecord = false;
         }
         if (receipt.state === "completed") {
           reply = receipt.text;

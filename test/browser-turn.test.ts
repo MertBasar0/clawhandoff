@@ -11,7 +11,8 @@ const otherUser = { role: "user", text: "" };
 const observe = (
   messages: Array<{ role: string; text: string; unconfirmed?: boolean; sendState?: string; settling?: boolean; loading?: boolean }>,
   busy = false,
-) => inspectBrowserTurn(JSON.stringify({ ready: true, busy, messages }), key);
+  alreadyDispatched = false,
+) => inspectBrowserTurn(JSON.stringify({ ready: true, busy, messages }), key, alreadyDispatched);
 
 test("browser turn settles only its acknowledged final reply after the matching submission", () => {
   assert.equal(wrapBrowserPrompt(key, "Check receipt").split("\n")[0], request.text);
@@ -30,6 +31,11 @@ test("browser turn settles only its acknowledged final reply after the matching 
   assert.equal(observe([request, { ...answer, text: "> " + answer.text }]).state, "uncertain");
   assert.equal(observe([request, { role: "assistant", text: "```text\n" + answer.text + "\n```" }]).state, "uncertain");
   assert.equal(observe([answer, { role: "assistant", text: request.text }]).state, "absent");
+  // Already-dispatched turns survive Control UI history reload/virtualization when the user prompt scrolls out.
+  assert.equal(observe([answer], false, true).state, "completed");
+  assert.equal(observe([], true, true).state, "running");
+  assert.equal(observe([], false, true).state, "uncertain");
+  assert.equal(observe([otherUser, answer], false, true).state, "uncertain");
 });
 
 test("a browser handoff result belongs only to the section starting at the current reply marker", () => {

@@ -160,22 +160,34 @@ interface TranscriptMessage {
   loading?: boolean;
 }
 
-export function inspectBrowserTurn(snapshot: string, idempotencyKey: string): BrowserTurnObservation {
+export function inspectBrowserTurn(
+  snapshot: string,
+  idempotencyKey: string,
+  alreadyDispatched = false,
+): BrowserTurnObservation {
   const page = JSON.parse(snapshot) as { ready: boolean; busy: boolean; messages: TranscriptMessage[] };
   if (!page.ready) return { state: "uncertain" };
   const request = `Bridge-Turn: ${idempotencyKey}`;
   const reply = `Bridge-Reply: ${idempotencyKey}`;
   const requests = page.messages.flatMap((message, index) =>
     message.role === "user" && message.text === request ? [index] : []);
-  if (requests.length === 0) return { state: "absent" };
-  if (requests.length !== 1) return { state: "uncertain" };
+  if (requests.length > 1) return { state: "uncertain" };
+  if (requests.length === 0 && !alreadyDispatched) return { state: "absent" };
 
-  const requestIndex = requests[0]!;
-  const requestMsg = page.messages[requestIndex];
-  if (requestMsg?.sendState === "waiting-reconnect") return { state: "pending" };
-  // The control UI can display optimistic, queued or failed sends as ordinary user bubbles.
-  if (requestMsg?.unconfirmed || requestMsg?.sendState) return { state: "uncertain" };
-  const later = page.messages.slice(requestIndex + 1);
+  let later: TranscriptMessage[];
+  if (requests.length === 1) {
+    const requestIndex = requests[0]!;
+    const requestMsg = page.messages[requestIndex];
+    if (requestMsg?.sendState === "waiting-reconnect") return { state: "pending" };
+    // The control UI can display optimistic, queued or failed sends as ordinary user bubbles.
+    if (requestMsg?.unconfirmed || requestMsg?.sendState) return { state: "uncertain" };
+    later = page.messages.slice(requestIndex + 1);
+  } else {
+    // Submission was already confirmed in an earlier poll; the user bubble scrolled or
+    // reloaded out of the rendered tail window while the remote agent executed tool calls.
+    later = page.messages;
+  }
+
   const nextUser = later.findIndex(message => message.role === "user");
   const answers = nextUser < 0 ? later : later.slice(0, nextUser);
   let matched: string | undefined;
@@ -194,5 +206,6 @@ export function inspectBrowserTurn(snapshot: string, idempotencyKey: string): Br
     // The ordinary bridge result parser handles a missing/malformed result conservatively.
     return { state: "completed", text: matched };
   }
+  if (requests.length === 0) return { state: "uncertain" };
   return { state: nextUser >= 0 || answers.length > 0 ? "uncertain" : "running" };
 }
