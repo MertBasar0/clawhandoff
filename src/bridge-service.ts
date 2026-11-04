@@ -423,7 +423,9 @@ export class BridgeService {
         }
         const remaining = deadline - Date.now();
         if (remaining <= 0) {
-          if (receipt.state === "absent") uncertain("The sent turn is not visible in the configured chat. Reopen it and attach without resending.");
+          if (receipt.state === "absent" || receipt.state === "pending") {
+            uncertain("The sent turn is not yet confirmed in the configured chat. Reopen it and attach without resending.");
+          }
           break;
         }
         await delay(Math.min(remaining, 1200));

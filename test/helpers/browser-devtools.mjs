@@ -16,10 +16,15 @@ server.registerTool("list_pages", { inputSchema: {} }, async () => result({
   pages: [{ id: 7, url: load().sessionUrl }, { id: 19, url: "https://example.invalid/unrelated" }],
 }));
 server.registerTool("take_snapshot", { inputSchema: page }, async () => {
-  const { sessionUrl, draft } = load();
+  const { sessionUrl, draft, locale, remoteResponding } = load();
+  const de = locale === "de";
+  const composerLabel = de ? "Nachricht eingeben" : "Chat composer";
+  const sendLabel = draft ? (de ? "Nachricht senden" : "Send message") : (de ? "Zuerst eine Nachricht eingeben" : "Write a message first");
+  const stopLabel = de ? "Generierung stoppen" : "Stop generating";
   return result({ snapshot: { id: "1_0", role: "RootWebArea", url: sessionUrl, children: [
-    { id: "1_1", role: "textbox", name: "Chat composer", ...(draft && { value: draft }) },
-    { id: "1_2", role: "button", name: draft ? "Send message" : "Write a message first", disabled: !draft },
+    { id: "1_1", role: "textbox", name: composerLabel, ...(draft && { value: draft }) },
+    ...(remoteResponding ? [{ id: "1_3", role: "button", name: stopLabel, disabled: false }] : []),
+    { id: "1_2", role: "button", name: sendLabel, disabled: !draft || Boolean(remoteResponding) },
   ] } });
 });
 server.registerTool("fill", { inputSchema: { ...page, uid: z.literal("1_1"), value: z.string() } }, async ({ value }) => {
@@ -48,9 +53,15 @@ server.registerTool("click", { inputSchema: { ...page, uid: z.literal("1_2") } }
   if (state.messages.length === 2) return { isError: true, content: [{ type: "text", text: "click acknowledgement lost" }] };
   return result({});
 });
-server.registerTool("evaluate_script", { inputSchema: { ...page, function: z.string() } }, async () => {
-  const { sessionUrl: url, messages } = load();
-  const projection = { url, ready: true, busy: false, messages: messages.map(({ role, text }) => ({
+server.registerTool("evaluate_script", { inputSchema: { ...page, function: z.string(), waitForStableDom: z.literal(false) } }, async () => {
+  const { sessionUrl: url, messages, draft, locale, remoteResponding } = load();
+  const de = locale === "de";
+  const controls = {
+    composerLabel: de ? "Nachricht eingeben" : "Chat composer",
+    sendLabel: draft ? (de ? "Nachricht senden" : "Send message") : (de ? "Zuerst eine Nachricht eingeben" : "Write a message first"),
+    stopLabel: remoteResponding ? (de ? "Generierung stoppen" : "Stop generating") : "",
+  };
+  const projection = { url, ready: true, busy: Boolean(remoteResponding), controls, messages: messages.map(({ role, text }) => ({
     role, text: role === "user" ? text.split("\n", 1)[0] : text,
   })) };
   return result({ message: `Script ran on page and returned:\n\`\`\`json\n${JSON.stringify(projection)}\n\`\`\`` });

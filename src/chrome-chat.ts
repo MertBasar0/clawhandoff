@@ -19,6 +19,12 @@ const COMPOSER = ["Chat composer", "Sohbet mesajı yazma alanı"];
 const SEND = ["Send message", "Mesaj gönder"];
 const STOP = ["Stop", "Stop generating", "Durdur", "Yanıt oluşturmayı durdur"];
 
+function labelSet(dynamicLabel: unknown, defaults: readonly string[]): string[] {
+  return typeof dynamicLabel === "string" && dynamicLabel.trim() && !defaults.includes(dynamicLabel)
+    ? [dynamicLabel, ...defaults]
+    : [...defaults];
+}
+
 // Only genuine accessibility nodes can supply a UID. Text rendered by a user or an
 // assistant may itself contain strings that look like a printed accessibility tree.
 function controls(node: RecordValue, role: string, names: readonly string[]): RecordValue[] {
@@ -107,10 +113,9 @@ export class ChromeChat {
     return id;
   }
 
-  async read(turnKey?: string): Promise<string> {
-    const pageId = await this.page();
+  private async readProjection(pageId: number, turnKey?: string): Promise<RecordValue> {
     const script = `() => (${browserTranscriptScript})(${JSON.stringify(this.options.sessionUrl)}, ${JSON.stringify(turnKey ?? null)})`;
-    const { message } = await this.tool("evaluate_script", { pageId, function: script });
+    const { message } = await this.tool("evaluate_script", { pageId, function: script, waitForStableDom: false });
     const body = typeof message === "string" && /^Script ran on page and returned:\n```json\n([\s\S]*)\n```$/.exec(message)?.[1];
     let projection: unknown;
     try {
@@ -122,38 +127,58 @@ export class ChromeChat {
         projection.ready !== true || typeof projection.busy !== "boolean" || !Array.isArray(projection.messages)) {
       throw new BridgeError("TARGET_UNAVAILABLE", "Open the configured chat and wait for its transcript and composer to finish loading.");
     }
-    return JSON.stringify(projection);
+    return projection;
   }
 
-  private async composerSnapshot(pageId: number): Promise<RecordValue> {
+  async read(turnKey?: string): Promise<string> {
+    const pageId = await this.page();
+    return JSON.stringify(await this.readProjection(pageId, turnKey));
+  }
+
+  private async composerSnapshot(pageId: number, stopNames: readonly string[]): Promise<RecordValue> {
     const { snapshot } = await this.tool("take_snapshot", { pageId });
     if (!isRecord(snapshot) || snapshot.role !== "RootWebArea" || snapshot.url !== this.options.sessionUrl) {
       throw new BridgeError("TARGET_UNAVAILABLE", "The tab no longer displays the configured Robo chat.");
     }
-    if (controls(snapshot, "button", STOP).length > 0) {
+    if (controls(snapshot, "button", stopNames).length > 0) {
       throw new BridgeError("BUSY_ACTIVE_TURN", "Robo is already responding in the configured chat.");
     }
     return snapshot;
+  }
+
+  private async inspectComposer(
+    pageId: number,
+    busyCode: "BUSY_ACTIVE_TURN" | "RECONCILIATION_UNCERTAIN",
+    busyMessage: string,
+  ) {
+    const proj = await this.readProjection(pageId);
+    if (proj.busy === true) throw new BridgeError(busyCode, busyMessage);
+    const ctl = isRecord(proj.controls) ? proj.controls : undefined;
+    const snap = await this.composerSnapshot(pageId, labelSet(ctl?.stopLabel, STOP));
+    return {
+      snap,
+      composer: oneEnabled(snap, "textbox", labelSet(ctl?.composerLabel, COMPOSER)),
+      sendNames: labelSet(ctl?.sendLabel, SEND),
+    };
   }
 
   async send(text: string, claim: () => boolean): Promise<void> {
     // HTML textareas normalize Windows line endings in their value.
     const draftText = text.replace(/\r\n?/g, "\n");
     const pageId = await this.page();
-    const initial = await this.composerSnapshot(pageId);
-    const composer = oneEnabled(initial, "textbox", COMPOSER);
-    if ((composer.value ?? "") !== "" || controls(initial, "button", SEND).some((node) => !node.disabled)) {
+    const initial = await this.inspectComposer(pageId, "BUSY_ACTIVE_TURN", "Robo is already responding in the configured chat.");
+    if ((initial.composer.value ?? "") !== "" || controls(initial.snap, "button", initial.sendNames).some((node) => !node.disabled)) {
       throw new BridgeError("BUSY_ACTIVE_TURN", "The chat has a draft. Leave the composer empty before starting a turn.");
     }
     await this.page(pageId);
     if (!claim()) return;
-    await this.tool("fill", { pageId, uid: composer.id, value: draftText });
+    await this.tool("fill", { pageId, uid: initial.composer.id, value: draftText });
 
-    const filled = await this.composerSnapshot(pageId);
-    if (oneEnabled(filled, "textbox", COMPOSER).value !== draftText) {
+    const filled = await this.inspectComposer(pageId, "RECONCILIATION_UNCERTAIN", "Robo started responding before submission; inspect the chat.");
+    if (filled.composer.value !== draftText) {
       throw new BridgeError("RECONCILIATION_UNCERTAIN", "The browser draft changed before submission; inspect the chat.");
     }
-    const button = oneEnabled(filled, "button", SEND);
+    const button = oneEnabled(filled.snap, "button", filled.sendNames);
     await this.page(pageId);
     await this.tool("click", { pageId, uid: button.id });
   }

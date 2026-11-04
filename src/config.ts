@@ -18,6 +18,19 @@ const GatewayTargetSchema = z.object({
   rpcTimeoutMs: z.number().int().min(1_000).max(300_000).optional(),
 });
 
+function decodeSessionSegment(segment: string): string | null {
+  if (!segment || !/^[a-zA-Z0-9._~%-]+$/.test(segment) || segment === "." || segment === "..") {
+    return null;
+  }
+  if (segment === "~dot") return ".";
+  if (segment === "~dotdot") return "..";
+  try {
+    return decodeURIComponent(segment.startsWith("~~") ? segment.slice(1) : segment) || null;
+  } catch {
+    return null;
+  }
+}
+
 const BrowserTargetSchema = z.object({
   transport: z.literal("browser"),
   targetId: z.string().min(1),
@@ -30,14 +43,24 @@ const BrowserTargetSchema = z.object({
 }).strict().refine((target) => {
   try {
     const url = new URL(target.sessionUrl);
-    const parts = url.pathname.split("/");
-    return url.protocol === "https:" && !url.username && !url.password && !url.search && !url.hash &&
-      url.href === target.sessionUrl && parts.length === 4 && parts[1] === "chat" &&
-      parts[2] === target.agentId && /^[a-zA-Z0-9_-]+$/.test(parts[3] ?? "");
+    if (
+      url.protocol !== "https:" || url.username || url.password || url.search || url.hash ||
+      url.href !== target.sessionUrl || url.pathname.endsWith("/")
+    ) {
+      return false;
+    }
+    const parts = url.pathname.slice(1).split("/");
+    if (!parts.every((part) => decodeSessionSegment(part) !== null)) return false;
+    const nsIndex = parts.findIndex((part) => part === "chat" || part === "dashboard");
+    if (nsIndex < 0) return false;
+    const agent = decodeSessionSegment(parts[nsIndex + 1] ?? "")?.toLowerCase();
+    if (agent !== target.agentId.trim().toLowerCase()) return false;
+    const rest = parts[nsIndex + 2] === "~key" ? parts.slice(nsIndex + 3) : parts.slice(nsIndex + 2);
+    return rest.length >= 1;
   } catch {
     return false;
   }
-}, { path: ["sessionUrl"], message: "Use the exact HTTPS /chat/<agentId>/<session> URL without credentials, query, or fragment." });
+}, { path: ["sessionUrl"], message: "Use the exact HTTPS /chat/<agentId>/<session...> (or /dashboard/<agentId>/<session...>) URL without credentials, query, or fragment." });
 
 const BridgeConfigFileSchema = z.object({
   dataDir: z.string().min(1).optional(),

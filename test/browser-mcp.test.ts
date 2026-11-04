@@ -9,11 +9,11 @@ import { createTempGitFixture } from "./helpers/git-fixture.js";
 
 test("browser MCP resumes a lost send receipt and accepts counter-evidence in the original chat", async () => {
   const fixture = createTempGitFixture();
-  const sessionUrl = "https://team.example/chat/roboclaw/verify-linux-00112233445566778899aabbccddeeff";
+  const sessionUrl = "https://team.example/chat/roboclaw/dashboard/33257e49-0012-426e-80ab-6ba8f8eb881f";
   const commit = fixture.commitFile("status.txt", "ready\n", "candidate");
   const configPath = join(fixture.rootDir, "bridge.json");
   const statePath = join(fixture.rootDir, "browser-state.json");
-  writeFileSync(statePath, JSON.stringify({ sessionUrl, messages: [], draft: "" }));
+  writeFileSync(statePath, JSON.stringify({ sessionUrl, locale: "de", messages: [], draft: "" }));
   writeFileSync(configPath, JSON.stringify({
     dataDir: fixture.rootDir,
     targets: { robo: {
@@ -82,6 +82,28 @@ test("browser MCP resumes a lost send receipt and accepts counter-evidence in th
     const localAbort = await abort(true);
     assert.ok(!localAbort.isError, JSON.stringify(localAbort.content));
     assert.equal(readFileSync(statePath, "utf8"), beforeAbort);
+
+    // An active remote response in a non-EN/TR locale must block submission with BUSY_ACTIVE_TURN.
+    writeFileSync(statePath, JSON.stringify({ ...JSON.parse(beforeAbort), remoteResponding: true }));
+    const busyAttempt = await client.callTool({
+      name: "bridge_handoff_start",
+      arguments: { targetId: "robo", waitBudgetMs: 0, envelope: {
+        schemaVersion: "0.2", requestId: "browser-busy-de", workspaceId: "test",
+        title: "Verify busy guard", outcome: "Must refuse active chat.", mode: "verify_only", publisherOwner: "none",
+        gitContext: { repoId: "example/status", localRepoPath: fixture.workRepoDir, pinnedBaseCommitSha: commit, pinnedSourceCommitSha: commit },
+        requestedCapabilities: { allowCodeEdit: false, allowBranchPush: false, allowManagedPublishStage: false },
+        acceptanceCriteria: ["Refuse active response"],
+      } },
+    });
+    assert.equal(busyAttempt.isError, true);
+    assert.match(JSON.stringify(busyAttempt.content), /BUSY_ACTIVE_TURN/);
+    writeFileSync(statePath, beforeAbort);
+    // Abort the unsent prepared turn so the next handoff can run cleanly.
+    const dbRows = JSON.parse(JSON.stringify(busyAttempt.content)) as Array<{ text?: string }>;
+    const unsentId = /attach to (hoff_[\w-]+)/.exec(dbRows[0]?.text ?? "")?.[1];
+    assert.ok(unsentId);
+    await client.callTool({ name: "bridge_handoff_abort", arguments: { handoffId: unsentId } });
+
     const released = await start("browser-after-abandonment");
     assert.equal(released.orchestratorDirective.action, "CONTINUE_AUTONOMOUSLY");
   } finally {
