@@ -78,15 +78,21 @@ export class GitVerifier {
     const notes: string[] = [];
 
     try {
-      if (localRepoPath && isLocalPath(localRepoPath)) {
-        await this.attachLocalAlternates(mirrorDir, localRepoPath);
+      const candidateLocalRepo =
+        localRepoPath && isLocalPath(localRepoPath)
+          ? localRepoPath
+          : isLocalPath(process.cwd()) && (await this.hasCommit(process.cwd(), pinnedBaseCommitSha))
+            ? process.cwd()
+            : undefined;
+      if (candidateLocalRepo) {
+        await this.attachLocalAlternates(mirrorDir, candidateLocalRepo);
       }
 
       // The PR base and handed-off source have different roles: local fixes before
       // the handoff are allowed, while subsequent remote edits remain locked.
       for (const sha of new Set([pinnedBaseCommitSha, lockBaseSha])) {
-        if (localRepoPath && isLocalPath(localRepoPath)) {
-          await this.ensureCommitPresent(mirrorDir, localRepoPath, sha);
+        if (candidateLocalRepo) {
+          await this.ensureCommitPresent(mirrorDir, candidateLocalRepo, sha);
         }
         await this.ensureCommitPresent(mirrorDir, remoteUrlOrPath, sha);
         if (await this.hasCommit(mirrorDir, sha)) {
