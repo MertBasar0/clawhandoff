@@ -91,7 +91,7 @@ Add this entry to `targets` in the bridge config, replacing the URL and executab
     "targetId": "robo-web",
     "transport": "browser",
     "agentId": "roboclaw",
-    "sessionUrl": "https://team.openclaw.ai/chat/roboclaw/YOUR-EXISTING-CHAT-ID",
+    "sessionUrl": "https://team.example/chat/roboclaw/dashboard/YOUR-EXISTING-CHAT-ID",
     "browserMcp": {
       "command": "/absolute/path/to/chrome-devtools-mcp",
       "args": ["--no-usage-statistics", "--no-performance-crux"]

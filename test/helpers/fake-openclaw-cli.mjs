@@ -232,8 +232,8 @@ switch (method) {
     const run = state.runs[params.runId];
     if (!run) {
       save();
-      process.stdout.write(JSON.stringify({ runId: params.runId, status: "timeout" }));
-      break;
+      process.stderr.write("INVALID_REQUEST: agent run was not found\n");
+      process.exit(1);
     }
     if (run.aborted) {
       save();

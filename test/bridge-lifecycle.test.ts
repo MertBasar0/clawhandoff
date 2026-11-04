@@ -155,7 +155,7 @@ test("Late attach recovers the bound final reply after the Gateway wait cache ex
   const stateFile = join(dataDir, "gateway.json");
   const prior = process.env.FAKE_GATEWAY_STATE_FILE;
   process.env.FAKE_GATEWAY_STATE_FILE = stateFile;
-  writeFileSync(stateFile, JSON.stringify({ queuedTurnReplies: [{ pollsBeforeComplete: 10 }] }));
+  writeFileSync(stateFile, JSON.stringify({ queuedTurnReplies: [{ pollsBeforeComplete: 10 }, { pollsBeforeComplete: 10 }] }));
   let service = new BridgeService(makeConfig(dataDir));
   t.after(() => {
     service.close();
@@ -185,10 +185,29 @@ test("Late attach recovers the bound final reply after the Gateway wait cache ex
   session.messages.push(reply(started.runId, "stop", "bound final"),
     reply(started.runId, "toolUse", "tool progress"), reply("another-run", "stop", "foreign final"));
   writeFileSync(stateFile, JSON.stringify(state));
-  const recovered = await service.attachHandoff({ handoffId: started.handoffId, waitBudgetMs: 0 });
+  const t0 = Date.now();
+  const recovered = await service.attachHandoff({ handoffId: started.handoffId, waitBudgetMs: 5_000 });
+  assert.ok(Date.now() - t0 < 3_500, "not_found must exit wait loop immediately without burning waitBudgetMs");
   assert.equal(recovered.lifecycleStatus, "settled");
   assert.equal(recovered.reported?.summaryDelta, "bound final");
   assert.equal(JSON.parse(readFileSync(stateFile, "utf8")).rpcCounts["sessions.create"], 1);
+
+  // When both the wait record and matching lastTerminalRun are gone, attach marks the turn uncertain.
+  const missing = await service.startHandoff({ targetId: "robo", waitBudgetMs: 0, envelope: {
+    schemaVersion: "0.2", requestId: "late-unmatched", workspaceId: "ws", title: "Review ownership 2",
+    outcome: "Identify the owner module.", mode: "investigate", publisherOwner: "none",
+    gitContext: { repoId: "example/repo", pinnedBaseCommitSha: "1".repeat(40) },
+    requestedCapabilities: { allowCodeEdit: false, allowBranchPush: false, allowManagedPublishStage: false },
+    acceptanceCriteria: ["Return the owner"],
+  } });
+  const state2 = JSON.parse(readFileSync(stateFile, "utf8"));
+  delete state2.runs[missing.runId];
+  state2.sessions[missing.remoteSessionKey!].status = "done";
+  state2.sessions[missing.remoteSessionKey!].lastRunId = "unrelated-run";
+  writeFileSync(stateFile, JSON.stringify(state2));
+  const unmatched = await service.attachHandoff({ handoffId: missing.handoffId, waitBudgetMs: 0 });
+  assert.equal(unmatched.lifecycleStatus, "uncertain");
+  assert.equal(unmatched.orchestratorDirective.action, "ESCALATE_TO_HUMAN");
 });
 
 test("Lost create response recovers only from exact user custody, even after Gateway idempotency records expire", async () => {

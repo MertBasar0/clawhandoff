@@ -236,16 +236,19 @@ export interface HandoffResultEnvelopeV2 {
 
 ### 6.1 Faz-1 Kapsamı (Tek Hedef Ailesi, Açık Kurtarma Sınırları)
 İlk sürüm tek hedef ailesiyle sınırlıdır. **İşin ve yayınlama durumunun görünür kalması**, belirsizlikte ikinci bir etki oluşturmaktan önce gelir:
-- **Hedef Adaptör (Faz 1):** Yalnızca `openclaw-gateway` (uzak paylaşımlı `robo` + yerel OpenClaw). Yerel `codex app-server --stdio` ve `claude -p --resume` adaptörleri Faz 2'ye ayrılmıştır.
+- **Hedef Taşıma Adaptörleri (Faz 1):**
+  1. **`gateway` (`openclaw-gateway`):** Uzak paylaşımlı `robo` veya yerel OpenClaw Gateway RPC yüzeyi (`sessions.create`, `chat.send`, `agent.wait`, `chat.history`, `chat.abort`).
+  2. **`browser` (`chrome-devtools-mcp`):** Cihaz eşleştirmesi (*device pairing*) veya CLI token'ı gerektirmeden, operatörün açık ve oturum açılmış tekil Control UI sohbet sekmesini (`/chat/<agentId>/<session...>` veya `/dashboard/<agentId>/<session...>`) erişilebilirlik ağacı ve salt-okunur DOM projeksiyonu üzerinden sürer. Her tur `Bridge-Turn: <idempotencyKey>` / `Bridge-Reply: <idempotencyKey>` işaretleriyle eşleştirilir; aynı `sessionUrl` üzerinde eşzamanlı ikinci handoff SQLite tarafından reddedilir.
+  *(Yerel `codex app-server --stdio` ve `claude -p --resume` adaptörleri Faz 2'ye ayrılmıştır.)*
 - **Yayınlama Kurtarma Sınırı (Faz 1):** Yalnızca **erişilebilir bir Git referansına push edilmiş** işleri yerelde devralır (uzak diskteki push edilmemiş `worktree` dosyalarını kurtarma vaadi Faz 1'de yoktur). Uzak yayınlama `uncertain_in_flight` durumundaysa yeni yayınlama yetkilendirmesi verilmez; boş PR araması tek başına belirsizliği kaldırmaz. Açık PR için tam aday commit eşleşmesi aranır; gövdedeki görev işareti bunun alternatifi değildir. PR metninin üretimi ve gizli bilgi kontrolü yayınlama sahibinin sorumluluğundadır; bu sürüm genel bir metin temizleyici sunmaz.
 
 **Faz-1 MCP Araçları:**
-1. **`bridge_preflight`:** Gateway `health`, kimlik erişimi ve ajan listesini kontrol eder; isteğe bağlı olarak açık/birleşmiş rakip PR'ları *engelleyici olmayan uyarı* olarak raporlar.
+1. **`bridge_preflight`:** Gateway `health`, kimlik erişimi ve ajan listesini (veya `browser` hedeflerinde açık sekme/composer hazırlığını: `browserReady`) kontrol eder; isteğe bağlı olarak açık/birleşmiş rakip PR'ları *engelleyici olmayan uyarı* olarak raporlar.
 2. **`bridge_handoff_start`:** Kalıcı `handoffId` oluşturur, ön-kaydı SQLite'a yazar, sabit commit SHA'larıyla oturumu açar ve kısa bekleme bütçesi (`waitBudgetMs`) içinde bitmezse `lifecycleStatus: "running"` döner.
 3. **`bridge_handoff_attach`:** Kesinti, yeniden başlatma veya bekleme bütçesi dolumu sonrasında kaydedilmiş aynı `handoffId` / `runId` koşusunu gözlemler. Kabulü bilinmeyen gönderimi tekrar etmez; geçmişten eşleştirme mümkün değilse belirsizliği ve gerekli uzlaştırmayı bildirir.
 4. **`bridge_handoff_continue`:** Otonom çözüm döngüsünün devam adımıdır (veya `remote_gated` modunda `observed` doğrulaması geçtikten sonra Aşama-2 yayınlama onayını iletir).
 5. **`bridge_verify_git`:** Checkout yapmadan izole depoda `pinnedBaseCommitSha`, `observedHeadSha`, `observedTreeSha` ve kaynak commit'ten sonraki ara commit'lerde `lockedPaths` kurallarını doğrular.
-6. **`bridge_handoff_abort`:** Beklemeyi bırakmaktan bağımsız olarak, gerçekten uzaktaki koşuyu durdurmak istendiğinde çağrılır.
+6. **`bridge_handoff_abort`:** Beklemeyi bırakmaktan bağımsız olarak, Gateway hedeflerinde uzaktaki koşuyu durdurmak veya henüz gönderilmemiş bir turu iptal etmek için çağrılır. Gönderilmiş bir `browser` turu köprü tarafından uzaktan güvenli biçimde durdurulamaz; operatör sohbeti inceledikten sonra `localOnly=true` ile yalnızca yerel takibi serbest bırakabilir.
 
 ### 6.2 Faz-1 Birincil Kabul Testi ve Başarı Ölçütleri
 Otomatik testler geçici Git depoları ve sahte Gateway/GitHub yanıtları kullanır. Bunlar durum, taşıma ve karar mantığını sınar; gerçek Claude/Codex muhakemesinin veya canlı Gateway yetkilerinin kanıtı değildir.
