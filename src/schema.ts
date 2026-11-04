@@ -2,6 +2,9 @@ import { z } from "zod";
 import { BridgeError, type HandoffEnvelopeV2 } from "./types.js";
 
 const HEX_SHA_40 = /^[0-9a-fA-F]{40}$/;
+const noNullBytes = (value: string) => !value.includes("\0");
+const safeText = (min: number, max: number) =>
+  z.string().min(min).max(max).refine(noNullBytes, "Text must not contain null bytes (\\u0000).");
 
 export const Sha40Schema = z
   .string()
@@ -20,21 +23,21 @@ export function normalizeLockedPath(rawPath: string): string {
 
 export const HandoffEnvelopeV2Schema = z.object({
   schemaVersion: z.literal("0.2"),
-  requestId: z.string().min(1).max(128),
-  workspaceId: z.string().min(1).max(200),
-  title: z.string().min(3).max(160),
-  outcome: z.string().min(10).max(4_000),
+  requestId: safeText(1, 128),
+  workspaceId: safeText(1, 200),
+  title: safeText(3, 160),
+  outcome: safeText(10, 4_000),
   mode: z.enum(["investigate", "implement", "verify_only", "publish_unchanged"]),
   publisherOwner: z.enum(["none", "local", "remote_gated"]),
   gitContext: z.object({
-    repoId: z.string().min(1).max(200),
-    localRepoPath: z.string().min(1).optional(),
-    remoteUrlOrPath: z.string().min(1).optional(),
+    repoId: safeText(1, 200),
+    localRepoPath: safeText(1, 1_024).optional(),
+    remoteUrlOrPath: safeText(1, 1_024).optional(),
     pinnedBaseCommitSha: Sha40Schema,
     pinnedSourceCommitSha: Sha40Schema.optional(),
-    sourceRemoteRef: z.string().min(1).max(256).optional(),
+    sourceRemoteRef: safeText(1, 256).optional(),
     expectedTreeSha: Sha40Schema.optional(),
-    lockedPaths: z.array(z.string().min(1).max(512)).max(200).optional(),
+    lockedPaths: z.array(safeText(1, 512)).max(200).optional(),
   }),
   requestedCapabilities: z.object({
     allowCodeEdit: z.boolean(),
@@ -44,8 +47,8 @@ export const HandoffEnvelopeV2Schema = z.object({
   advisoryInstructions: z
     .array(
       z.object({
-        instruction: z.string().min(1).max(1_000),
-        reason: z.string().min(1).max(1_000),
+        instruction: safeText(1, 1_000),
+        reason: safeText(1, 1_000),
       }),
     )
     .max(30)
@@ -53,14 +56,14 @@ export const HandoffEnvelopeV2Schema = z.object({
   priorEvidence: z
     .array(
       z.object({
-        claim: z.string().min(1).max(2_000),
-        sourceRef: z.string().min(1).max(500),
+        claim: safeText(1, 2_000),
+        sourceRef: safeText(1, 500),
       }),
     )
     .max(50)
     .default([]),
-  nonBindingHints: z.array(z.string().min(1).max(1_000)).max(20).optional(),
-  acceptanceCriteria: z.array(z.string().min(1).max(1_000)).min(1).max(30),
+  nonBindingHints: z.array(safeText(1, 1_000)).max(20).optional(),
+  acceptanceCriteria: z.array(safeText(1, 1_000)).min(1).max(30),
 });
 
 export function validateAndNormalizeEnvelope(input: unknown): HandoffEnvelopeV2 {
@@ -148,17 +151,17 @@ export const AttachHandoffInputSchema = z.object({
 });
 
 export const ContinueHandoffInputSchema = z.object({
-  handoffId: z.string().min(1).max(128),
+  handoffId: safeText(1, 128),
   intent: z.enum(["counter_evidence_or_followup", "authorize_publish"]),
-  message: z.string().min(1).max(8_000),
+  message: safeText(1, 8_000),
   updatedSourceCommitSha: Sha40Schema.optional(),
-  updatedSourceRemoteRef: z.string().min(1).max(256).optional(),
+  updatedSourceRemoteRef: safeText(1, 256).optional(),
   updatedExpectedTreeSha: Sha40Schema.optional(),
   evidenceRefs: z
     .array(
       z.object({
-        claim: z.string().min(1).max(2_000),
-        sourceRef: z.string().min(1).max(500),
+        claim: safeText(1, 2_000),
+        sourceRef: safeText(1, 500),
       }),
     )
     .max(30)
