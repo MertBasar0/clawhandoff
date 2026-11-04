@@ -2,7 +2,7 @@
 
 `agent-bridge-mcp` connects a local assistant to an OpenClaw agent such as Robo. Suppose Robo asks for a Windows test it cannot run. Your local assistant can run the test, send the result back to the same conversation and check Robo’s reply. The bridge records each turn in SQLite and can verify Git commits and pull requests. The local assistant owns the investigation and must stay active to advance it.
 
-[Türkçe hızlı başlangıç](docs/quickstart.tr.md) · [Architecture and design (Türkçe)](docs/RFC-v0.2.tr.md) · [Local orchestrator skill](skills/autonomous-handoff/SKILL.md)
+[Guided browser quickstart](docs/quickstart.md) · [Architecture and protocol (RFC v0.2)](docs/RFC-v0.2.md) · [Local orchestrator skill](skills/autonomous-handoff/SKILL.md)
 
 ## Build from source
 
