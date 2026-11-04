@@ -90,6 +90,29 @@ export class GitHubReconciler {
       return uncertain;
     }
     const expectedUrl = params.priorUrl ?? params.reportedPrUrl;
+    const pullRefMatch = /^refs\/pull\/(\d+)\/head$/.exec(params.headRef ?? "");
+    if (pullRefMatch) {
+      try {
+        const raw = await this.invokeGh([
+          "pr",
+          "view",
+          pullRefMatch[1]!,
+          "--repo",
+          params.repoId,
+          "--json",
+          "url,headRefOid,state",
+        ]);
+        const rec = JSON.parse(raw) as Record<string, unknown>;
+        const url = typeof rec?.url === "string" ? rec.url : undefined;
+        const oid = typeof rec?.headRefOid === "string" ? rec.headRefOid.toLowerCase() : undefined;
+        if (url && rec.state === "OPEN" && oid === params.headSha.toLowerCase() && (!expectedUrl || url === expectedUrl)) {
+          return { prState: "open_verified", prUrl: url };
+        }
+      } catch {
+        // Fall through to uncertain_in_flight when PR lookup fails.
+      }
+      return uncertain;
+    }
     const lookupLimit = 10;
 
     try {

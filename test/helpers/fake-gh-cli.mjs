@@ -10,6 +10,19 @@ if (state.ghFailure) {
   process.stderr.write("GitHub request failed\n");
   process.exit(1);
 }
+if (args[0] === "pr" && args[1] === "view") {
+  const prNum = Number(args[2]);
+  const fields = args[args.indexOf("--json") + 1].split(",");
+  const found = (state.openPrs ?? [])
+    .map((p) => ({ isCrossRepository: false, ...p, state: p.state ?? "OPEN" }))
+    .find((p) => p.number === prNum);
+  if (!found) {
+    process.stderr.write("PR not found\n");
+    process.exit(1);
+  }
+  process.stdout.write(JSON.stringify(Object.fromEntries(fields.map((key) => [key, found[key]]))));
+  process.exit(0);
+}
 if (args[0] === "pr" && args[1] === "list") {
   const headIdx = args.indexOf("--head");
   const searchIdx = args.indexOf("--search");

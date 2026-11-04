@@ -30,10 +30,13 @@ test("PR reconciliation verifies the exact open head and preserves uncertain pub
     priorState: ReconciledPrState;
     expected: ReconciledPrState;
     fail?: boolean;
+    headRef?: string;
     headSha?: string;
     reportedPrUrl?: string;
   }> = [
     { name: "exact open commit", records: [pr], priorState: "uncertain_in_flight", expected: "open_verified", headSha },
+    { name: "pull ref headRef reconciles cross-repo fork PR via gh pr view", records: [{ ...pr, isCrossRepository: true }], headRef: "refs/pull/42/head", reportedPrUrl: priorUrl, priorState: "none", expected: "open_verified", headSha },
+    { name: "pull ref headRef rejects mismatched commit", records: [{ ...pr, headRefOid: "b".repeat(40) }], headRef: "refs/pull/42/head", reportedPrUrl: priorUrl, priorState: "none", expected: "uncertain_in_flight", headSha },
     { name: "task marker cannot override a different commit", records: [{ ...pr, headRefOid: "b".repeat(40) }], priorState: "none", expected: "uncertain_in_flight", headSha },
     { name: "missing expected commit cannot verify a PR", records: [pr], priorState: "none", expected: "uncertain_in_flight" },
     { name: "empty search before publication", records: [], priorState: "none", expected: "none", headSha },
@@ -56,7 +59,7 @@ test("PR reconciliation verifies the exact open head and preserves uncertain pub
         writeFileSync(stateFile, JSON.stringify({ openPrs: c.records, ghFailure: c.fail }));
         const result = await reconciler.reconcilePullRequest({
           repoId: "example/repo",
-          headRef: "refs/heads/candidate",
+          headRef: c.headRef ?? "refs/heads/candidate",
           headSha: c.headSha,
           handoffId: "handoff-42",
           priorState: c.priorState,
