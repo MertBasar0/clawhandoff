@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { terminalBrowserResultJson } from "./browser-turn.js";
 import { Sha40Schema } from "./schema.js";
-import type { HandoffEnvelopeV2, ReportedResult } from "./types.js";
+import type { HandoffEnvelopeV2, ReportedResult, TargetTransport } from "./types.js";
 
 // Some agents serialize an absent optional text field as an empty string.
 const optionalResultText = (schema: z.ZodString) =>
@@ -33,6 +33,7 @@ const ReportedResultSchema = z.object({
 export function compileInitialHandoffPrompt(params: {
   handoffId: string;
   envelope: HandoffEnvelopeV2;
+  isolatedWorktreePath?: string;
 }): string {
   const { handoffId, envelope } = params;
   const g = envelope.gitContext;
@@ -73,6 +74,9 @@ export function compileInitialHandoffPrompt(params: {
   }
   if (g.expectedTreeSha) {
     lines.push(`- Expected Immutable Tree SHA: \`${g.expectedTreeSha}\``);
+  }
+  if (params.isolatedWorktreePath) {
+    lines.push(`- Isolated Git Worktree (active working directory): \`${params.isolatedWorktreePath}\``);
   }
   if (lockedPaths.length > 0) {
     lines.push(
@@ -215,7 +219,11 @@ function renderStructuredReturnFooter(): string {
   ].join("\n");
 }
 
-export function parseReportedResult(rawText: string, transport: "gateway" | "browser" = "gateway"): ReportedResult {
+export function parseReportedResult(
+  rawText: string,
+  transport: TargetTransport = "gateway",
+  options?: { a2aInputRequired?: boolean },
+): ReportedResult {
   let candidateJson: string | undefined;
   if (transport === "browser") {
     candidateJson = terminalBrowserResultJson(rawText);
@@ -237,6 +245,14 @@ export function parseReportedResult(rawText: string, transport: "gateway" | "bro
   // Conservative fallback: never assume completion if machine-readable block is missing or malformed.
   const trimmed = rawText.trim();
   const preview = trimmed.length > 800 ? `${trimmed.slice(0, 800)}...` : trimmed;
+  if (options?.a2aInputRequired) {
+    return {
+      disposition: "needs_evidence",
+      summaryDelta: preview || "Remote A2A agent requested additional input.",
+      blockers: [preview || "Remote A2A agent requested additional input (TASK_STATE_INPUT_REQUIRED)."],
+      claimedChecks: [],
+    };
+  }
   return {
     disposition: "needs_evidence",
     summaryDelta: preview || "(Empty assistant response)",

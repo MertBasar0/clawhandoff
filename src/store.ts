@@ -332,6 +332,17 @@ export class BridgeStore {
     });
   }
 
+  bindRemoteSessionId(handoffId: string, remoteSessionId: string, now: string): void {
+    this.db
+      .prepare(
+        `UPDATE handoff_sessions
+         SET remote_session_id = COALESCE(?, remote_session_id),
+             updated_at = ?
+         WHERE handoff_id = ?`,
+      )
+      .run(remoteSessionId, now, handoffId);
+  }
+
   // Claim before I/O: a crash after this point means acceptance is unknown, never safe to replay.
   claimDispatch(handoffId: string, turnId: string): boolean {
     return this.withTransaction(() => {

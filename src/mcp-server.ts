@@ -71,7 +71,7 @@ export function createBridgeMcpServer(service: BridgeService): McpServer {
     {
       title: "Autonomous Handoff & Counter-Evidence Resolution Loop",
       description:
-        "Binds the local primary agent as goal owner across remote OpenClaw handoffs so intermediate objections or missing-proof requests are resolved autonomously with local evidence instead of relayed to the human.",
+        "Binds the local primary agent as goal owner across OpenClaw Gateway, browser, A2A, Codex, or ACP agent handoffs so intermediate objections or missing-proof requests are resolved autonomously with local evidence instead of relayed to the human.",
       argsSchema: {
         targetId: z.string().default("robo"),
         goal: z.string(),
@@ -106,7 +106,7 @@ export function createBridgeMcpServer(service: BridgeService): McpServer {
     {
       title: "Bridge Preflight Check",
       description:
-        "Checks the configured Gateway or browser chat and optional rival PR warnings. For browser targets inspect browserReady.",
+        "Checks the configured target (OpenClaw Gateway, browser chat, A2A Agent Card, local Codex app-server, or ACP agent) and optional rival PR warnings. Inspect targetHealthy/authReady (and browserReady for browser targets or agentCard for A2A targets).",
       inputSchema: PreflightInputSchema.shape,
     },
     async (args) => {
@@ -123,7 +123,7 @@ export function createBridgeMcpServer(service: BridgeService): McpServer {
     {
       title: "Start Durable Agent Handoff",
       description:
-        "Stores the handoff before sending. `envelope.publisherOwner` defaults to `remote_gated` (or configured `defaultPublisherOwner`) unless overridden. Gateway targets open a dedicated session; browser targets use the exact open chat configured by the operator. Observes up to waitBudgetMs. Returns `orchestratorDirective` separating `reported` claims from `observed` Git/PR facts.",
+        "Stores the handoff before sending to an OpenClaw Gateway, browser chat, A2A endpoint, Codex app-server, or ACP agent. `envelope.publisherOwner` defaults to `remote_gated` (or configured `defaultPublisherOwner`) unless overridden. Gateway/Codex/ACP targets support optional isolated `worktreeName`. Observes up to waitBudgetMs and returns `orchestratorDirective` separating `reported` claims from `observed` Git/PR facts.",
       inputSchema: StartHandoffInputSchema.shape,
     },
     async (args) => {
@@ -191,7 +191,7 @@ export function createBridgeMcpServer(service: BridgeService): McpServer {
     {
       title: "Abort Remote Handoff Run",
       description:
-        "Cancels a Gateway run by its ID or an unsent browser turn. For a submitted browser turn, localOnly=true closes local tracking without stopping Robo.",
+        "Cancels a Gateway run, A2A task, Codex turn, or ACP prompt by its active ID, or closes an unsent turn. For submitted browser turns (or local abandonment), localOnly=true closes local tracking without stopping the remote session.",
       inputSchema: AbortHandoffInputSchema.shape,
     },
     async (args) => {

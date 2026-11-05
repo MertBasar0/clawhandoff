@@ -1,7 +1,17 @@
 {
   "name": "clawhandoff",
   "version": "0.2.0",
-  "description": "Local-first autonomous agent handoff, crash-safe reconciliation, checkout-free Git object verification, and two-step single-publisher gate over MCP.",
+  "description": "Universal local-first MCP bridge for verified multi-agent handoffs across OpenClaw (Gateway & Browser), Agent2Agent (A2A), Codex app-server, and Agent Client Protocol (ACP) with crash-safe SQLite reconciliation and checkout-free Git/PR gating.",
+  "keywords": [
+    "mcp",
+    "a2a",
+    "acp",
+    "codex",
+    "claude-code",
+    "openclaw",
+    "agent-handoff",
+    "git-verification"
+  ],
   "type": "module",
   "license": "MIT",
   "engines": {

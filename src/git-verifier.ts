@@ -1,37 +1,14 @@
-import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { killProcessTree } from "./process-spawn.js";
 import { normalizeLockedPath } from "./schema.js";
 import { BridgeError, type ObservedResult, type ReconciledPrState } from "./types.js";
 
 export interface GitVerifierOptions {
   commandTimeoutMs?: number;
   fetchTimeoutMs?: number;
-}
-
-function killProcessTree(child: ChildProcess): void {
-  const pid = child.pid;
-  if (!pid) return;
-  if (process.platform === "win32") {
-    execFile("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true }, () => {
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        // Already exited.
-      }
-    });
-    return;
-  }
-  try {
-    process.kill(-pid, "SIGKILL");
-  } catch {
-    try {
-      child.kill("SIGKILL");
-    } catch {
-      // Already exited.
-    }
-  }
 }
 
 function isLocalPath(remote: string): boolean {
@@ -58,14 +35,42 @@ function matchesLockedPath(changedPath: string, lockedPaths: readonly string[]):
 
 export class GitVerifier {
   private readonly mirrorsRoot: string;
+  private readonly worktreesRoot: string;
   private readonly commandTimeoutMs: number;
   private readonly fetchTimeoutMs: number;
 
   constructor(dataDir: string, options: GitVerifierOptions = {}) {
     this.mirrorsRoot = join(dataDir, "git-mirrors");
+    this.worktreesRoot = join(dataDir, "worktrees");
     this.commandTimeoutMs = options.commandTimeoutMs ?? 60_000;
     this.fetchTimeoutMs = options.fetchTimeoutMs ?? 180_000;
     mkdirSync(this.mirrorsRoot, { recursive: true });
+  }
+
+  worktreePath(handoffId: string, worktreeName: string): string {
+    return join(this.worktreesRoot, `${handoffId}-${worktreeName}`);
+  }
+
+  /** Create or reuse an isolated linked Git worktree checked out detached at checkoutCommitSha. */
+  async ensureIsolatedWorktree(params: {
+    sourceRepoPath: string;
+    handoffId: string;
+    worktreeName: string;
+    checkoutCommitSha: string;
+  }): Promise<string> {
+    await this.assertLocalRepository(params.sourceRepoPath);
+    const targetDir = this.worktreePath(params.handoffId, params.worktreeName);
+    if (existsSync(targetDir)) {
+      await this.assertLocalRepository(targetDir);
+      return targetDir;
+    }
+    mkdirSync(this.worktreesRoot, { recursive: true });
+    await this.runGit(
+      params.sourceRepoPath,
+      ["worktree", "add", "--detach", targetDir, params.checkoutCommitSha],
+      false,
+    );
+    return targetDir;
   }
 
   /** Validate that a path is an existing local Git repository or linked worktree. */

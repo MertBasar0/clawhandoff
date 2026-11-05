@@ -1,9 +1,12 @@
 import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { A2AClient, type A2ATurnObservation } from "./a2a-client.js";
+import { AcpSessionClient, resolveAcpLaunchCommand } from "./acp-client.js";
 import { ChromeChat } from "./chrome-chat.js";
 import { inspectBrowserTurn, wrapBrowserPrompt } from "./browser-turn.js";
-import { parseBrowserSessionRoute, sameBrowserSessionUrl } from "./config.js";
-import { join } from "node:path";
+import { CodexAppServerClient } from "./codex-client.js";
+import { normalizeA2ABaseUrl, parseBrowserSessionRoute, sameBrowserSessionUrl } from "./config.js";
 import { evaluateOrchestratorDirective } from "./directive.js";
 import { buildPrettySessionUrl, OpenClawGatewayClient } from "./gateway-client.js";
 import { GitVerifier } from "./git-verifier.js";
@@ -18,14 +21,18 @@ import { validateAndNormalizeEnvelope } from "./schema.js";
 import { BridgeStore } from "./store.js";
 import {
   BridgeError,
+  type A2ATargetConfig,
+  type AcpTargetConfig,
   type BridgeConfig,
   type BridgeTargetConfig,
   type BrowserTargetConfig,
+  type CodexTargetConfig,
   type GatewayTargetConfig,
   type HandoffResultEnvelopeV2,
   type ObservedResult,
   type PreflightResult,
   type SessionRecord,
+  type TargetTransport,
   type TurnRecord,
 } from "./types.js";
 
@@ -35,6 +42,9 @@ export class BridgeService {
   private readonly gitVerifier: GitVerifier;
   private readonly githubReconciler: GitHubReconciler;
   private readonly browserChats = new Map<string, ChromeChat>();
+  private readonly a2aClients = new Map<string, A2AClient>();
+  private readonly codexClients = new Map<string, CodexAppServerClient>();
+  private readonly acpClients = new Map<string, AcpSessionClient>();
   private readonly inFlightMutations = new Set<string>();
 
   constructor(config: BridgeConfig) {
@@ -47,7 +57,15 @@ export class BridgeService {
 
   async close(): Promise<void> {
     this.store.close();
-    await Promise.all([...this.browserChats.values()].map((chat) => chat.close()));
+    await Promise.all([
+      ...[...this.browserChats.values()].map((chat) => chat.close()),
+      ...[...this.codexClients.values()].map((client) => client.close()),
+      ...[...this.acpClients.values()].map((client) => client.close()),
+    ]);
+    this.browserChats.clear();
+    this.codexClients.clear();
+    this.acpClients.clear();
+    this.a2aClients.clear();
   }
 
   private getTarget(targetId: string): BridgeTargetConfig {
@@ -73,16 +91,118 @@ export class BridgeService {
     return chat;
   }
 
+  private a2a(target: A2ATargetConfig): A2AClient {
+    const key = JSON.stringify([
+      normalizeA2ABaseUrl(target.url),
+      target.agentCardPath,
+      target.protocolVersion,
+      target.authTokenEnvVar,
+      target.authHeaderName,
+      target.headers,
+    ]);
+    let client = this.a2aClients.get(key);
+    if (!client) {
+      client = new A2AClient(target);
+      this.a2aClients.set(key, client);
+    }
+    return client;
+  }
+
+  private codex(target: CodexTargetConfig): CodexAppServerClient {
+    const key = JSON.stringify([
+      target.targetId,
+      target.command,
+      target.args,
+      target.cwd,
+      target.model,
+      target.effort,
+      target.approvalPolicy,
+      target.sandbox,
+    ]);
+    let client = this.codexClients.get(key);
+    if (!client) {
+      client = new CodexAppServerClient(target);
+      this.codexClients.set(key, client);
+    }
+    return client;
+  }
+
+  private acp(target: AcpTargetConfig): AcpSessionClient {
+    const key = JSON.stringify([
+      target.targetId,
+      target.agent,
+      target.command,
+      target.args,
+      target.cwd,
+      target.model,
+      target.modeId,
+      target.permissionMode,
+    ]);
+    let client = this.acpClients.get(key);
+    if (!client) {
+      client = new AcpSessionClient(target);
+      this.acpClients.set(key, client);
+    }
+    return client;
+  }
+
+  private buildRemoteSessionKey(target: BridgeTargetConfig, handoffId: string): string {
+    if (target.transport === "browser") return `browser:${target.sessionUrl}`;
+    if (target.transport === "a2a") return `a2a:${normalizeA2ABaseUrl(target.url)}#${handoffId}`;
+    if (target.transport === "codex") return `codex:${target.targetId}#${handoffId}`;
+    if (target.transport === "acp") return `acp:${resolveAcpLaunchCommand(target).agentLabel}#${handoffId}`;
+    return `agent:${target.agentId}:bridge-${handoffId.slice(5)}`;
+  }
+
+  private sessionTransport(session: SessionRecord): TargetTransport {
+    const key = session.remoteSessionKey ?? "";
+    if (key.startsWith("browser:")) return "browser";
+    if (key.startsWith("a2a:")) return "a2a";
+    if (key.startsWith("codex:")) return "codex";
+    if (key.startsWith("acp:")) return "acp";
+    return "gateway";
+  }
+
+  private sessionMatchesTarget(session: SessionRecord, target: BridgeTargetConfig): boolean {
+    const key = session.remoteSessionKey;
+    if (!key) return false;
+    if (target.transport === "browser") {
+      return (
+        key.startsWith("browser:") &&
+        sameBrowserSessionUrl(key.slice("browser:".length), target.sessionUrl, target.basePath)
+      );
+    }
+    if (target.transport === "a2a") {
+      return key === `a2a:${normalizeA2ABaseUrl(target.url)}#${session.handoffId}`;
+    }
+    if (target.transport === "codex") {
+      return key === `codex:${target.targetId}#${session.handoffId}`;
+    }
+    if (target.transport === "acp") {
+      return key === `acp:${resolveAcpLaunchCommand(target).agentLabel}#${session.handoffId}`;
+    }
+    return (
+      !key.startsWith("browser:") &&
+      !key.startsWith("a2a:") &&
+      !key.startsWith("codex:") &&
+      !key.startsWith("acp:")
+    );
+  }
+
+  private resolveExecutionCwd(session: SessionRecord, fallbackCwd?: string): string | undefined {
+    if (session.worktreeName) {
+      return this.gitVerifier.worktreePath(session.handoffId, session.worktreeName);
+    }
+    return session.localRepoPath ?? fallbackCwd;
+  }
+
   private targetForSession(session: SessionRecord): BridgeTargetConfig {
     const target = this.getTarget(session.targetId);
-    const key = session.remoteSessionKey;
-    if (
-      target.transport === "browser"
-        ? !key?.startsWith("browser:") ||
-          !sameBrowserSessionUrl(key.slice("browser:".length), target.sessionUrl, target.basePath)
-        : key?.startsWith("browser:")
-    ) {
-      throw new BridgeError("INVALID_CONTRACT_CONFLICT", "The configured transport or browser chat differs from this handoff's recorded destination.");
+    if (!this.sessionMatchesTarget(session, target)) {
+      throw new BridgeError(
+        "INVALID_CONTRACT_CONFLICT",
+        "The configured transport or destination differs from this handoff's recorded destination.",
+      );
     }
     return target;
   }
@@ -96,8 +216,95 @@ export class BridgeService {
     if (target.transport === "browser") {
       await this.browser(target).read();
       return {
-        targetId: params.targetId, gatewayHealthy: false, browserReady: true, authReady: true, agentFound: true, availableAgentIds: [target.agentId],
+        targetId: params.targetId,
+        transport: "browser",
+        gatewayHealthy: false,
+        browserReady: true,
+        targetHealthy: true,
+        authReady: true,
+        agentFound: true,
+        availableAgentIds: [target.agentId],
         rivalPullRequests: await this.githubReconciler.findRivalPullRequests(params),
+      };
+    }
+    if (target.transport === "a2a") {
+      const client = this.a2a(target);
+      let targetHealthy = false;
+      let authReady = false;
+      let agentCard: PreflightResult["agentCard"];
+      let availableAgentIds: string[] = [];
+      let remediation: string | undefined;
+      try {
+        const card = await client.discoverAgentCard(true);
+        targetHealthy = true;
+        authReady = true;
+        agentCard = card;
+        availableAgentIds = [card.name];
+      } catch (err) {
+        if (err instanceof BridgeError && err.code === "AUTH_LOGIN_REQUIRED") {
+          targetHealthy = false;
+          authReady = false;
+          remediation = err.remediation ?? err.message;
+        } else {
+          throw err;
+        }
+      }
+      return {
+        targetId: params.targetId,
+        transport: "a2a",
+        gatewayHealthy: false,
+        targetHealthy,
+        authReady,
+        agentFound: targetHealthy,
+        availableAgentIds,
+        ...(agentCard ? { agentCard } : {}),
+        rivalPullRequests: await this.githubReconciler.findRivalPullRequests(params),
+        ...(remediation ? { remediation } : {}),
+      };
+    }
+    if (target.transport === "codex") {
+      const status = await this.codex(target).preflight();
+      return {
+        targetId: params.targetId,
+        transport: "codex",
+        gatewayHealthy: false,
+        targetHealthy: status.healthy,
+        authReady: status.authReady,
+        agentFound: status.healthy,
+        availableAgentIds: ["codex"],
+        rivalPullRequests: await this.githubReconciler.findRivalPullRequests(params),
+        ...(status.remediation ? { remediation: status.remediation } : {}),
+      };
+    }
+    if (target.transport === "acp") {
+      let targetHealthy = false;
+      let authReady = false;
+      let availableAgentIds: string[] = [];
+      let remediation: string | undefined;
+      try {
+        const status = await this.acp(target).preflight();
+        targetHealthy = status.healthy;
+        authReady = status.authReady;
+        availableAgentIds = [status.agentLabel];
+      } catch (err) {
+        if (err instanceof BridgeError && err.code === "AUTH_LOGIN_REQUIRED") {
+          targetHealthy = false;
+          authReady = false;
+          remediation = err.remediation ?? err.message;
+        } else {
+          throw err;
+        }
+      }
+      return {
+        targetId: params.targetId,
+        transport: "acp",
+        gatewayHealthy: false,
+        targetHealthy,
+        authReady,
+        agentFound: targetHealthy,
+        availableAgentIds,
+        rivalPullRequests: await this.githubReconciler.findRivalPullRequests(params),
+        ...(remediation ? { remediation } : {}),
       };
     }
     const client = new OpenClawGatewayClient(target, this.config.dataDir);
@@ -139,7 +346,9 @@ export class BridgeService {
 
     return {
       targetId: params.targetId,
+      transport: "gateway",
       gatewayHealthy,
+      targetHealthy: gatewayHealthy,
       authReady,
       agentFound,
       defaultAgentId,
@@ -176,8 +385,11 @@ export class BridgeService {
       this.config.defaultPublisherOwner ?? "remote_gated",
     );
     const target = this.getTarget(params.targetId);
-    if (target.transport === "browser" && params.worktreeName) {
-      throw new BridgeError("INVALID_INPUT", "A browser target uses its existing chat and cannot create a named worktree.");
+    if ((target.transport === "browser" || target.transport === "a2a") && params.worktreeName) {
+      throw new BridgeError(
+        "INVALID_INPUT",
+        `A ${target.transport} target cannot create a local named worktree.`,
+      );
     }
 
     // Idempotent requestId check: never create a duplicate handoff if retried with same requestId.
@@ -195,15 +407,35 @@ export class BridgeService {
       ? await this.resolveSourceTree(source, source.pinnedSourceCommitSha)
       : undefined);
 
+    const handoffId = `hoff_${randomUUID()}`;
+    let isolatedWorktreePath: string | undefined;
+    let effectiveLocalRepoPath = source.localRepoPath;
+    if (params.worktreeName && (target.transport === "codex" || target.transport === "acp")) {
+      const worktreeSourceRepo = source.localRepoPath ?? target.cwd;
+      if (!worktreeSourceRepo) {
+        throw new BridgeError(
+          "INVALID_INPUT",
+          `Creating a local isolated worktree for ${target.transport} target "${params.targetId}" requires gitContext.localRepoPath or target.cwd.`,
+        );
+      }
+      isolatedWorktreePath = await this.gitVerifier.ensureIsolatedWorktree({
+        sourceRepoPath: worktreeSourceRepo,
+        handoffId,
+        worktreeName: params.worktreeName,
+        checkoutCommitSha: source.pinnedSourceCommitSha ?? source.pinnedBaseCommitSha,
+      });
+      effectiveLocalRepoPath = worktreeSourceRepo;
+    }
+
     const envelopeWithTree = {
       ...normalized,
       gitContext: {
         ...normalized.gitContext,
+        ...(effectiveLocalRepoPath ? { localRepoPath: effectiveLocalRepoPath } : {}),
         ...(expectedTreeSha ? { expectedTreeSha } : {}),
       },
     };
 
-    const handoffId = `hoff_${randomUUID()}`;
     const turnId = `turn_${randomUUID()}`;
     const idempotencyKey = `idem_${randomUUID()}`;
     const now = new Date().toISOString();
@@ -213,21 +445,29 @@ export class BridgeService {
     const promptText = compileInitialHandoffPrompt({
       handoffId,
       envelope: envelopeWithTree,
+      isolatedWorktreePath,
     });
 
-    const remoteSessionKey = target.transport === "browser"
-      ? `browser:${target.sessionUrl}`
-      : `agent:${target.agentId}:bridge-${handoffId.slice(5)}`;
-    const createRpcParams = target.transport === "browser" ? undefined : {
-      key: remoteSessionKey,
-      agentId: target.agentId,
-      label: envelopeWithTree.title,
-      message: promptText,
-      idempotencyKey,
-      projectId: target.projectId,
-      worktreeBaseRef: envelopeWithTree.gitContext.pinnedBaseCommitSha,
-      worktreeName: params.worktreeName,
-    };
+    const remoteSessionKey = this.buildRemoteSessionKey(target, handoffId);
+    const isGateway = target.transport === undefined || target.transport === "gateway";
+    const createRpcParams = isGateway
+      ? {
+          key: remoteSessionKey,
+          agentId: target.agentId,
+          label: envelopeWithTree.title,
+          message: promptText,
+          idempotencyKey,
+          projectId: target.projectId,
+          worktreeBaseRef: envelopeWithTree.gitContext.pinnedBaseCommitSha,
+          worktreeName: params.worktreeName,
+        }
+      : undefined;
+    const initialRemoteSessionUrl =
+      target.transport === "browser"
+        ? target.sessionUrl
+        : target.transport === "a2a"
+          ? normalizeA2ABaseUrl(target.url)
+          : undefined;
 
     const sessionRecord: SessionRecord = {
       handoffId,
@@ -238,7 +478,7 @@ export class BridgeService {
       mode: envelopeWithTree.mode,
       publisherOwner: envelopeWithTree.publisherOwner,
       repoId: envelopeWithTree.gitContext.repoId,
-      localRepoPath: envelopeWithTree.gitContext.localRepoPath,
+      localRepoPath: effectiveLocalRepoPath,
       remoteUrlOrPath: envelopeWithTree.gitContext.remoteUrlOrPath,
       pinnedBaseCommitSha: envelopeWithTree.gitContext.pinnedBaseCommitSha,
       pinnedSourceCommitSha: envelopeWithTree.gitContext.pinnedSourceCommitSha,
@@ -248,7 +488,7 @@ export class BridgeService {
       envelope: envelopeWithTree,
       worktreeName: params.worktreeName,
       remoteSessionKey,
-      remoteSessionUrl: target.transport === "browser" ? target.sessionUrl : undefined,
+      remoteSessionUrl: initialRemoteSessionUrl,
       lifecycleStatus: "running",
       maxAutonomousTurns,
       sameBlockerStreak: 0,
@@ -263,7 +503,7 @@ export class BridgeService {
         turnId,
         idempotencyKey,
         promptText,
-        createParamsJson: JSON.stringify(createRpcParams),
+        createParamsJson: createRpcParams ? JSON.stringify(createRpcParams) : undefined,
         now,
       },
     });
@@ -304,6 +544,15 @@ export class BridgeService {
       const waitBudgetMs = params.waitBudgetMs ?? this.config.defaultWaitBudgetMs ?? 30_000;
       if (target.transport === "browser") {
         return await this.attachBrowserTurn(session, latestTurn, target, waitBudgetMs);
+      }
+      if (target.transport === "a2a") {
+        return await this.attachA2ATurn(session, latestTurn, target, waitBudgetMs);
+      }
+      if (target.transport === "codex") {
+        return await this.attachCodexTurn(session, latestTurn, target, waitBudgetMs);
+      }
+      if (target.transport === "acp") {
+        return await this.attachAcpTurn(session, latestTurn, target, waitBudgetMs);
       }
       const client = new OpenClawGatewayClient(target, this.config.dataDir);
       const deadline = Date.now() + waitBudgetMs;
@@ -467,6 +716,450 @@ export class BridgeService {
     return current.lifecycleStatus === "running" || current.lifecycleStatus === "uncertain"
       ? this.buildRunningOrUncertainResult(current, latest)
       : this.buildEnvelopeFromRecords(current, latest);
+  }
+
+  private async attachA2ATurn(
+    session: SessionRecord,
+    turn: TurnRecord,
+    target: A2ATargetConfig,
+    waitBudgetMs: number,
+  ): Promise<HandoffResultEnvelopeV2> {
+    const client = this.a2a(target);
+    const deadline = Date.now() + waitBudgetMs;
+    const remoteSessionKey = session.remoteSessionKey ?? this.buildRemoteSessionKey(target, session.handoffId);
+    const remoteSessionUrl = normalizeA2ABaseUrl(target.url);
+    let initialObs: A2ATurnObservation | undefined;
+
+    if (!turn.runId) {
+      if (turn.dispatchState !== "prepared") {
+        try {
+          initialObs = await client.findTaskByMessageId({
+            messageId: turn.idempotencyKey,
+            contextId: session.remoteSessionId,
+          });
+        } catch (err) {
+          if (err instanceof BridgeError && err.code === "AUTH_LOGIN_REQUIRED") throw err;
+        }
+        if (!initialObs || initialObs.kind !== "task") {
+          this.store.markTurnUncertain({
+            handoffId: session.handoffId,
+            turnId: turn.turnId,
+            errorText:
+              "Cannot confirm A2A submission receipt after interrupted dispatch. Inspect the remote A2A agent before continuing.",
+            now: new Date().toISOString(),
+          });
+          return this.buildRunningOrUncertainResult(
+            this.requireSession(session.handoffId),
+            this.requireLatestTurn(session.handoffId),
+          );
+        }
+        this.store.recordDispatched({
+          handoffId: session.handoffId,
+          turnId: turn.turnId,
+          remoteSessionKey,
+          remoteSessionId: initialObs.contextId ?? session.remoteSessionId,
+          remoteSessionUrl,
+          runId: initialObs.taskId,
+          now: new Date().toISOString(),
+        });
+      } else {
+        await client.discoverAgentCard();
+        if (!this.store.claimDispatch(session.handoffId, turn.turnId)) {
+          return this.buildRunningOrUncertainResult(
+            this.requireSession(session.handoffId),
+            this.requireLatestTurn(session.handoffId),
+          );
+        }
+        try {
+          initialObs = await client.sendMessage({
+            messageId: turn.idempotencyKey,
+            promptText: turn.promptText,
+            contextId: session.remoteSessionId,
+            handoffId: session.handoffId,
+          });
+        } catch (err) {
+          if (!(err instanceof BridgeError)) throw err;
+          this.store.markTurnUncertain({
+            handoffId: session.handoffId,
+            turnId: turn.turnId,
+            errorText: err.message,
+            now: new Date().toISOString(),
+          });
+          if (err.code === "AUTH_LOGIN_REQUIRED") throw err;
+          return this.buildRunningOrUncertainResult(
+            this.requireSession(session.handoffId),
+            this.requireLatestTurn(session.handoffId),
+          );
+        }
+
+        if (initialObs.kind === "message") {
+          this.store.recordDispatched({
+            handoffId: session.handoffId,
+            turnId: turn.turnId,
+            remoteSessionKey,
+            remoteSessionId: initialObs.contextId ?? session.remoteSessionId,
+            remoteSessionUrl,
+            runId: `a2a-msg:${initialObs.messageId}`,
+            now: new Date().toISOString(),
+          });
+          return await this.finalizeSettledTurn({
+            session: this.requireSession(session.handoffId),
+            turn: this.requireLatestTurn(session.handoffId),
+            terminalReplyText: initialObs.replyText,
+          });
+        }
+
+        this.store.recordDispatched({
+          handoffId: session.handoffId,
+          turnId: turn.turnId,
+          remoteSessionKey,
+          remoteSessionId: initialObs.contextId ?? session.remoteSessionId,
+          remoteSessionUrl,
+          runId: initialObs.taskId,
+          now: new Date().toISOString(),
+        });
+      }
+    }
+
+    let activeSession = this.requireSession(session.handoffId);
+    const activeTurn = this.requireLatestTurn(session.handoffId);
+    if (!activeTurn.runId) {
+      return this.buildRunningOrUncertainResult(activeSession, activeTurn);
+    }
+
+    let pendingObs: A2ATurnObservation | { kind: "not_found" } | undefined = initialObs;
+    for (;;) {
+      const obs = pendingObs ?? (await client.getTask(activeTurn.runId));
+      pendingObs = undefined;
+
+      if (obs.kind === "not_found") {
+        this.store.markTurnUncertain({
+          handoffId: activeSession.handoffId,
+          turnId: activeTurn.turnId,
+          errorText: `Remote A2A agent has no task record for "${activeTurn.runId}".`,
+          now: new Date().toISOString(),
+        });
+        return this.buildRunningOrUncertainResult(
+          this.requireSession(activeSession.handoffId),
+          this.requireLatestTurn(activeSession.handoffId),
+        );
+      }
+
+      if (obs.kind === "message") {
+        return await this.finalizeSettledTurn({
+          session: activeSession,
+          turn: activeTurn,
+          terminalReplyText: obs.replyText,
+        });
+      }
+
+      if (obs.contextId && !activeSession.remoteSessionId) {
+        this.store.bindRemoteSessionId(activeSession.handoffId, obs.contextId, new Date().toISOString());
+        activeSession = this.requireSession(activeSession.handoffId);
+      }
+
+      if (obs.state === "completed") {
+        return await this.finalizeSettledTurn({
+          session: activeSession,
+          turn: activeTurn,
+          terminalReplyText: obs.replyText,
+        });
+      }
+      if (obs.state === "input_required") {
+        return await this.finalizeSettledTurn({
+          session: activeSession,
+          turn: activeTurn,
+          terminalReplyText:
+            obs.replyText || "Remote A2A agent requested additional input (TASK_STATE_INPUT_REQUIRED).",
+          a2aInputRequired: true,
+        });
+      }
+      if (obs.state === "failed" || obs.state === "auth_required") {
+        return await this.finalizeSettledTurn({
+          session: activeSession,
+          turn: activeTurn,
+          runFailedError: obs.errorMessage ?? "Remote A2A task failed.",
+        });
+      }
+      if (obs.state === "canceled") {
+        this.store.markAborted(
+          activeSession.handoffId,
+          activeTurn.turnId,
+          "Remote A2A task was canceled.",
+          new Date().toISOString(),
+          activeTurn.dispatchState,
+        );
+        return this.buildEnvelopeFromRecords(
+          this.requireSession(activeSession.handoffId),
+          this.requireLatestTurn(activeSession.handoffId),
+        );
+      }
+
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        return this.buildRunningOrUncertainResult(activeSession, activeTurn);
+      }
+      await delay(Math.min(400, remaining));
+    }
+  }
+
+  private async attachCodexTurn(
+    session: SessionRecord,
+    turn: TurnRecord,
+    target: CodexTargetConfig,
+    waitBudgetMs: number,
+  ): Promise<HandoffResultEnvelopeV2> {
+    const client = this.codex(target);
+    const deadline = Date.now() + waitBudgetMs;
+    const cwd = this.resolveExecutionCwd(session, target.cwd);
+    const remoteSessionKey = session.remoteSessionKey ?? this.buildRemoteSessionKey(target, session.handoffId);
+
+    if (!turn.runId) {
+      if (turn.dispatchState !== "prepared") {
+        if (!session.remoteSessionId) {
+          this.store.markTurnUncertain({
+            handoffId: session.handoffId,
+            turnId: turn.turnId,
+            errorText: "Codex handoff was interrupted before a thread ID was recorded.",
+            now: new Date().toISOString(),
+          });
+          return this.buildRunningOrUncertainResult(
+            this.requireSession(session.handoffId),
+            this.requireLatestTurn(session.handoffId),
+          );
+        }
+        const found = await client.findTurnByClientMessageId({
+          threadId: session.remoteSessionId,
+          clientUserMessageId: turn.idempotencyKey,
+          cwd,
+        });
+        if (!found) {
+          this.store.markTurnUncertain({
+            handoffId: session.handoffId,
+            turnId: turn.turnId,
+            errorText: "Codex thread has no matching turn for this submission's clientUserMessageId.",
+            now: new Date().toISOString(),
+          });
+          return this.buildRunningOrUncertainResult(
+            this.requireSession(session.handoffId),
+            this.requireLatestTurn(session.handoffId),
+          );
+        }
+        this.store.recordDispatched({
+          handoffId: session.handoffId,
+          turnId: turn.turnId,
+          remoteSessionKey,
+          remoteSessionId: session.remoteSessionId,
+          runId: found.turnId,
+          now: new Date().toISOString(),
+        });
+      } else {
+        const threadId = await client.ensureThread({ threadId: session.remoteSessionId, cwd });
+        if (!session.remoteSessionId) {
+          this.store.bindRemoteSessionId(session.handoffId, threadId, new Date().toISOString());
+        }
+        if (!this.store.claimDispatch(session.handoffId, turn.turnId)) {
+          return this.buildRunningOrUncertainResult(
+            this.requireSession(session.handoffId),
+            this.requireLatestTurn(session.handoffId),
+          );
+        }
+        try {
+          const started = await client.startTurn({
+            threadId,
+            clientUserMessageId: turn.idempotencyKey,
+            promptText: turn.promptText,
+            cwd,
+          });
+          this.store.recordDispatched({
+            handoffId: session.handoffId,
+            turnId: turn.turnId,
+            remoteSessionKey,
+            remoteSessionId: threadId,
+            runId: started.turnId,
+            now: new Date().toISOString(),
+          });
+        } catch (err) {
+          if (!(err instanceof BridgeError)) throw err;
+          this.store.markTurnUncertain({
+            handoffId: session.handoffId,
+            turnId: turn.turnId,
+            errorText: err.message,
+            now: new Date().toISOString(),
+          });
+          if (err.code === "AUTH_LOGIN_REQUIRED") throw err;
+          return this.buildRunningOrUncertainResult(
+            this.requireSession(session.handoffId),
+            this.requireLatestTurn(session.handoffId),
+          );
+        }
+      }
+    }
+
+    const activeSession = this.requireSession(session.handoffId);
+    const activeTurn = this.requireLatestTurn(session.handoffId);
+    if (!activeTurn.runId || !activeSession.remoteSessionId) {
+      return this.buildRunningOrUncertainResult(activeSession, activeTurn);
+    }
+
+    do {
+      const remaining = deadline - Date.now();
+      const sliceMs = waitBudgetMs === 0 ? 50 : Math.max(50, Math.min(25_000, remaining));
+      const obs = await client.waitTurnSlice({
+        threadId: activeSession.remoteSessionId,
+        turnId: activeTurn.runId,
+        sliceMs,
+        cwd,
+      });
+      if (obs.state === "completed") {
+        return await this.finalizeSettledTurn({
+          session: activeSession,
+          turn: activeTurn,
+          terminalReplyText: obs.replyText,
+        });
+      }
+      if (obs.state === "failed") {
+        return await this.finalizeSettledTurn({
+          session: activeSession,
+          turn: activeTurn,
+          runFailedError: obs.errorMessage,
+        });
+      }
+      if (obs.state === "interrupted") {
+        this.store.markAborted(
+          activeSession.handoffId,
+          activeTurn.turnId,
+          "Codex turn was interrupted.",
+          new Date().toISOString(),
+          activeTurn.dispatchState,
+        );
+        return this.buildEnvelopeFromRecords(
+          this.requireSession(activeSession.handoffId),
+          this.requireLatestTurn(activeSession.handoffId),
+        );
+      }
+      if (obs.state === "not_found") {
+        this.store.markTurnUncertain({
+          handoffId: activeSession.handoffId,
+          turnId: activeTurn.turnId,
+          errorText: "Codex app-server no longer has a record of this turn ID.",
+          now: new Date().toISOString(),
+        });
+        return this.buildRunningOrUncertainResult(
+          this.requireSession(activeSession.handoffId),
+          this.requireLatestTurn(activeSession.handoffId),
+        );
+      }
+    } while (Date.now() < deadline);
+
+    return this.buildRunningOrUncertainResult(activeSession, activeTurn);
+  }
+
+  private async attachAcpTurn(
+    session: SessionRecord,
+    turn: TurnRecord,
+    target: AcpTargetConfig,
+    waitBudgetMs: number,
+  ): Promise<HandoffResultEnvelopeV2> {
+    const client = this.acp(target);
+    const deadline = Date.now() + waitBudgetMs;
+    const cwd = this.resolveExecutionCwd(session, target.cwd);
+    const remoteSessionKey = session.remoteSessionKey ?? this.buildRemoteSessionKey(target, session.handoffId);
+
+    if (!turn.runId) {
+      if (turn.dispatchState !== "prepared") {
+        this.store.markTurnUncertain({
+          handoffId: session.handoffId,
+          turnId: turn.turnId,
+          errorText:
+            "ACP stdio turn was interrupted before dispatch completion; refusing automatic replay to prevent duplicate execution.",
+          now: new Date().toISOString(),
+        });
+        return this.buildRunningOrUncertainResult(
+          this.requireSession(session.handoffId),
+          this.requireLatestTurn(session.handoffId),
+        );
+      }
+
+      const sessionId = await client.ensureSession({ sessionId: session.remoteSessionId, cwd });
+      if (!session.remoteSessionId) {
+        this.store.bindRemoteSessionId(session.handoffId, sessionId, new Date().toISOString());
+      }
+      if (!this.store.claimDispatch(session.handoffId, turn.turnId)) {
+        return this.buildRunningOrUncertainResult(
+          this.requireSession(session.handoffId),
+          this.requireLatestTurn(session.handoffId),
+        );
+      }
+      const runId = `acp:${turn.idempotencyKey}`;
+      await client.startPrompt({
+        sessionId,
+        runId,
+        promptText: turn.promptText,
+        cwd,
+      });
+      this.store.recordDispatched({
+        handoffId: session.handoffId,
+        turnId: turn.turnId,
+        remoteSessionKey,
+        remoteSessionId: sessionId,
+        runId,
+        now: new Date().toISOString(),
+      });
+    }
+
+    const activeSession = this.requireSession(session.handoffId);
+    const activeTurn = this.requireLatestTurn(session.handoffId);
+    if (!activeTurn.runId) {
+      return this.buildRunningOrUncertainResult(activeSession, activeTurn);
+    }
+
+    do {
+      const remaining = deadline - Date.now();
+      const sliceMs = waitBudgetMs === 0 ? 50 : Math.max(50, Math.min(25_000, remaining));
+      const obs = await client.waitPromptSlice(activeTurn.runId, sliceMs);
+      if (obs.state === "completed") {
+        return await this.finalizeSettledTurn({
+          session: activeSession,
+          turn: activeTurn,
+          terminalReplyText: obs.replyText,
+        });
+      }
+      if (obs.state === "failed") {
+        return await this.finalizeSettledTurn({
+          session: activeSession,
+          turn: activeTurn,
+          runFailedError: obs.errorMessage,
+        });
+      }
+      if (obs.state === "cancelled") {
+        this.store.markAborted(
+          activeSession.handoffId,
+          activeTurn.turnId,
+          "ACP prompt was cancelled.",
+          new Date().toISOString(),
+          activeTurn.dispatchState,
+        );
+        return this.buildEnvelopeFromRecords(
+          this.requireSession(activeSession.handoffId),
+          this.requireLatestTurn(activeSession.handoffId),
+        );
+      }
+      if (obs.state === "not_found") {
+        this.store.markTurnUncertain({
+          handoffId: activeSession.handoffId,
+          turnId: activeTurn.turnId,
+          errorText: "ACP client restarted while prompt was active; inspect local repository state before continuing.",
+          now: new Date().toISOString(),
+        });
+        return this.buildRunningOrUncertainResult(
+          this.requireSession(activeSession.handoffId),
+          this.requireLatestTurn(activeSession.handoffId),
+        );
+      }
+    } while (Date.now() < deadline);
+
+    return this.buildRunningOrUncertainResult(activeSession, activeTurn);
   }
 
   async continueHandoff(params: {
@@ -744,12 +1437,13 @@ export class BridgeService {
     if (turn.dispatchState === "aborted" || turn.dispatchState === "settled" || turn.dispatchState === "failed") {
       return this.buildEnvelopeFromRecords(session, turn);
     }
-    // Local-only abandonment never touches Chrome, even if the operator changed the target URL.
-    if (params.localOnly || (session.remoteSessionKey?.startsWith("browser:") && turn.dispatchState === "prepared")) {
-      if (!session.remoteSessionKey?.startsWith("browser:")) {
-        throw new BridgeError("INVALID_INPUT", "localOnly applies to existing browser chats.");
+    const recordedTransport = this.sessionTransport(session);
+    // Local-only abandonment never touches Chrome or remote processes, even if the operator changed the target URL.
+    if (params.localOnly || (recordedTransport !== "gateway" && turn.dispatchState === "prepared")) {
+      if (recordedTransport === "gateway") {
+        throw new BridgeError("INVALID_INPUT", "localOnly applies to non-Gateway handoffs or existing browser chats.");
       }
-      if (!this.store.markAborted(session.handoffId, turn.turnId, params.reason ?? "Local browser handoff closed.",
+      if (!this.store.markAborted(session.handoffId, turn.turnId, params.reason ?? `Local ${recordedTransport} handoff closed.`,
         new Date().toISOString(), turn.dispatchState)) {
         throw new BridgeError("BUSY_ACTIVE_TURN", "The turn changed while closing the handoff. Attach to check its current state.");
       }
@@ -761,6 +1455,29 @@ export class BridgeService {
     }
     if (!session.remoteSessionKey || !turn.runId) {
       throw new BridgeError("RECONCILIATION_UNCERTAIN", "Cannot abort without an accepted run ID. Attach to this handoff to reconcile its submission.");
+    }
+    if (target.transport === "a2a") {
+      if (!turn.runId.startsWith("a2a-msg:")) {
+        if (!(await this.a2a(target).cancelTask(turn.runId))) {
+          throw new BridgeError("RECONCILIATION_UNCERTAIN", "Remote A2A agent did not confirm cancellation of this task. Attach to observe its outcome.");
+        }
+      }
+      this.store.markAborted(session.handoffId, turn.turnId, params.reason ?? "Aborted by local orchestrator.", new Date().toISOString(), turn.dispatchState);
+      return this.buildEnvelopeFromRecords(this.requireSession(session.handoffId), this.requireLatestTurn(session.handoffId));
+    }
+    if (target.transport === "codex") {
+      if (!session.remoteSessionId || !(await this.codex(target).interruptTurn(session.remoteSessionId, turn.runId, this.resolveExecutionCwd(session, target.cwd)))) {
+        throw new BridgeError("RECONCILIATION_UNCERTAIN", "Codex app-server did not confirm turn interruption. Attach to observe its outcome.");
+      }
+      this.store.markAborted(session.handoffId, turn.turnId, params.reason ?? "Aborted by local orchestrator.", new Date().toISOString(), turn.dispatchState);
+      return this.buildEnvelopeFromRecords(this.requireSession(session.handoffId), this.requireLatestTurn(session.handoffId));
+    }
+    if (target.transport === "acp") {
+      if (!session.remoteSessionId || !(await this.acp(target).cancelPrompt(session.remoteSessionId, turn.runId))) {
+        throw new BridgeError("RECONCILIATION_UNCERTAIN", "ACP agent did not confirm prompt cancellation. Attach to observe its outcome.");
+      }
+      this.store.markAborted(session.handoffId, turn.turnId, params.reason ?? "Aborted by local orchestrator.", new Date().toISOString(), turn.dispatchState);
+      return this.buildEnvelopeFromRecords(this.requireSession(session.handoffId), this.requireLatestTurn(session.handoffId));
     }
     const client = new OpenClawGatewayClient(target, this.config.dataDir);
     if (!await client.abortRun(session.remoteSessionKey, turn.runId)) {
@@ -860,8 +1577,15 @@ export class BridgeService {
     turn: TurnRecord;
     terminalReplyText?: string;
     runFailedError?: string;
+    a2aInputRequired?: boolean;
   }): Promise<HandoffResultEnvelopeV2> {
-    const { session, turn, terminalReplyText: rawReply, runFailedError } = params;
+    const { session, turn, runFailedError, a2aInputRequired } = params;
+    const rawReply =
+      params.terminalReplyText?.trim()
+        ? params.terminalReplyText
+        : a2aInputRequired
+          ? "Remote A2A agent requested additional input (TASK_STATE_INPUT_REQUIRED)."
+          : undefined;
     const now = new Date().toISOString();
     const pubLedger = this.store.getPublicationLedger(session.handoffId);
 
@@ -913,10 +1637,12 @@ export class BridgeService {
 
     if (!rawReply?.trim()) {
       this.store.markTurnUncertain({ handoffId: session.handoffId, turnId: turn.turnId,
-        errorText: "Run reached a terminal state, but its exact reply is unavailable. Inspect this Gateway run before continuing.", now });
+        errorText: "Run reached a terminal state, but its exact reply is unavailable. Inspect this target session before continuing.", now });
       return this.buildRunningOrUncertainResult(this.requireSession(session.handoffId), this.requireLatestTurn(session.handoffId));
     }
-    const reported = parseReportedResult(rawReply, session.remoteSessionKey?.startsWith("browser:") ? "browser" : "gateway");
+    const reported = parseReportedResult(rawReply, this.sessionTransport(session), {
+      a2aInputRequired,
+    });
 
     const candidateRef = reported.candidateRef ?? session.sourceRemoteRef ??
       (session.mode === "verify_only" && session.publisherOwner === "none" ? session.pinnedSourceCommitSha : undefined);

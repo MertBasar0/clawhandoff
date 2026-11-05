@@ -2,9 +2,24 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
-import { BridgeError, type BridgeConfig, type GatewayTargetConfig, type PublisherOwner } from "./types.js";
+import {
+  BridgeError,
+  type BridgeConfig,
+  type BridgeTargetConfig,
+  type GatewayTargetConfig,
+  type PublisherOwner,
+} from "./types.js";
 
 const PublisherOwnerConfigSchema = z.enum(["none", "local", "remote_gated"]);
+
+export function normalizeA2ABaseUrl(rawUrl: string): string {
+  const parsed = new URL(rawUrl);
+  if ((parsed.protocol !== "https:" && parsed.protocol !== "http:") || parsed.username || parsed.password || parsed.hash) {
+    throw new Error("A2A target url must be an HTTP(S) URL without inline credentials or fragment.");
+  }
+  const cleanPath = parsed.pathname === "/" ? "" : parsed.pathname.replace(/\/+$/, "");
+  return `${parsed.origin}${cleanPath}`;
+}
 
 const GatewayTargetSchema = z.object({
   transport: z.literal("gateway").optional(),
@@ -106,13 +121,83 @@ const BrowserTargetSchema = z.object({
   }).strict(),
 }).strict().refine((target) => parseBrowserSessionRoute(target.sessionUrl, target.basePath, target.agentId) !== null, { path: ["sessionUrl"], message: "Use the exact HTTPS /chat/<agentId>/<session...> (or /dashboard/<agentId>/<session...>) URL without credentials, query, or fragment. If the route is ambiguous, set basePath to the UI mount (/ for the root)." });
 
+const A2ATargetSchema = z
+  .object({
+    transport: z.literal("a2a"),
+    targetId: z.string().min(1),
+    url: z.string().url(),
+    agentCardPath: z.string().min(1).optional(),
+    protocolVersion: z.enum(["auto", "1.0", "0.3"]).optional(),
+    authTokenEnvVar: z.string().min(1).optional(),
+    authHeaderName: z.string().min(1).optional(),
+    headers: z.record(z.string(), z.string()).optional(),
+    rpcTimeoutMs: z.number().int().min(1_000).max(300_000).optional(),
+  })
+  .strict()
+  .refine(
+    (target) => {
+      try {
+        normalizeA2ABaseUrl(target.url);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    {
+      path: ["url"],
+      message: "Use a clean HTTP or HTTPS A2A URL without inline credentials or URL fragment.",
+    },
+  );
+
+const CodexTargetSchema = z
+  .object({
+    transport: z.literal("codex"),
+    targetId: z.string().min(1),
+    command: z.string().min(1).optional(),
+    args: z.array(z.string()).optional(),
+    cwd: z.string().min(1).optional(),
+    model: z.string().min(1).optional(),
+    effort: z.enum(["none", "minimal", "low", "medium", "high", "xhigh"]).optional(),
+    approvalPolicy: z.enum(["untrusted", "on-failure", "on-request", "never"]).optional(),
+    sandbox: z.enum(["read-only", "workspace-write", "danger-full-access"]).optional(),
+    rpcTimeoutMs: z.number().int().min(1_000).max(300_000).optional(),
+  })
+  .strict();
+
+const AcpTargetSchema = z
+  .object({
+    transport: z.literal("acp"),
+    targetId: z.string().min(1),
+    agent: z.string().min(1).optional(),
+    command: z.string().min(1).optional(),
+    args: z.array(z.string()).optional(),
+    cwd: z.string().min(1).optional(),
+    model: z.string().min(1).optional(),
+    modeId: z.string().min(1).optional(),
+    permissionMode: z.enum(["approve-all", "approve-reads", "deny-all"]).optional(),
+    rpcTimeoutMs: z.number().int().min(1_000).max(300_000).optional(),
+  })
+  .strict()
+  .refine((target) => Boolean(target.agent || target.command), {
+    path: ["agent"],
+    message: "Specify either a built-in ACP agent preset (e.g. 'claude', 'gemini', 'cursor') or an explicit command.",
+  });
+
+const BridgeTargetSchema: z.ZodType<BridgeTargetConfig, z.ZodTypeDef, unknown> = z.union([
+  BrowserTargetSchema,
+  A2ATargetSchema,
+  CodexTargetSchema,
+  AcpTargetSchema,
+  GatewayTargetSchema,
+]);
+
 const BridgeConfigFileSchema = z.object({
   dataDir: z.string().min(1).optional(),
   ghCliPath: z.string().min(1).optional(),
   defaultPublisherOwner: PublisherOwnerConfigSchema.optional(),
   defaultWaitBudgetMs: z.number().int().min(0).max(120_000).optional(),
   defaultMaxAutonomousTurns: z.number().int().min(1).max(15).optional(),
-  targets: z.record(z.string(), z.union([BrowserTargetSchema, GatewayTargetSchema])),
+  targets: z.record(z.string(), BridgeTargetSchema),
 });
 
 function resolveEnvPublisherOwner(): PublisherOwner | undefined {

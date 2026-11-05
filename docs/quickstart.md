@@ -2,7 +2,7 @@
 
 Use this guide to have your local assistant hand an investigation to Robo and answer a request for evidence in **the same chat**. For example, if Robo asks for a Windows test, the local assistant can run it in an authorized environment, check which commit it tested, and send the result back. The bridge records each turn. The local assistant owns the task until the evidence meets the acceptance criteria or it needs help.
 
-The example below investigates a specific commit and requires no code changes or pull request. To start a separate Gateway session, see the [README](../README.md). For the handoff protocol and publishing rules, see the [design RFC](RFC-v0.2.md).
+The example below investigates a specific commit and requires no code changes or pull request. To connect an OpenClaw Gateway, a standard Agent2Agent (`a2a`) endpoint, a local `codex app-server --stdio` worker (`codex`), or an ACP coding agent (`acp` for Claude Code, Gemini CLI, Cursor, Copilot, OpenCode, etc.), see the target configuration examples in the [README](../README.md#configure-a-target). For the handoff protocol and publishing rules, see the [design RFC](RFC-v0.2.md).
 
 ## 1. Build the bridge
 

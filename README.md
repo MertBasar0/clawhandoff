@@ -1,6 +1,6 @@
 # clawhandoff
 
-`clawhandoff` connects a local assistant to an OpenClaw agent such as Robo. Suppose Robo asks for a Windows test it cannot run. Your local assistant can run the test, send the result back to the same conversation and check Robo’s reply. The bridge records each turn in SQLite and can verify Git commits and pull requests. The local assistant owns the investigation and must stay active to advance it.
+`clawhandoff` connects a local assistant (Claude Code, Codex, Gemini CLI, Cursor, Copilot, OpenClaw, or any MCP client) to any target coding agent over **OpenClaw Browser**, **OpenClaw Gateway**, **Agent2Agent (`a2a`)**, **Codex (`codex app-server --stdio`)**, or **Agent Client Protocol (`acp`)**. Suppose a remote Linux agent asks for a Windows test it cannot run, or your local Claude Code hands an isolated implementation slice to Codex or an A2A service: your primary assistant runs the local check, sends commit-bound evidence back into the same session, and verifies the reply. The bridge records each turn in SQLite and independently verifies Git commits, locked paths, and pull requests before publication.
 
 [Guided browser quickstart](docs/quickstart.md) · [Architecture and protocol (RFC v0.2)](docs/RFC-v0.2.md) · [Local orchestrator skill](skills/autonomous-handoff/SKILL.md)
 
@@ -24,8 +24,11 @@ The build creates `dist/cli.js`. Keep the printed absolute Node path for your MC
 
 | Choose | What it does | What you need |
 | --- | --- | --- |
-| Browser | Uses a specific, existing Robo conversation. Messages appear in its ordinary Team history. | The exact chat URL, your signed-in Chrome profile and [Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp) with explicit page IDs and structured output (tested with 1.11.0). |
-| Gateway | Creates a dedicated agent session over RPC. Supports named worktrees and cancellation by run ID. | An OpenClaw CLI with access to the Gateway. Cloudflare Access targets also need `cloudflared`. |
+| Browser (`"browser"`) | Uses a specific, existing Robo conversation. Messages appear in its ordinary Team history. | The exact chat URL, your signed-in Chrome profile and [Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp) with explicit page IDs and structured output (tested with 1.11.0). |
+| Gateway (`"gateway"`) | Creates a dedicated OpenClaw agent session over RPC. Supports named worktrees and cancellation by run ID. | An OpenClaw CLI with access to the Gateway. Cloudflare Access targets also need `cloudflared`. |
+| Agent2Agent (`"a2a"`) | Connects to any A2A v1.0 or v0.3 HTTP/JSON-RPC agent via Agent Card discovery (`/.well-known/agent-card.json` or `/.well-known/agent.json`), `contextId` multi-turn continuity, `TASK_STATE_INPUT_REQUIRED` objection routing, and `CancelTask`. | Target HTTP(S) base URL and optional `authTokenEnvVar` (Bearer token or custom `authHeaderName`). |
+| Codex (`"codex"`) | Drives a local or WSL `codex app-server --stdio` session with persistent thread resume (`thread/start`, `thread/resume`, `thread/read`), `clientUserMessageId` crash recovery, optional isolated Git `worktreeName`, and `turn/interrupt`. | `codex` CLI installed and authenticated (`codex login` or `OPENAI_API_KEY`). |
+| ACP (`"acp"`) | Drives any Agent Client Protocol stdio agent (`claude`, `gemini`, `cursor`, `copilot`, `opencode`, `pi`, `droid`, `kimi`, `openclaw`, or custom `command`) with `session/new`, `session/load`, permission policy gating, optional isolated Git `worktreeName`, and `session/cancel`. | Target ACP agent CLI or `npx` adapter on `PATH`. |
 
 ### Use an existing Robo chat in Chrome
 
@@ -79,6 +82,41 @@ For Gateway access, save this as your config or merge the target into the same `
 - **Existing profile.** Use `"authMode": "existing-profile"` and a `profileDir` containing an `openclaw.json` for the configured Gateway. The bridge checks that the stored remote URL matches.
 
 For one Gateway, you can omit the config file and set `OPENCLAW_HANDOFF_URL`, `OPENCLAW_HANDOFF_AGENT` and, when applicable, `OPENCLAW_HANDOFF_PROJECT` in the MCP server’s environment. `OPENCLAW_HANDOFF_TARGET_ID` defaults to `robo` and `OPENCLAW_HANDOFF_AUTH_MODE` defaults to `edge-cloudflare`. `OPENCLAW_HANDOFF_CLI` and `OPENCLAW_HANDOFF_CLOUDFLARED` override the executable paths. An explicit `--config` or `CLAWHANDOFF_CONFIG_PATH` selects file-based targets instead.
+
+### Connect to A2A, Codex, or ACP agents
+
+You can mix remote A2A agents, local Codex threads, and ACP coding agents in the same `targets` map:
+
+```json
+{
+  "targets": {
+    "remote-a2a": {
+      "targetId": "remote-a2a",
+      "transport": "a2a",
+      "url": "https://agent.example.com",
+      "authTokenEnvVar": "REMOTE_A2A_TOKEN"
+    },
+    "codex-local": {
+      "targetId": "codex-local",
+      "transport": "codex",
+      "cwd": "/absolute/path/to/repo",
+      "approvalPolicy": "never",
+      "sandbox": "workspace-write"
+    },
+    "claude-local": {
+      "targetId": "claude-local",
+      "transport": "acp",
+      "agent": "claude",
+      "cwd": "/absolute/path/to/repo",
+      "permissionMode": "approve-all"
+    }
+  }
+}
+```
+
+- **A2A (`"transport": "a2a"`).** Discovers the Agent Card automatically (`/.well-known/agent-card.json` with `/.well-known/agent.json` fallback, or custom `agentCardPath`) and speaks A2A v1.0 (`SendMessage` / `GetTask` / `ListTasks` / `CancelTask`) or v0.3 (`message/send` / `tasks/get` / `tasks/cancel`). Set `authHeaderName` when `authTokenEnvVar` holds an API key header rather than a Bearer token.
+- **Codex (`"transport": "codex"`).** Launches `codex app-server --stdio` (override with `command` / `args` if needed, for example `["wsl", "codex", "app-server", "--stdio"]`). Passing `worktreeName` to `bridge_handoff_start` creates a detached Git worktree under `<dataDir>/worktrees/` at the pinned commit so your primary working tree stays untouched.
+- **ACP (`"transport": "acp"`).** Built-in `agent` presets include `claude`, `gemini`, `cursor`, `copilot`, `codex`, `opencode`, `pi`, `droid`, `kimi`, `kiro`, `qwen`, and `openclaw`, or pass an explicit `command` and `args`. Supports `permissionMode` (`"approve-all"`, `"approve-reads"`, or `"deny-all"`) and isolated `worktreeName` creation.
 
 ## Register the bridge with your local assistant
 
