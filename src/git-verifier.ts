@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { isPlainGitRef } from "./candidate-ref.js";
 import { killProcessTree } from "./process-spawn.js";
 import { normalizeLockedPath } from "./schema.js";
 import { BridgeError, type ObservedResult, type ReconciledPrState } from "./types.js";
@@ -104,6 +105,8 @@ export class GitVerifier {
 
   async verifyCandidate(params: {
     remoteUrlOrPath: string;
+    /** Fetch candidateRef from here instead, such as a fork. Base commits still come from remoteUrlOrPath. */
+    candidateRemoteUrlOrPath?: string;
     localRepoPath?: string;
     candidateRef: string;
     pinnedBaseCommitSha: string;
@@ -115,6 +118,7 @@ export class GitVerifier {
   }): Promise<ObservedResult> {
     const {
       remoteUrlOrPath,
+      candidateRemoteUrlOrPath = remoteUrlOrPath,
       localRepoPath,
       candidateRef,
       pinnedBaseCommitSha,
@@ -125,6 +129,15 @@ export class GitVerifier {
       existingPrUrl,
     } = params;
 
+    // The ref becomes the source side of a refspec, so it must not carry refspec syntax itself.
+    if (!isPlainGitRef(candidateRef)) {
+      return {
+        reachableRefVerified: false,
+        reconciledPrState: existingPrState,
+        reconciledPrUrl: existingPrUrl,
+        verificationNotes: [`Refusing candidateRef "${candidateRef}": it is not a plain Git ref.`],
+      };
+    }
     const normalizedLocks = lockedPaths.map(normalizeLockedPath);
     const lockBaseSha = pinnedSourceCommitSha ?? pinnedBaseCommitSha;
     const mirrorDir = await this.ensureBareMirror(remoteUrlOrPath);
@@ -154,7 +167,7 @@ export class GitVerifier {
         }
       }
 
-      const remoteIsLocal = isLocalPath(remoteUrlOrPath);
+      const remoteIsLocal = isLocalPath(candidateRemoteUrlOrPath);
       const bloblessArgs = remoteIsLocal ? [] : ["--filter=blob:none"];
       try {
         await this.runGit(
@@ -165,14 +178,15 @@ export class GitVerifier {
             "--no-recurse-submodules",
             ...bloblessArgs,
             "--",
-            remoteUrlOrPath,
+            candidateRemoteUrlOrPath,
             `${candidateRef}:${tempRef}`,
           ],
           remoteIsLocal,
         );
       } catch (err) {
+        const from = candidateRemoteUrlOrPath === remoteUrlOrPath ? "" : ` from ${candidateRemoteUrlOrPath}`;
         notes.push(
-          `Failed to fetch candidateRef "${candidateRef}": ${err instanceof Error ? err.message : String(err)}`,
+          `Failed to fetch candidateRef "${candidateRef}"${from}: ${err instanceof Error ? err.message : String(err)}`,
         );
         return {
           reachableRefVerified: false,

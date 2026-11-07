@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { A2AClient, type A2ATurnObservation } from "./a2a-client.js";
 import { AcpSessionClient, resolveAcpLaunchCommand } from "./acp-client.js";
+import { githubCloneUrl, parseCandidateRef } from "./candidate-ref.js";
 import { ChromeChat } from "./chrome-chat.js";
 import { inspectBrowserTurn, wrapBrowserPrompt } from "./browser-turn.js";
 import { CodexAppServerClient } from "./codex-client.js";
@@ -707,8 +708,11 @@ export class BridgeService {
       }
     } catch (error) {
       if (!(error instanceof BridgeError)) throw error;
-      if (!submitted) throw new BridgeError(error.code, error.message, `When the chat is ready, attach to ${handoffId}.`);
-      uncertain(error.message);
+      const attachAgain = `When the chat is ready, attach to ${handoffId}.`;
+      if (!submitted) {
+        throw new BridgeError(error.code, error.message, error.remediation ? `${error.remediation} ${attachAgain}` : attachAgain);
+      }
+      uncertain(error.remediation ? `${error.message} ${error.remediation}` : error.message);
     }
     if (reply) return this.finalizeSettledTurn({ session, turn, terminalReplyText: reply });
     const latest = this.requireLatestTurn(handoffId);
@@ -1349,17 +1353,23 @@ export class BridgeService {
     remoteSource = session.remoteUrlOrPath ?? session.localRepoPath,
   ): Promise<ObservedResult> {
     const ledger = this.store.getPublicationLedger(session.handoffId);
-    const git: ObservedResult = candidateRef && remoteSource
-      ? await this.gitVerifier.verifyCandidate({
-          remoteUrlOrPath: remoteSource,
-          localRepoPath: session.localRepoPath,
-          candidateRef,
-          pinnedBaseCommitSha: session.pinnedBaseCommitSha,
-          pinnedSourceCommitSha: session.pinnedSourceCommitSha,
-          expectedTreeSha: session.expectedTreeSha,
-          lockedPaths: session.lockedPaths,
-        })
-      : { reachableRefVerified: false, reconciledPrState: "none" };
+    let git: ObservedResult = { reachableRefVerified: false, reconciledPrState: "none" };
+    if (candidateRef && remoteSource) {
+      // A target may report owner/repo:<ref>. A ref in another repository is fetched from GitHub.
+      const location = parseCandidateRef(candidateRef, session.repoId);
+      git = location
+        ? await this.gitVerifier.verifyCandidate({
+            remoteUrlOrPath: remoteSource,
+            ...(location.repository ? { candidateRemoteUrlOrPath: githubCloneUrl(location.repository) } : {}),
+            localRepoPath: session.localRepoPath,
+            candidateRef: location.ref,
+            pinnedBaseCommitSha: session.pinnedBaseCommitSha,
+            pinnedSourceCommitSha: session.pinnedSourceCommitSha,
+            expectedTreeSha: session.expectedTreeSha,
+            lockedPaths: session.lockedPaths,
+          })
+        : { ...git, verificationNotes: [`Refusing candidateRef "${candidateRef}": expected a plain Git ref or owner/repo:<ref>.`] };
+    }
     if (session.publisherOwner === "none" && !reportedPrUrl && !ledger.attempted && !ledger.prUrl) return git;
 
     const pr = await this.githubReconciler.reconcilePullRequest({

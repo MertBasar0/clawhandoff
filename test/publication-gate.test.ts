@@ -90,6 +90,60 @@ test("Fresh verification after restart cannot replace a pending publication's au
   assert.equal(JSON.parse(readFileSync(gate.statePath, "utf8")).rpcCounts["chat.send"], 1);
 });
 
+test("A candidateRef qualified with the handoff repository passes both stages and reconciles the published PR", async (t) => {
+  const fixture = createTempGitFixture();
+  const head = fixture.commitFile("README.md", "verified tree", "prepare candidate");
+  fixture.git(["push", "origin", "refs/heads/main"]);
+  const statePath = join(fixture.rootDir, "gateway.json");
+  const originalEnv = process.env.FAKE_GATEWAY_STATE_FILE;
+  process.env.FAKE_GATEWAY_STATE_FILE = statePath;
+  const prUrl = "https://github.com/example/repo/pull/9";
+  // Robo's owner/repo:<ref> form, with GitHub's case-insensitive names.
+  const reply = (disposition: string, extra: Record<string, unknown> = {}) => "```handoff-result\n" + JSON.stringify({
+    disposition, candidateRef: "Example/Repo:refs/heads/main", candidateCommitSha: head,
+    summaryDelta: disposition, blockers: [], claimedChecks: [], ...extra,
+  }) + "\n```";
+  writeFileSync(statePath, JSON.stringify({ openPrs: [], queuedTurnReplies: [
+    { replyText: reply("ready_for_publish_gate") },
+    { replyText: reply("completed", { prUrl }), createdPr: { number: 9, url: prUrl, headRefName: "main", headRefOid: head } },
+  ] }));
+  const service = new BridgeService({
+    dataDir: fixture.rootDir,
+    ghCliPath: resolve("test/helpers/fake-gh-cli.mjs"),
+    targets: { robo: { targetId: "robo", url: "https://gateway.example", authMode: "direct-token",
+      agentId: "main", cliPath: resolve("test/helpers/fake-openclaw-cli.mjs") } },
+  });
+  t.after(() => {
+    service.close();
+    if (originalEnv === undefined) delete process.env.FAKE_GATEWAY_STATE_FILE;
+    else process.env.FAKE_GATEWAY_STATE_FILE = originalEnv;
+    fixture.cleanup();
+  });
+
+  const ready = await service.startHandoff({ targetId: "robo", envelope: {
+    schemaVersion: "0.2", requestId: "qualified-ref", workspaceId: "workspace", title: "Publish verified commit",
+    outcome: "Publish a draft after exact commit verification.", mode: "publish_unchanged", publisherOwner: "remote_gated",
+    gitContext: { repoId: "example/repo", remoteUrlOrPath: fixture.originBareDir, pinnedBaseCommitSha: head,
+      pinnedSourceCommitSha: head, expectedTreeSha: fixture.revParse("HEAD^{tree}") },
+    requestedCapabilities: { allowCodeEdit: false, allowBranchPush: false, allowManagedPublishStage: false },
+    acceptanceCriteria: ["Only the approved commit is published"],
+  } });
+  assert.equal(ready.observed.reachableRefVerified, true, JSON.stringify(ready.observed.verificationNotes));
+  assert.equal(ready.observed.observedHeadSha, head);
+  assert.equal(ready.orchestratorDirective.action, "AUTHORIZE_REMOTE_PUBLISH");
+
+  const published = await service.continueHandoff({ handoffId: ready.handoffId, intent: "authorize_publish", message: "Publish the verified commit." });
+  assert.equal(published.observed.observedHeadSha, head);
+  assert.equal(published.observed.reconciledPrState, "open_verified");
+  assert.equal(published.observed.reconciledPrUrl, prUrl);
+  assert.equal(published.orchestratorDirective.action, "COMPLETE");
+
+  // A refspec is refused before anything is fetched.
+  const refused = await service.verifyGit({ handoffId: ready.handoffId, candidateRef: "example/repo:refs/heads/main:refs/heads/x" });
+  assert.equal(refused.observed.reachableRefVerified, false);
+  assert.match((refused.observed.verificationNotes ?? []).join("\n"), /Refusing candidateRef/);
+});
+
 test("Omitting publisherOwner defaults to remote_gated (unless config overrides defaultPublisherOwner) and mid-handoff updatedLocalRepoPath binds worktree", async (t) => {
   const fixture = createTempGitFixture();
   const baseSha = fixture.commitFile("README.md", "base\n", "base");

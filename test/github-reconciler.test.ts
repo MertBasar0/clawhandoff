@@ -51,6 +51,11 @@ test("PR reconciliation verifies the exact open head and preserves uncertain pub
     { name: "multiple open PRs on the same head need disambiguation", records: [another, pr], priorState: "none", expected: "uncertain_in_flight", headSha },
     { name: "a fork with the same branch and commit needs an explicit PR identity", records: [{ ...pr, isCrossRepository: true }], priorState: "none", expected: "uncertain_in_flight", headSha },
     { name: "explicit URL identifies the open fork PR among equal heads", records: [another, { ...pr, isCrossRepository: true }], reportedPrUrl: priorUrl, priorState: "none", expected: "open_verified", headSha },
+    // Robo can report owner/repo:<ref>; gh filters by the branch name alone.
+    { name: "a ref qualified with the handoff repository reconciles like a plain ref", records: [pr], headRef: "Example/Repo:refs/heads/candidate", priorState: "uncertain_in_flight", expected: "open_verified", headSha },
+    { name: "a fork-qualified ref verifies the reported fork PR", records: [{ ...pr, isCrossRepository: true }], headRef: "fork-owner/repo:refs/heads/candidate", reportedPrUrl: priorUrl, priorState: "uncertain_in_flight", expected: "open_verified", headSha },
+    { name: "a fork-qualified ref without a PR URL cannot adopt a same-repository PR", records: [pr], headRef: "fork-owner/repo:refs/heads/candidate", priorState: "none", expected: "uncertain_in_flight", headSha },
+    { name: "a fork-qualified pull ref cannot name a PR in the handoff repository", records: [{ ...pr, isCrossRepository: true }], headRef: "fork-owner/repo:refs/pull/42/head", reportedPrUrl: priorUrl, priorState: "none", expected: "uncertain_in_flight", headSha },
   ];
 
   try {

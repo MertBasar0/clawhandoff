@@ -209,6 +209,8 @@ Use a stable `sourceRef` for each distinct artifact. The assistant verifies its 
 
 Keep exactly one tab open at the configured chat URL with its input empty. If a Chrome connection request times out, call `bridge_handoff_attach` with the saved `handoffId` (or the ID in the error message). Keep Chrome visible and accept the new connection prompt while the call is waiting. A virtualized chat may require scrolling back to the relevant turn. The bridge correlates a submitted `Bridge-Turn` with a reply marked `Bridge-Reply`. The reply’s final `handoff-result` block must open and close at the start of a line.
 
+A browser error names its cause in parentheses, such as `(browser_connect_timeout)` when Chrome did not finish attaching within Chrome DevTools MCP’s 60-second limit, `(browser_connect_failed)` when remote debugging is off, or `(mcp_transport_closed)` when the Chrome DevTools MCP process exited. An uncertain turn records the same text. Raw tool output stays private because it can describe other tabs. If the browser reconnects during a call, the bridge finds the chat tab again and repeats the interrupted step once, starting with its checks. It repeats a fill or click only when Chrome DevTools MCP shows that the first attempt never reached the page. If the chat is then not open in exactly one tab, the bridge stops with `(browser_reconnected)`.
+
 SQLite records the intent before sending. An attach may deliver a prepared, unsent intent. If a send was attempted and its acceptance is unknown, attach looks for the existing receipt. If `lifecycleStatus` is `uncertain`, inspect the original conversation before retrying to avoid sending the task twice.
 
 Use `bridge_handoff_abort` for an intentional cancellation. It can cancel a recorded Gateway run or close a browser turn before submission. For a submitted browser turn, stop Robo in the chat UI if necessary. After reviewing the conversation, `localOnly: true` closes local browser tracking while the remote conversation continues.
@@ -216,6 +218,8 @@ Use `bridge_handoff_abort` for an intentional cancellation. It can cancel a reco
 ## Git verification and publication
 
 For a task that needs Git verification, configure a repository to fetch from with `gitContext.remoteUrlOrPath` or `gitContext.localRepoPath`. `bridge_verify_git` accepts a `handoffId` and a reachable `candidateRef`. It fetches into an isolated bare mirror without checking out candidate code, running hooks or fetching submodules. It checks the candidate’s ancestry and optional expected tree. `lockedPaths` are protected from changes after `pinnedSourceCommitSha` (or `pinnedBaseCommitSha` if no source commit was supplied), including changes reverted before the tip.
+
+A `candidateRef` is a plain ref, or a ref qualified with its GitHub repository, as in `owner/repo:refs/heads/branch`. If `owner/repo` is the handoff’s `repoId`, the bridge fetches the ref from the configured repository. Otherwise it fetches it from `https://github.com/<owner>/<repo>.git`. It refuses anything else, such as a refspec.
 
 The initial `publisherOwner` determines who can be asked to publish. When omitted from the envelope, the bridge defaults to `remote_gated` (configurable via `defaultPublisherOwner` in `bridge-config.json` or `CLAWHANDOFF_DEFAULT_PUBLISHER_OWNER`).
 
@@ -225,7 +229,7 @@ The initial `publisherOwner` determines who can be asked to publish. When omitte
 | `none` | Use for a report or verification without publication. |
 | `local` | Opt-in local publication: the local assistant publishes the verified candidate when authorized. To enforce a local-only boundary, use a remote worker without publishing credentials or tools. |
 
-PR reconciliation requires an authenticated GitHub CLI (`gh`) with read access to the repository. The bridge checks an open PR’s exact head. Without a PR URL it requires a unique same-repository match. Verify the destination branch separately when it matters. If a publish might have succeeded, an empty search is insufficient to repeat it safely. Preflight can optionally search for rival PRs when given both `repoId` and `issueQuery`. An empty advisory list can also mean `gh` was unavailable.
+PR reconciliation requires an authenticated GitHub CLI (`gh`) with read access to the repository. The bridge checks an open PR’s exact head. Without a PR URL it requires a unique same-repository match, so a PR from a fork needs its URL. Verify the destination branch separately when it matters. If a publish might have succeeded, an empty search is insufficient to repeat it safely. Preflight can optionally search for rival PRs when given both `repoId` and `issueQuery`. An empty advisory list can also mean `gh` was unavailable.
 
 ## Test the loop locally
 

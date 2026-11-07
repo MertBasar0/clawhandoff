@@ -158,25 +158,22 @@ test("browser MCP survives OpenClaw auto-title slug replacement on 32-hex UUID s
     });
     assert.equal(completed.orchestratorDirective.action, "COMPLETE");
 
-    // Reopening Chrome (reconnected: true on initial list_pages) recovers on the first preflight call,
-    // while mid-operation reconnect during evaluate_script still fails closed.
-    writeFileSync(
-      statePath,
-      JSON.stringify({ ...JSON.parse(readFileSync(statePath, "utf8")), reconnectedOnNextListPages: true }),
-    );
-    const preflightOk = await client.callTool({ name: "bridge_preflight", arguments: { targetId: "robo" } });
-    assert.ok(!preflightOk.isError, JSON.stringify(preflightOk.content));
-    assert.equal(
-      JSON.parse((preflightOk.content as Array<{ text: string }>)[0]!.text).browserReady,
-      true,
-    );
-
-    writeFileSync(
-      statePath,
-      JSON.stringify({ ...JSON.parse(readFileSync(statePath, "utf8")), reconnectedOnNextEvaluate: true }),
-    );
-    const preflightMidReconnect = await client.callTool({ name: "bridge_preflight", arguments: { targetId: "robo" } });
-    assert.equal(preflightMidReconnect.isError, true);
+    // A reconnect renumbers tabs. On the first list_pages the fresh ids are used directly; in the
+    // middle of a read the bridge resolves the chat tab again and repeats the read once.
+    const preflightAfter = async (reconnectBefore: Record<string, unknown>) => {
+      writeFileSync(statePath, JSON.stringify({ ...JSON.parse(readFileSync(statePath, "utf8")), reconnectBefore }));
+      return client.callTool({ name: "bridge_preflight", arguments: { targetId: "robo" } });
+    };
+    for (const tool of ["list_pages", "evaluate_script"]) {
+      const preflightOk = await preflightAfter({ tool });
+      assert.ok(!preflightOk.isError, JSON.stringify(preflightOk.content));
+      assert.equal(JSON.parse((preflightOk.content as Array<{ text: string }>)[0]!.text).browserReady, true);
+    }
+    // It fails closed when the tab is no longer exactly one after the reconnect.
+    const preflightDuplicate = await preflightAfter({ tool: "evaluate_script", duplicateTab: true });
+    assert.equal(preflightDuplicate.isError, true);
+    assert.match(JSON.stringify(preflightDuplicate.content), /\(browser_reconnected\)/);
+    writeFileSync(statePath, JSON.stringify({ ...JSON.parse(readFileSync(statePath, "utf8")), duplicateTab: false }));
 
     // Between-tool-call preamble flicker (settled unlabelled bubble + momentary !busy) rides through
     // waitBudgetMs and settles cleanly on Bridge-Reply instead of aborting as uncertain.
