@@ -3,8 +3,75 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { githubCloneUrl, parseCandidateRef } from "../src/candidate-ref.js";
 import { GitVerifier } from "../src/git-verifier.js";
 import { createTempGitFixture } from "./helpers/git-fixture.js";
+
+test("a candidate ref may name its GitHub repository and must otherwise be a plain ref", () => {
+  const repoId = "openclaw/openclaw-windows-node";
+  // Both forms Robo reported for openclaw-windows-node PR updates.
+  assert.deepEqual(
+    parseCandidateRef("openclaw/openclaw-windows-node:refs/heads/openclaw/tray-tests-isolate-user-profile", repoId),
+    { ref: "refs/heads/openclaw/tray-tests-isolate-user-profile" },
+  );
+  assert.deepEqual(
+    parseCandidateRef("MertBasar0/openclaw-windows-node:refs/heads/tray-tests-isolate-user-profile-1961", repoId),
+    { ref: "refs/heads/tray-tests-isolate-user-profile-1961", repository: "MertBasar0/openclaw-windows-node" },
+  );
+  assert.equal(githubCloneUrl("MertBasar0/openclaw-windows-node"), "https://github.com/MertBasar0/openclaw-windows-node.git");
+  // GitHub names are case-insensitive.
+  assert.deepEqual(parseCandidateRef("OpenClaw/OpenClaw-Windows-Node:refs/heads/x", repoId), { ref: "refs/heads/x" });
+  for (const plain of ["refs/heads/main", "main", "robo/feature", "refs/pull/42/head", "refs/heads/a+b", "a".repeat(40)]) {
+    assert.deepEqual(parseCandidateRef(plain, repoId), { ref: plain }, plain);
+  }
+  for (const refused of [
+    "", "refs/heads/a:refs/heads/b", "owner/repo:refs/heads/a:refs/heads/b", "owner/repo:", "-owner/repo:refs/heads/x",
+    "owner/..:refs/heads/x", "https://github.com/owner/repo:refs/heads/x", "+refs/heads/main", "-q", "refs/heads/*",
+    "refs/heads/[x]", "a?b", "main~1", "HEAD^", "a..b", "a@{1}", "@", "x.", "refs/heads/x.lock", "refs/heads/.hidden",
+    "refs//heads", "/refs/heads/x", "refs/heads/x/", "a b", "a\\b", "a\nb",
+  ]) {
+    assert.equal(parseCandidateRef(refused, repoId), undefined, JSON.stringify(refused));
+  }
+});
+
+test("GitVerifier fetches a candidate from the repository that holds it and refuses refspec syntax", async () => {
+  const fixture = createTempGitFixture();
+  const dataDir = mkdtempSync(join(tmpdir(), "clawhandoff-fork-"));
+  try {
+    const base = fixture.commitFile("README.md", "base\n", "base");
+    fixture.git(["push", "origin", "main"]);
+    // Only a fork holds the candidate branch.
+    const forkDir = join(fixture.rootDir, "fork.git");
+    fixture.git(["clone", "--bare", fixture.originBareDir, forkDir], fixture.rootDir);
+    fixture.git(["checkout", "-b", "robo/fork-fix"]);
+    const candidate = fixture.commitFile("src/fix.ts", "export const fixed = true;\n", "fork fix");
+    fixture.git(["push", forkDir, "robo/fork-fix"]);
+
+    const verifier = new GitVerifier(dataDir);
+    const params = {
+      remoteUrlOrPath: fixture.originBareDir,
+      candidateRef: "refs/heads/robo/fork-fix",
+      pinnedBaseCommitSha: base,
+      pinnedSourceCommitSha: base,
+    };
+    assert.equal((await verifier.verifyCandidate(params)).reachableRefVerified, false);
+    const fromFork = await verifier.verifyCandidate({ ...params, candidateRemoteUrlOrPath: forkDir });
+    assert.equal(fromFork.reachableRefVerified, true);
+    assert.equal(fromFork.observedHeadSha, candidate.toLowerCase());
+    assert.equal(fromFork.baseIsAncestor, true);
+    assert.equal(fromFork.lockedPathsClean, true);
+
+    // These would widen or break the fetch refspec, so they are refused before any fetch.
+    for (const candidateRef of ["owner/repo:refs/heads/robo/fork-fix", "refs/heads/main:refs/heads/x", "+refs/heads/main", "refs/heads/*", "HEAD^"]) {
+      const refused = await verifier.verifyCandidate({ ...params, candidateRemoteUrlOrPath: forkDir, candidateRef });
+      assert.equal(refused.reachableRefVerified, false, candidateRef);
+      assert.match((refused.verificationNotes ?? []).join("\n"), /is not a plain Git ref/, candidateRef);
+    }
+  } finally {
+    fixture.cleanup();
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});
 
 test("GitVerifier locks the handed-off source, catches remote edits and reverts, and leaves dirty local files untouched", async () => {
   const fixture = createTempGitFixture();

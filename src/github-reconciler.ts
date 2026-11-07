@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { parseCandidateRef } from "./candidate-ref.js";
 import type { ReconciledPrState, RivalPrWarning } from "./types.js";
 
 const execFileAsync = promisify(execFile);
@@ -82,7 +83,10 @@ export class GitHubReconciler {
       prState: "uncertain_in_flight" as const,
       prUrl: params.priorUrl,
     };
-    const headBranch = params.headRef?.replace(/^refs\/heads\//, "");
+    // A target may report owner/repo:<ref>, but gh filters by the branch name alone.
+    const head = params.headRef ? parseCandidateRef(params.headRef, params.repoId) : undefined;
+    const headRef = head?.ref ?? params.headRef;
+    const headBranch = headRef?.replace(/^refs\/heads\//, "");
     if (!headBranch || !params.headSha) {
       return uncertain;
     }
@@ -90,7 +94,8 @@ export class GitHubReconciler {
       return uncertain;
     }
     const expectedUrl = params.priorUrl ?? params.reportedPrUrl;
-    const pullRefMatch = /^refs\/pull\/(\d+)\/head$/.exec(params.headRef ?? "");
+    // Pull numbers belong to the repository that holds the ref.
+    const pullRefMatch = head?.repository ? null : /^refs\/pull\/(\d+)\/head$/.exec(headRef ?? "");
     if (pullRefMatch) {
       try {
         const raw = await this.invokeGh([
@@ -150,8 +155,9 @@ export class GitHubReconciler {
           continue;
         }
         // The handoff does not specify a fork owner or destination branch. Only
-        // infer the PR from a unique same-repository match in a complete listing.
-        if (rec.isCrossRepository !== false || candidateUrl || parsed.length >= lookupLimit) {
+        // infer the PR from a unique same-repository match in a complete listing,
+        // and never for a ref the target placed in another repository.
+        if (rec.isCrossRepository !== false || head?.repository || candidateUrl || parsed.length >= lookupLimit) {
           return uncertain;
         }
         candidateUrl = url;
