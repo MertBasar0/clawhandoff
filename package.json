@@ -1,5 +1,5 @@
 {
-  "name": "clawhandoff",
+  "name": "@mertbasar0/clawhandoff",
   "version": "0.2.0",
   "description": "Universal local-first MCP bridge for verified multi-agent handoffs across OpenClaw (Gateway & Browser), Agent2Agent (A2A), Codex app-server, and Agent Client Protocol (ACP) with crash-safe SQLite reconciliation and checkout-free Git/PR gating.",
   "keywords": [
