@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "setup": {
+    "ready": false,
+    "completedAt": null
+  },
+  "defaultTargetId": null,
+  "defaultPublisherOwner": "remote_gated",
+  "defaultMaxAutonomousTurns": 4,
+  "defaultLockedPaths": []
+}

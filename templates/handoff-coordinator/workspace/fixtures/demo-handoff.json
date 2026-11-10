@@ -1,0 +1,104 @@
+{
+  "synthetic": true,
+  "provenance": "Synthetic rehearsal fixture demonstrating a 3-turn cross-agent handoff with objection resolution and two-stage remote_gated PR verification.",
+  "handoffId": "ho_demo_cross_platform_01",
+  "target": {
+    "targetId": "codex-worker",
+    "transport": "codex"
+  },
+  "contract": {
+    "mode": "implement",
+    "publisherOwner": "remote_gated",
+    "prBaseCommitSha": "1111111111111111111111111111111111111111",
+    "pinnedSourceCommitSha": "1111111111111111111111111111111111111111",
+    "lockedPaths": [
+      "SECURITY.md",
+      "installer.iss"
+    ],
+    "acceptanceCriteria": [
+      "Fix path normalization bug without touching SECURITY.md or installer.iss",
+      "Pass Windows path unit suite on the exact candidate commit"
+    ]
+  },
+  "turns": [
+    {
+      "turn": 1,
+      "kind": "initial",
+      "reported": {
+        "disposition": "needs_evidence",
+        "candidateRef": "refs/heads/worker/path-fix",
+        "candidateCommitSha": "2222222222222222222222222222222222222222",
+        "summaryDelta": "Implemented POSIX/Windows separator normalization on worker/path-fix; need host Windows test confirmation.",
+        "blockers": [
+          "Linux sandbox cannot execute Windows drive-letter regression check on commit 2222222222222222222222222222222222222222."
+        ]
+      },
+      "observed": {
+        "reachableRefVerified": true,
+        "observedHeadSha": "2222222222222222222222222222222222222222",
+        "baseIsAncestor": true,
+        "lockedPathsClean": true,
+        "violatedPaths": [],
+        "reconciledPrState": "none"
+      },
+      "directive": {
+        "action": "CONTINUE_AUTONOMOUSLY",
+        "reason": "Remote agent requested local platform evidence on verified candidate commit 2222222222222222222222222222222222222222."
+      }
+    },
+    {
+      "turn": 2,
+      "kind": "continue",
+      "evidenceSubmitted": [
+        {
+          "claim": "Windows path suite passed (18/18) on commit 2222222222222222222222222222222222222222",
+          "sourceRef": "local-check://win32-path-suite/2222222222222222222222222222222222222222"
+        }
+      ],
+      "reported": {
+        "disposition": "completed",
+        "candidateRef": "refs/heads/worker/path-fix",
+        "candidateCommitSha": "2222222222222222222222222222222222222222",
+        "summaryDelta": "All acceptance criteria verified; candidate ready for Stage-2 publication gate.",
+        "blockers": []
+      },
+      "observed": {
+        "reachableRefVerified": true,
+        "observedHeadSha": "2222222222222222222222222222222222222222",
+        "baseIsAncestor": true,
+        "lockedPathsClean": true,
+        "violatedPaths": [],
+        "reconciledPrState": "none"
+      },
+      "directive": {
+        "action": "AUTHORIZE_REMOTE_PUBLISH",
+        "reason": "Stage-1 Git ancestry and lockedPaths checks passed on 2222222222222222222222222222222222222222; human approval unlocks Stage-2 PR creation."
+      }
+    },
+    {
+      "turn": 3,
+      "kind": "authorize_publish",
+      "reported": {
+        "disposition": "completed",
+        "candidateRef": "refs/heads/worker/path-fix",
+        "candidateCommitSha": "2222222222222222222222222222222222222222",
+        "prUrl": "https://example.invalid/org/repo/pull/42",
+        "summaryDelta": "Opened pull request #42 at the exact authorized commit SHA.",
+        "blockers": []
+      },
+      "observed": {
+        "reachableRefVerified": true,
+        "observedHeadSha": "2222222222222222222222222222222222222222",
+        "baseIsAncestor": true,
+        "lockedPathsClean": true,
+        "violatedPaths": [],
+        "reconciledPrState": "open_verified",
+        "reconciledPrUrl": "https://example.invalid/org/repo/pull/42"
+      },
+      "directive": {
+        "action": "COMPLETE",
+        "reason": "Open pull request verified at exact authorized commit SHA 2222222222222222222222222222222222222222."
+      }
+    }
+  ]
+}

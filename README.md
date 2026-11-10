@@ -4,6 +4,21 @@
 
 [Guided browser quickstart](docs/quickstart.md) · [Architecture and protocol (RFC v0.2)](docs/RFC-v0.2.md) · [Local orchestrator skill](skills/autonomous-handoff/SKILL.md)
 
+## Install from ClawHub (OpenClaw)
+
+Install the MCP bridge plugin, standalone skill, or the **Handoff Coordinator** agent template directly from ClawHub:
+
+```sh
+# Install the OpenClaw plugin (registers the clawhandoff stdio MCP server + skill)
+openclaw plugins install @mertbasar0/clawhandoff
+
+# Create a dedicated Handoff Coordinator agent from the Focus Week Template
+openclaw templates add @mertbasar0/handoff-coordinator
+
+# Or install the standalone orchestrator skill
+clawhub install autonomous-handoff
+```
+
 ## Build from source
 
 Install Node.js 22.13 or newer, pnpm and Git 2.38 or newer. Clone the repository and build the server.

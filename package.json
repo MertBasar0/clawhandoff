@@ -14,6 +14,15 @@
   ],
   "type": "module",
   "license": "MIT",
+  "author": "Mert Basar",
+  "homepage": "https://github.com/MertBasar0/clawhandoff",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MertBasar0/clawhandoff.git"
+  },
+  "bugs": {
+    "url": "https://github.com/MertBasar0/clawhandoff/issues"
+  },
   "engines": {
     "node": ">=22.13.0"
   },
@@ -24,15 +33,34 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./openclaw-plugin": {
+      "types": "./dist/openclaw-plugin.d.ts",
+      "default": "./dist/openclaw-plugin.js"
     }
   },
   "files": [
+    "assets",
     "dist",
     "docs",
     "skills",
+    "openclaw.plugin.json",
     "README.md",
     "LICENSE"
   ],
+  "openclaw": {
+    "extensions": [
+      "./dist/openclaw-plugin.js"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.3.24-beta.2",
+      "minGatewayVersion": "2026.3.24-beta.2"
+    },
+    "build": {
+      "openclawVersion": "2026.11.2",
+      "pluginSdkVersion": "2026.11.2"
+    }
+  },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",

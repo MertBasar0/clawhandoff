@@ -1,0 +1,25 @@
+{
+  "id": "clawhandoff",
+  "name": "ClawHandoff",
+  "version": "0.2.0",
+  "description": "Universal local-first MCP bridge for verified multi-agent handoffs across OpenClaw (Gateway & Browser), Agent2Agent (A2A), Codex app-server, and Agent Client Protocol (ACP) with SQLite crash recovery and checkout-free Git/PR gating.",
+  "categories": [
+    "agent-runtimes"
+  ],
+  "skills": [
+    "./skills"
+  ],
+  "mcpServers": {
+    "clawhandoff": {
+      "transport": "stdio",
+      "command": "node",
+      "args": [
+        "./dist/cli.js"
+      ]
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "@mertbasar0/handoff-coordinator",
+  "version": "0.2.0",
+  "license": "MIT",
+  "type": "module",
+  "openclaw": {
+    "template": "CLAW.md"
+  }
+}
