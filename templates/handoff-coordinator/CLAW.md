@@ -16,19 +16,17 @@ workspace:
   bootstrapFiles:
     AGENTS.md:
       source: workspace/AGENTS.md
+    IDENTITY.md:
+      source: workspace/IDENTITY.md
+    TOOLS.md:
+      source: workspace/TOOLS.md
   files:
-    - source: workspace/IDENTITY.md
-      path: IDENTITY.md
-    - source: workspace/TOOLS.md
-      path: TOOLS.md
     - source: workspace/USER.md
       path: USER.md
     - source: workspace/MEMORY.md
       path: MEMORY.md
     - source: workspace/state/config.json
       path: state/config.json
-    - source: workspace/skills/autonomous-handoff/SKILL.md
-      path: skills/autonomous-handoff/SKILL.md
     - source: workspace/references/handoff-contract.md
       path: references/handoff-contract.md
     - source: workspace/templates/handoff-ledger.md
@@ -39,6 +37,11 @@ workspace:
       path: assets/avatar.png
     - source: workspace/avatars/blobster.svg
       path: avatars/blobster.svg
+skills:
+  - path: workspace/skills/autonomous-handoff
+plugins:
+  - ref: "@mertbasar0/clawhandoff"
+    version: "0.2.0"
 ---
 
 # Handoff Coordinator

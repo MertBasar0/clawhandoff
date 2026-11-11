@@ -13,7 +13,7 @@ Install the MCP bridge plugin, standalone skill, or the **Handoff Coordinator** 
 openclaw plugins install @mertbasar0/clawhandoff
 
 # Create a dedicated Handoff Coordinator agent from the Focus Week Template
-openclaw templates add @mertbasar0/handoff-coordinator
+openclaw agents add --template @mertbasar0/handoff-coordinator
 
 # Or install the standalone orchestrator skill
 clawhub install autonomous-handoff
