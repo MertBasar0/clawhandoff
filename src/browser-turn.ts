@@ -99,8 +99,14 @@ export const browserTranscriptScript = String.raw`(expectedUrl, turnKey, uuidRou
     stopLabel: stopBtn ? (stopBtn.getAttribute('aria-label') || stopBtn.textContent || '').trim() : '',
   };
   if (!turnKey) return page; // Preflight and send control discovery only need readiness.
-  const bubbles = Array.from(thread.querySelectorAll('.chat-bubble[data-message-id]')).slice(-64);
-  for (const bubble of bubbles) {
+  // A run failure notice ("Unable to finish this reply") sits between bubbles in thread order.
+  const rows = Array.from(thread.querySelectorAll('.chat-bubble[data-message-id], [data-run-failure]')).slice(-64);
+  for (const bubble of rows) {
+    if (bubble.getAttribute('data-run-failure') !== null) {
+      page.messages.push({ role: 'failure', text: '',
+        ...(bubble.querySelector('button.chat-run-failure__retry') ? { retryable: true } : {}) });
+      continue;
+    }
     if (bubble.parentElement.closest('.chat-bubble[data-message-id]')) continue;
     const group = bubble.closest('.chat-group');
     if (!group) continue;
@@ -118,12 +124,18 @@ export const browserTranscriptScript = String.raw`(expectedUrl, turnKey, uuidRou
     // Keep other turns' boundaries without copying their contents out of the browser.
     const ownRequest = user && !group.classList.contains('chat-group--peer') &&
       firstLine === "Bridge-Turn: " + turnKey;
+    // The bridge's own nudge resumes this turn. Only its marker leaves the browser.
+    const nudge = user && !ownRequest && !group.classList.contains('chat-group--peer') &&
+      firstLine === "Bridge-Nudge: " + turnKey;
     const sendStatus = ownRequest ? group.querySelector('[data-send-state]') : null;
     const sendState = sendStatus ? (sendStatus.getAttribute('data-send-state') || 'unconfirmed') : '';
     const reply = !user && settledFooter && !loading && !loadError && raw.length <= 256000
       ? replySection(raw, "Bridge-Reply: " + turnKey) : undefined;
     page.messages.push({
       role: user ? 'user' : 'assistant', text: ownRequest ? firstLine : reply ?? '',
+      // Progress is fingerprinted by message identity and length, never by content.
+      id: bubble.getAttribute('data-message-id') || '', size: raw.length,
+      ...(nudge ? { nudge: true } : {}),
       ...(reply === null ? { ambiguousReply: true } : {}),
       ...(sendState ? { sendState, ...(sendState !== 'waiting-reconnect' ? { unconfirmed: true } : {}) } : {}),
       ...(!user && !settledFooter ? { settling: true } : {}),
@@ -146,16 +158,44 @@ export function wrapBrowserPrompt(idempotencyKey: string, prompt: string): strin
   ].join("\n");
 }
 
+/**
+ * A short follow-up that resumes a failed or stalled turn. It carries its own marker so the
+ * turn's original request stays unique and the turn still ends with the same reply marker.
+ */
+export function wrapBrowserNudge(idempotencyKey: string): string {
+  return [
+    `Bridge-Nudge: ${idempotencyKey}`,
+    "",
+    "Your reply to this handoff stopped before it finished: the chat showed it could not be completed, or it went quiet without a final answer.",
+    "Continue from where you stopped. Check which actions already completed before retrying anything, and never repeat a push or a publish that already happened.",
+    "Start your final answer with the following plain-text line by itself.",
+    `Bridge-Reply: ${idempotencyKey}`,
+    "Then give your assessment and finish with the required handoff-result JSON block. Start both fence lines in column one.",
+  ].join("\n");
+}
+
 export interface BrowserTurnObservation {
-  state: "absent" | "pending" | "running" | "completed" | "uncertain";
+  state: "absent" | "pending" | "running" | "completed" | "uncertain" | "failed";
   text?: string;
   /** True when uncertainty comes solely from a brief unlabelled idle gap between tool calls. */
   transientIdle?: boolean;
+  /** Changes whenever the visible turn changes. Unchanged over time means no progress. */
+  progress?: string;
+  /** The chat is idle and nothing answered the request (or the latest resume) yet. */
+  idleWithoutAnswer?: boolean;
+  /** Bridge nudges already visible in this turn. */
+  nudges?: number;
+  /** The failure notice offers the Control UI's own "Try again" action. */
+  retryable?: boolean;
 }
 
 interface TranscriptMessage {
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "failure";
   text: string;
+  id?: string;
+  size?: number;
+  nudge?: boolean;
+  retryable?: boolean;
   unconfirmed?: boolean;
   ambiguousReply?: boolean;
   sendState?: string;
@@ -192,12 +232,26 @@ export function inspectBrowserTurn(
     later = page.messages;
   }
 
-  const nextUser = later.findIndex(message => message.role === "user");
-  const answers = nextUser < 0 ? later : later.slice(0, nextUser);
+  // A user message ends the turn, except the bridge's own nudge and the continuation the
+  // Control UI sends when the operator presses "Try again" on a failure notice.
+  let nudges = 0;
+  let nextUser = -1;
+  for (let i = 0; i < later.length; i += 1) {
+    const message = later[i]!;
+    if (message.role !== "user") continue;
+    if (message.nudge || later[i - 1]?.role === "failure") {
+      if (message.nudge) nudges += 1;
+      continue;
+    }
+    nextUser = i;
+    break;
+  }
+  const segment = nextUser < 0 ? later : later.slice(0, nextUser);
+  const progress = fingerprint(segment, page.busy);
+  const answers = segment.filter(message => message.role === "assistant");
   let matched: string | undefined;
   let hasLoadError = false;
   for (const message of answers) {
-    if (message.role !== "assistant") continue;
     if (message.loadError) hasLoadError = true;
     if (message.settling || message.loading) continue;
     const section = browserReplySection(message.text, reply);
@@ -207,7 +261,7 @@ export function inspectBrowserTurn(
     matched = section;
   }
   if (nextUser < 0 && (page.busy || answers.some(message => message.settling || message.loading))) {
-    return { state: "running" };
+    return { state: "running", progress, nudges };
   }
   if (hasLoadError) return { state: "uncertain" };
   if (matched !== undefined) {
@@ -215,6 +269,24 @@ export function inspectBrowserTurn(
     return { state: "completed", text: matched };
   }
   if (nextUser >= 0) return { state: "uncertain" };
-  if (requests.length === 0) return { state: "uncertain", transientIdle: true };
-  return answers.length > 0 ? { state: "uncertain", transientIdle: true } : { state: "running" };
+  const last = segment[segment.length - 1];
+  if (last?.role === "failure") {
+    return { state: "failed", progress, nudges, ...(last.retryable ? { retryable: true } : {}) };
+  }
+  if (requests.length === 0) return { state: "uncertain", transientIdle: true, progress, nudges };
+  const resumedAt = segment.map(message => message.role).lastIndexOf("user");
+  return segment.slice(resumedAt + 1).some(message => message.role === "assistant")
+    ? { state: "uncertain", transientIdle: true, progress, nudges }
+    : { state: "running", idleWithoutAnswer: true, progress, nudges };
+}
+
+function fingerprint(segment: TranscriptMessage[], busy: boolean): string {
+  let hash = 0x811c9dc5;
+  const text = JSON.stringify([busy, segment.map(m =>
+    [m.role, m.id ?? "", m.size ?? m.text.length, m.settling ? 1 : 0, m.loading ? 1 : 0])]);
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return `${segment.length}:${hash.toString(16)}`;
 }

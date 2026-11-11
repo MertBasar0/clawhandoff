@@ -5,7 +5,7 @@ import { A2AClient, type A2ATurnObservation } from "./a2a-client.js";
 import { AcpSessionClient, resolveAcpLaunchCommand } from "./acp-client.js";
 import { githubCloneUrl, parseCandidateRef } from "./candidate-ref.js";
 import { ChromeChat } from "./chrome-chat.js";
-import { inspectBrowserTurn, wrapBrowserPrompt } from "./browser-turn.js";
+import { inspectBrowserTurn, wrapBrowserNudge, wrapBrowserPrompt } from "./browser-turn.js";
 import { CodexAppServerClient } from "./codex-client.js";
 import { normalizeA2ABaseUrl, parseBrowserSessionRoute, sameBrowserSessionUrl } from "./config.js";
 import { evaluateOrchestratorDirective } from "./directive.js";
@@ -43,6 +43,10 @@ export class BridgeService {
   private readonly gitVerifier: GitVerifier;
   private readonly githubReconciler: GitHubReconciler;
   private readonly browserChats = new Map<string, ChromeChat>();
+  /** Last visible change per browser turn, for stall detection. */
+  private readonly browserProgress = new Map<string, { progress: string; since: number }>();
+  /** Nudges this process sent per browser turn, in case the chat does not show them as expected. */
+  private readonly browserNudgesSent = new Map<string, number>();
   private readonly a2aClients = new Map<string, A2AClient>();
   private readonly codexClients = new Map<string, CodexAppServerClient>();
   private readonly acpClients = new Map<string, AcpSessionClient>();
@@ -640,6 +644,16 @@ export class BridgeService {
     }
   }
 
+  /** How long this turn's visible state has stayed the same, across attaches in this process. */
+  private quietBrowserTurnMs(turnId: string, progress: string | undefined): number {
+    if (progress === undefined) return 0;
+    const now = Date.now();
+    const seen = this.browserProgress.get(turnId);
+    if (seen?.progress === progress) return now - seen.since;
+    this.browserProgress.set(turnId, { progress, since: now });
+    return 0;
+  }
+
   private async attachBrowserTurn(
     session: SessionRecord,
     turn: TurnRecord,
@@ -654,6 +668,11 @@ export class BridgeService {
     let accepted = turn.dispatchState === "dispatched" || Boolean(turn.runId);
     let needsDispatchRecord = turn.dispatchState !== "dispatched";
     let reply: string | undefined;
+    const recovery = {
+      idleStallMs: target.recovery?.idleStallMs ?? 180_000,
+      busyStallMs: target.recovery?.busyStallMs ?? 1_200_000,
+      maxNudges: target.recovery?.maxNudges ?? 2,
+    };
     const uncertain = (errorText: string) =>
       this.store.markTurnUncertain({ handoffId, turnId, errorText, now: new Date().toISOString() });
 
@@ -668,7 +687,7 @@ export class BridgeService {
       let transientIdlePolls = 0;
       for (;;) {
         const receipt = inspectBrowserTurn(await chat.read(idempotencyKey), idempotencyKey, accepted);
-        if (needsDispatchRecord && (receipt.state === "running" || receipt.state === "completed")) {
+        if (needsDispatchRecord && (receipt.state === "running" || receipt.state === "completed" || receipt.state === "failed")) {
           this.store.recordDispatched({
             handoffId, turnId, remoteSessionKey: `browser:${target.sessionUrl}`,
             remoteSessionUrl: target.sessionUrl, runId: `browser:${idempotencyKey}`, now: new Date().toISOString(),
@@ -677,7 +696,37 @@ export class BridgeService {
           needsDispatchRecord = false;
         }
         if (receipt.state === "completed") {
+          this.browserProgress.delete(turnId);
+          this.browserNudgesSent.delete(turnId);
           reply = receipt.text;
+          break;
+        }
+        const quietMs = this.quietBrowserTurnMs(turnId, receipt.progress);
+        const idleStalled = receipt.state === "running" && receipt.idleWithoutAnswer && quietMs >= recovery.idleStallMs;
+        if (accepted && (receipt.state === "failed" || idleStalled)) {
+          const nudges = Math.max(receipt.nudges ?? 0, this.browserNudgesSent.get(turnId) ?? 0);
+          if (nudges >= recovery.maxNudges) {
+            uncertain(receipt.state === "failed"
+              ? `Robo's reply could not be completed${nudges ? ` after ${nudges} bridge nudge(s)` : ""}. Open the chat, check what already happened, press Try again if it fits, then attach again without resending.`
+              : `Robo has been idle without answering for ${Math.round(quietMs / 60_000)} min${nudges ? ` after ${nudges} bridge nudge(s)` : ""}. Open the chat, then attach again without resending.`);
+            break;
+          }
+          try {
+            // The nudge is visible in the chat, so the count survives restarts and is never repeated blindly.
+            await chat.send(wrapBrowserNudge(idempotencyKey), () => {
+              this.browserNudgesSent.set(turnId, nudges + 1);
+              return true;
+            });
+            this.browserProgress.delete(turnId);
+          } catch (error) {
+            // Robo resumed on its own between the read and the send. Keep watching.
+            if (!(error instanceof BridgeError) || error.code !== "BUSY_ACTIVE_TURN") throw error;
+          }
+          transientIdlePolls = 0;
+          continue;
+        }
+        if (receipt.state === "running" && !receipt.idleWithoutAnswer && quietMs >= recovery.busyStallMs) {
+          uncertain(`Robo has shown as working for ${Math.round(quietMs / 60_000)} min with no visible progress. A sub-session may be stuck: open the chat and its sub-sessions, press Try again on any reply that could not be completed, then attach again without resending.`);
           break;
         }
         if (receipt.state === "running" || receipt.state === "pending" || receipt.state === "absent") {
@@ -1246,13 +1295,23 @@ export class BridgeService {
           throw new BridgeError("CONTRACT_VIOLATION", "A reachable candidate ref is required before publication.");
         }
         const observed = await this.observeCandidate(session, candidateRef, latestTurn.reported?.prUrl);
+        const update = session.envelope.gitContext.updatePullRequest;
         if (observed.reconciledPrState === "open_verified") {
           throw new BridgeError(
             "PUBLISH_GATE_BLOCKED",
-            `Pull request is already verified open (${observed.reconciledPrUrl ?? "recorded"}). Refusing duplicate publish.`,
+            update
+              ? `Pull request ${update.url} already has the verified tree. Refusing duplicate publish.`
+              : `Pull request is already verified open (${observed.reconciledPrUrl ?? "recorded"}). Refusing duplicate publish.`,
           );
         }
-        if (observed.reconciledPrState === "uncertain_in_flight" || before.attempted) {
+        if (update && observed.reconciledPrState === "uncertain_in_flight") {
+          throw new BridgeError(
+            "RECONCILIATION_UNCERTAIN",
+            `Cannot confirm that ${update.url} is still at ${update.expectedHeadSha}: ${observed.verificationNotes?.at(-1) ?? "unknown state"} Inspect it before authorizing again.`,
+          );
+        }
+        // For an update, a head still at its expected commit proves an earlier attempt never landed.
+        if (observed.reconciledPrState === "uncertain_in_flight" || (before.attempted && !update)) {
           throw new BridgeError(
             "RECONCILIATION_UNCERTAIN",
             "A previous remote publish attempt is still uncertain_in_flight. Reconcile PR state first before issuing another publish authorization.",
@@ -1277,6 +1336,7 @@ export class BridgeService {
           verifiedTreeSha: observed.observedTreeSha,
           candidateRef,
           operatorNote: params.message,
+          ...(update ? { updatePullRequest: update } : {}),
         });
         authorizedHead = { ref: candidateRef, sha: session.verifiedPublishHeadSha };
       } else {
@@ -1371,6 +1431,25 @@ export class BridgeService {
         : { ...git, verificationNotes: [`Refusing candidateRef "${candidateRef}": expected a plain Git ref or owner/repo:<ref>.`] };
     }
     if (session.publisherOwner === "none" && !reportedPrUrl && !ledger.attempted && !ledger.prUrl) return git;
+
+    const update = session.envelope.gitContext.updatePullRequest;
+    if (update && session.expectedTreeSha) {
+      // The pull request exists by contract. Only its head says whether this handoff's update landed.
+      const pr = await this.githubReconciler.reconcilePullRequestUpdate({
+        repoId: session.repoId,
+        url: update.url,
+        expectedHeadSha: update.expectedHeadSha,
+        publishedTreeSha: session.expectedTreeSha,
+      });
+      const foreign = reportedPrUrl && reportedPrUrl !== update.url
+        ? `The target reported another pull request (${reportedPrUrl}) than the one this handoff updates.` : undefined;
+      return {
+        ...git,
+        reconciledPrState: foreign ? "uncertain_in_flight" : pr.prState,
+        reconciledPrUrl: pr.prUrl,
+        verificationNotes: [...(git.verificationNotes ?? []), pr.note, ...(foreign ? [foreign] : [])],
+      };
+    }
 
     const pr = await this.githubReconciler.reconcilePullRequest({
       repoId: session.repoId,

@@ -251,3 +251,69 @@ test("browser MCP survives OpenClaw auto-title slug replacement on 32-hex UUID s
     fixture.cleanup();
   }
 });
+
+test("browser MCP nudges a reply the chat could not complete, and the operator's Try again keeps the turn", async () => {
+  const fixture = createTempGitFixture();
+  const sessionUrl = "https://team.example/chat/roboclaw/dashboard/33257e49-0012-426e-80ab-6ba8f8eb881f";
+  const commit = fixture.commitFile("status.txt", "ready\n", "candidate");
+  const configPath = join(fixture.rootDir, "bridge.json");
+  const statePath = join(fixture.rootDir, "browser-state.json");
+  writeFileSync(statePath, JSON.stringify({ sessionUrl, messages: [], draft: "", ackFirstClick: true, failNextTurn: true }));
+  const target = (targetId: string, maxNudges: number) => ({
+    targetId, transport: "browser", agentId: "roboclaw", sessionUrl, recovery: { maxNudges },
+    browserMcp: { command: process.execPath, args: [resolve("test/helpers/browser-devtools.mjs"), statePath] },
+  });
+  writeFileSync(configPath, JSON.stringify({
+    dataDir: fixture.rootDir,
+    targets: { robo: target("robo", 2), manual: target("manual", 0) },
+  }));
+  const client = new Client({ name: "browser-recovery", version: "1" });
+  await client.connect(new StdioClientTransport({ command: process.execPath, args: [resolve("dist/cli.js"), "--config", configPath] }));
+  const invoke = async (name: string, args: Record<string, unknown>) => {
+    const result = await client.callTool({ name, arguments: { ...args, waitBudgetMs: 0 } });
+    const content = (result.content as Array<{ type: string; text?: string }>).find(p => p.type === "text")?.text;
+    assert.ok(content);
+    assert.ok(!result.isError, content);
+    return JSON.parse(content) as HandoffResultEnvelopeV2;
+  };
+  const start = (targetId: string, requestId: string) => invoke("bridge_handoff_start", { targetId, envelope: {
+    schemaVersion: "0.2", requestId, workspaceId: "test",
+    title: "Verify the Linux run", outcome: "Check the pinned commit against the local smoke result.",
+    mode: "verify_only", publisherOwner: "none",
+    gitContext: { repoId: "example/status", localRepoPath: fixture.workRepoDir,
+      pinnedBaseCommitSha: commit, pinnedSourceCommitSha: commit },
+    requestedCapabilities: { allowCodeEdit: false, allowBranchPush: false, allowManagedPublishStage: false },
+    acceptanceCriteria: ["Passing local runtime evidence"],
+  } });
+  const readState = () => JSON.parse(readFileSync(statePath, "utf8")) as {
+    messages: Array<{ role: string; text: string }>; nudgeClicks?: number; clicks?: number;
+  };
+  try {
+    const nudged = await start("robo", "browser-nudged");
+    assert.equal(nudged.lifecycleStatus, "settled");
+    assert.match(nudged.reported?.summaryDelta ?? "", /resumed after a failed reply/i);
+    assert.equal(readState().nudgeClicks, 1);
+    assert.equal(readState().clicks, 1);
+
+    // Without nudges the bridge stops and names the failure instead of waiting forever.
+    writeFileSync(statePath, JSON.stringify({ ...readState(), failNextTurn: true }));
+    const stopped = await start("manual", "browser-manual");
+    assert.equal(stopped.lifecycleStatus, "uncertain");
+    assert.match(JSON.stringify(stopped), /could not be completed/);
+    assert.equal(readState().nudgeClicks, 1);
+
+    // The operator presses "Try again": the Control UI sends its own continuation and Robo finishes.
+    const state = readState();
+    const key = /Bridge-Turn: (idem_[\w-]+)/.exec(state.messages.at(-2)?.text ?? "")?.[1];
+    assert.ok(key);
+    state.messages.push({ role: "user", text: "Continue from where you stopped." }, { role: "assistant",
+      text: `Bridge-Reply: ${key}\n\n\`\`\`handoff-result\n${JSON.stringify({ disposition: "needs_evidence", summaryDelta: "Finished after Try again.", blockers: ["Missing receipt"] })}\n\`\`\`` });
+    writeFileSync(statePath, JSON.stringify(state));
+    const recovered = await invoke("bridge_handoff_attach", { handoffId: stopped.handoffId });
+    assert.equal(recovered.lifecycleStatus, "settled");
+    assert.match(recovered.reported?.summaryDelta ?? "", /after try again/i);
+  } finally {
+    await client.close();
+    fixture.cleanup();
+  }
+});

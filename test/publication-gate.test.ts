@@ -348,3 +348,89 @@ test("Omitting publisherOwner defaults to remote_gated (unless config overrides 
   });
   assert.equal(localTurn.orchestratorDirective.action, "PUBLISH_LOCALLY");
 });
+
+async function prepareUpdate(t: TestContext, opts: { foreignHead?: boolean } = {}) {
+  const fixture = createTempGitFixture();
+  const prHead = fixture.commitFile("README.md", "published before", "current pull request head");
+  const candidate = fixture.commitFile("README.md", "refreshed tree", "refresh candidate");
+  const tree = fixture.revParse("HEAD^{tree}");
+  const ref = "refs/heads/main";
+  fixture.git(["push", "origin", ref]);
+  const statePath = join(fixture.rootDir, "gateway.json");
+  const originalEnv = process.env.FAKE_GATEWAY_STATE_FILE;
+  process.env.FAKE_GATEWAY_STATE_FILE = statePath;
+  const prUrl = "https://github.com/example/repo/pull/9";
+  // The target's managed publication always makes its own commit with the verified tree.
+  const publishCommit = "c".repeat(40);
+  const reply = (disposition: string) => "```handoff-result\n" + JSON.stringify({
+    disposition, candidateRef: ref, candidateCommitSha: candidate, prUrl,
+    summaryDelta: disposition, blockers: [], claimedChecks: [],
+  }) + "\n```";
+  writeFileSync(statePath, JSON.stringify({
+    openPrs: [{ number: 9, url: prUrl, headRefName: "feature", headRefOid: opts.foreignHead ? "d".repeat(40) : prHead }],
+    commitTrees: { [publishCommit]: tree, ["d".repeat(40)]: "e".repeat(40) },
+    queuedTurnReplies: [
+      { replyText: reply("ready_for_publish_gate") },
+      { replyText: reply("completed"), updatedPr: { number: 9, headRefOid: publishCommit } },
+    ],
+  }));
+  const service = new BridgeService({
+    dataDir: fixture.rootDir,
+    ghCliPath: resolve("test/helpers/fake-gh-cli.mjs"),
+    targets: { robo: { targetId: "robo", url: "https://gateway.example", authMode: "direct-token",
+      agentId: "main", cliPath: resolve("test/helpers/fake-openclaw-cli.mjs") } },
+  });
+  t.after(() => {
+    service.close();
+    if (originalEnv === undefined) delete process.env.FAKE_GATEWAY_STATE_FILE;
+    else process.env.FAKE_GATEWAY_STATE_FILE = originalEnv;
+    fixture.cleanup();
+  });
+  const envelope = (gitContext: Record<string, unknown> = {}) => ({
+    schemaVersion: "0.2" as const, requestId: "update-pr", workspaceId: "workspace", title: "Refresh the pull request",
+    outcome: "Update the existing pull request to the verified tree.", mode: "publish_unchanged" as const,
+    publisherOwner: "remote_gated" as const,
+    gitContext: { repoId: "example/repo", remoteUrlOrPath: fixture.originBareDir, pinnedBaseCommitSha: prHead,
+      pinnedSourceCommitSha: candidate, expectedTreeSha: tree, sourceRemoteRef: ref,
+      updatePullRequest: { url: prUrl, expectedHeadSha: prHead }, ...gitContext },
+    requestedCapabilities: { allowCodeEdit: false, allowBranchPush: false, allowManagedPublishStage: false },
+    acceptanceCriteria: ["The pull request ends with exactly the verified tree"],
+  });
+  return { service, envelope, prUrl, publishCommit, statePath };
+}
+
+test("Updating an existing pull request is authorized while its head is unchanged and settles by tree", async (t) => {
+  const { service, envelope, prUrl, publishCommit } = await prepareUpdate(t);
+  // The pull request is open and the target names it, yet nothing of this handoff landed yet.
+  const ready = await service.startHandoff({ targetId: "robo", envelope: envelope() });
+  assert.equal(ready.observed.reconciledPrState, "none", JSON.stringify(ready.observed.verificationNotes));
+  assert.equal(ready.orchestratorDirective.action, "AUTHORIZE_REMOTE_PUBLISH");
+
+  const published = await service.continueHandoff({ handoffId: ready.handoffId, intent: "authorize_publish", message: "Update it." });
+  assert.equal(published.observed.reconciledPrState, "open_verified", JSON.stringify(published.observed.verificationNotes));
+  assert.equal(published.observed.reconciledPrUrl, prUrl);
+  assert.equal(published.orchestratorDirective.action, "COMPLETE");
+  assert.match((published.observed.verificationNotes ?? []).join("\n"), /verified tree/);
+  assert.notEqual(publishCommit, published.observed.observedHeadSha);
+});
+
+test("Updating a pull request whose head moved to another tree stops before authorization", async (t) => {
+  const { service, envelope } = await prepareUpdate(t, { foreignHead: true });
+  const ready = await service.startHandoff({ targetId: "robo", envelope: envelope() });
+  assert.equal(ready.observed.reconciledPrState, "uncertain_in_flight");
+  await assert.rejects(
+    service.continueHandoff({ handoffId: ready.handoffId, intent: "authorize_publish", message: "Update it." }),
+    (error: unknown) => error instanceof BridgeError && /RECONCILIATION_UNCERTAIN|CONTRACT_VIOLATION/.test(error.code),
+  );
+});
+
+test("An update contract needs the target tree and a pull request in the handoff repository", async (t) => {
+  const { service, envelope } = await prepareUpdate(t);
+  for (const gitContext of [
+    { expectedTreeSha: undefined },
+    { updatePullRequest: { url: "https://github.com/other/repo/pull/9", expectedHeadSha: "a".repeat(40) } },
+  ]) {
+    await assert.rejects(service.startHandoff({ targetId: "robo", envelope: envelope(gitContext) }),
+      (error: unknown) => error instanceof BridgeError && error.code === "INVALID_CONTRACT_CONFLICT");
+  }
+});

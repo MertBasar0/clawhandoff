@@ -119,6 +119,11 @@ const BrowserTargetSchema = z.object({
     command: z.string().min(1),
     args: z.array(z.string()).default([]),
   }).strict(),
+  recovery: z.object({
+    idleStallMs: z.number().int().min(10_000).optional(),
+    busyStallMs: z.number().int().min(60_000).optional(),
+    maxNudges: z.number().int().min(0).max(5).optional(),
+  }).strict().optional(),
 }).strict().refine((target) => parseBrowserSessionRoute(target.sessionUrl, target.basePath, target.agentId) !== null, { path: ["sessionUrl"], message: "Use the exact HTTPS /chat/<agentId>/<session...> (or /dashboard/<agentId>/<session...>) URL without credentials, query, or fragment. If the route is ambiguous, set basePath to the UI mount (/ for the root)." });
 
 const A2ATargetSchema = z

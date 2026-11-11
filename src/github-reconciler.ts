@@ -176,6 +176,50 @@ export class GitHubReconciler {
     }
   }
 
+  /**
+   * Reconciles an update to one existing pull request. A target's managed publication makes its own
+   * commit, so the update is recognized by its tree, never by an exact commit SHA:
+   * - head still at expectedHeadSha: the update has not landed ("none"),
+   * - head moved to a commit whose tree is publishedTreeSha: it landed ("open_verified"),
+   * - anything else (closed, other tree, lookup failure): "uncertain_in_flight".
+   */
+  async reconcilePullRequestUpdate(params: {
+    repoId: string;
+    url: string;
+    expectedHeadSha: string;
+    publishedTreeSha: string;
+  }): Promise<{ prState: ReconciledPrState; prUrl: string; headSha?: string; note: string }> {
+    const number = /\/pull\/(\d+)$/.exec(params.url)?.[1];
+    const uncertain = (note: string, headSha?: string) =>
+      ({ prState: "uncertain_in_flight" as const, prUrl: params.url, ...(headSha ? { headSha } : {}), note });
+    if (!number) return uncertain("The pull request URL has no number.");
+    let head: string | undefined;
+    try {
+      const rec = JSON.parse(await this.invokeGh([
+        "pr", "view", number, "--repo", params.repoId, "--json", "url,headRefOid,state",
+      ])) as Record<string, unknown>;
+      head = typeof rec?.headRefOid === "string" ? rec.headRefOid.toLowerCase() : undefined;
+      if (rec?.url !== params.url || !head) return uncertain("GitHub did not confirm this pull request.");
+      if (rec.state !== "OPEN") return uncertain(`The pull request is ${String(rec.state).toLowerCase()}.`, head);
+    } catch {
+      return uncertain("The pull request lookup failed.");
+    }
+    if (head === params.expectedHeadSha.toLowerCase()) {
+      return { prState: "none", prUrl: params.url, headSha: head, note: "The pull request is still at its expected pre-publish head." };
+    }
+    try {
+      const commit = JSON.parse(await this.invokeGh(["api", `repos/${params.repoId}/git/commits/${head}`])) as
+        { tree?: { sha?: unknown } };
+      const tree = typeof commit?.tree?.sha === "string" ? commit.tree.sha.toLowerCase() : undefined;
+      if (tree === params.publishedTreeSha.toLowerCase()) {
+        return { prState: "open_verified", prUrl: params.url, headSha: head, note: "The pull request head now has the verified tree." };
+      }
+      return uncertain(`The pull request head moved to ${head}, whose tree is not the verified tree. Someone else may have updated it.`, head);
+    } catch {
+      return uncertain(`The pull request head moved to ${head}, and its tree could not be read.`, head);
+    }
+  }
+
   private async invokeGh(args: string[]): Promise<string> {
     const isJsScript = /\.(?:mjs|cjs|js)$/i.test(this.ghCliPath);
     const cmd = isJsScript ? process.execPath : this.ghCliPath;

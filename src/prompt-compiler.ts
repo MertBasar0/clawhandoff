@@ -175,7 +175,20 @@ export function compileAuthorizePublishPrompt(params: {
   verifiedTreeSha: string;
   candidateRef: string;
   operatorNote: string;
+  updatePullRequest?: { url: string; expectedHeadSha: string };
 }): string {
+  const update = params.updatePullRequest;
+  const rule = update
+    ? [
+        `- You are now authorized to update the existing pull request ${update.url} **ONLY**, which is currently at head \`${update.expectedHeadSha}\`.`,
+        `- Its new head must have exactly tree \`${params.verifiedTreeSha}\` (the tree of \`${params.verifiedHeadSha}\`). A publication commit of your own is fine when its tree is identical. Do not open a new pull request and do not change any file.`,
+        "- If the pull request head is no longer the commit above, stop and report it in `blockers` instead of publishing.",
+        `- Return \`prUrl\` as ${update.url} once the update landed.`,
+      ]
+    : [
+        `- You are now authorized to publish a draft pull request **ONLY** for exact commit \`${params.verifiedHeadSha}\` without modifying any file or rebasing.`,
+        "- Include marker `Handoff-ID: " + params.handoffId + "` in internal tracking if supported, or return the created `prUrl` in the result block below.",
+      ];
   return [
     `## Stage-2 Managed Publish Authorization (Handoff-ID: \`${params.handoffId}\`, Turn ${params.turnNumber})`,
     "",
@@ -186,8 +199,7 @@ export function compileAuthorizePublishPrompt(params: {
     `- Authorized Branch Ref: \`${params.candidateRef}\``,
     "",
     "### Strict Publish Rule",
-    `- You are now authorized to publish a draft pull request **ONLY** for exact commit \`${params.verifiedHeadSha}\` without modifying any file or rebasing.`,
-    "- Include marker `Handoff-ID: " + params.handoffId + "` in internal tracking if supported, or return the created `prUrl` in the result block below.",
+    ...rule,
     "- If managed publication fails or returns an uncertain error, DO NOT retry blindly; report the exact error in `blockers`.",
     "",
     params.operatorNote,

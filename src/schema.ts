@@ -10,6 +10,8 @@ export const Sha40Schema = z
   .string()
   .regex(HEX_SHA_40, "Must be a resolved 40-character hexadecimal Git SHA (not a moving branch or tag ref).");
 
+const PULL_URL = /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/[1-9]\d*$/;
+
 export const PublisherOwnerSchema = z.enum(["none", "local", "remote_gated"]);
 const WaitBudgetMsSchema = z
   .number()
@@ -48,6 +50,10 @@ export const HandoffEnvelopeV2Schema = z.object({
     sourceRemoteRef: safeText(1, 256).optional(),
     expectedTreeSha: Sha40Schema.optional(),
     lockedPaths: z.array(safeText(1, 512)).max(200).optional(),
+    updatePullRequest: z.object({
+      url: z.string().regex(PULL_URL, "Use the pull request's https://github.com/<owner>/<repo>/pull/<number> URL."),
+      expectedHeadSha: Sha40Schema.describe("The pull request head before this handoff publishes. Publication is detected when the head moves to a commit with expectedTreeSha."),
+    }).strict().optional().describe("Update this existing pull request instead of opening a new one. Requires expectedTreeSha."),
   }),
   requestedCapabilities: z.object({
     allowCodeEdit: z.boolean(),
@@ -120,6 +126,17 @@ export function validateAndNormalizeEnvelope(
       "INVALID_CONTRACT_CONFLICT",
       "allowManagedPublishStage cannot be enabled on initial handoff creation. Managed remote publishing is unlocked only in Stage 2 via bridge_handoff_continue(intent='authorize_publish') after Git object verification succeeds.",
     );
+  }
+
+  const update = env.gitContext.updatePullRequest;
+  if (update) {
+    const repo = /^https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/pull\//.exec(update.url)?.[1];
+    if (repo?.toLowerCase() !== env.gitContext.repoId.toLowerCase()) {
+      throw new BridgeError("INVALID_CONTRACT_CONFLICT", `updatePullRequest.url must be a pull request in ${env.gitContext.repoId}.`);
+    }
+    if (!env.gitContext.expectedTreeSha || publisherOwner === "none") {
+      throw new BridgeError("INVALID_CONTRACT_CONFLICT", "updatePullRequest needs expectedTreeSha (the tree the pull request must end up with) and a publisher.");
+    }
   }
 
   if (env.mode === "publish_unchanged" && publisherOwner === "none") {

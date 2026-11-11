@@ -112,6 +112,7 @@ switch (method) {
       pollsRemaining: queuedReply.pollsBeforeComplete ?? 0,
       replyText: queuedReply.replyText,
       createdPr: queuedReply.createdPr,
+      updatedPr: queuedReply.updatedPr,
       failError: queuedReply.failError ?? null,
       completed: false,
       aborted: false,
@@ -207,6 +208,7 @@ switch (method) {
       pollsRemaining: queuedReply.pollsBeforeComplete ?? 0,
       replyText: queuedReply.replyText,
       createdPr: queuedReply.createdPr,
+      updatedPr: queuedReply.updatedPr,
       failError: queuedReply.failError ?? null,
       completed: false,
       aborted: false,
@@ -282,6 +284,7 @@ switch (method) {
     if (!run.completed) {
       run.completed = true;
       if (run.createdPr) (state.openPrs ??= []).push(run.createdPr);
+      if (run.updatedPr) state.openPrs = (state.openPrs ?? []).map((p) => p.number === run.updatedPr.number ? { ...p, ...run.updatedPr } : p);
       const s = state.sessions[run.sessionKey];
       if (s) {
         s.status = "idle";

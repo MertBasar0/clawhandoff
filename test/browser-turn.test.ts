@@ -9,7 +9,7 @@ const answer = { role: "assistant", text: "Bridge-Reply: " + key +
   '\n\n```handoff-result\n{"disposition":"needs_evidence","summaryDelta":"Missing test output"}\n```' };
 const otherUser = { role: "user", text: "" };
 const observe = (
-  messages: Array<{ role: string; text: string; unconfirmed?: boolean; sendState?: string; settling?: boolean; loading?: boolean }>,
+  messages: Array<{ role: string; text: string } & Record<string, unknown>>,
   busy = false,
   alreadyDispatched = false,
 ) => inspectBrowserTurn(JSON.stringify({ ready: true, busy, messages }), key, alreadyDispatched);
@@ -248,4 +248,106 @@ test("a result with no candidate ref or PR keeps the target's evidence blockers"
   assert.equal(parse({ candidateCommitSha: "", disposition: "completed" }).disposition, "completed");
   assert.equal(parse({ disposition: "completed", prUrl: "not a URL" }).disposition, "needs_evidence");
   assert.equal(parse({ disposition: "completed", candidateCommitSha: "x".repeat(40) }).disposition, "needs_evidence");
+});
+
+test("a failed reply, the Try again continuation and bridge nudges keep the turn's own reply", () => {
+  const failure = { role: "failure", text: "", retryable: true };
+  const resume = { role: "user", text: "" };
+  const nudge = { role: "user", text: "", nudge: true };
+  const progressText = { role: "assistant", text: "", id: "a1", size: 40 };
+  const failed = observe([request, progressText, failure]);
+  assert.equal(failed.state, "failed");
+  assert.equal(failed.retryable, true);
+  assert.equal(failed.nudges, 0);
+  // "Try again" sends a plain user message right after the failure notice.
+  assert.equal(observe([request, failure, resume, answer]).state, "completed");
+  assert.equal(observe([request, failure, resume], true).state, "running");
+  assert.equal(observe([request, failure, nudge, answer]).state, "completed");
+  const resumed = observe([request, failure, nudge, failure]);
+  assert.equal(resumed.state, "failed");
+  assert.equal(resumed.nudges, 1);
+  // Any other user message still ends the turn.
+  assert.equal(observe([request, progressText, resume, answer]).state, "uncertain");
+  assert.equal(observe([request, failure, resume, resume, answer]).state, "uncertain");
+  // An idle chat with nothing after the request (or the latest resume) is waiting, not finished.
+  const idle = observe([request]);
+  assert.equal(idle.state, "running");
+  assert.equal(idle.idleWithoutAnswer, true);
+  assert.equal(observe([request, failure, nudge]).idleWithoutAnswer, true);
+  assert.equal(observe([request, progressText]).state, "uncertain");
+  assert.equal(observe([request], true).idleWithoutAnswer, undefined);
+});
+
+test("browser turn progress changes only when the visible turn changes", () => {
+  const step = (size: number, id = "a1") => ({ role: "assistant", text: "", id, size, settling: true });
+  const p = (messages: Array<Record<string, unknown>>, busy = true) =>
+    inspectBrowserTurn(JSON.stringify({ ready: true, busy, messages }), key).progress;
+  assert.equal(p([request, step(10)]), p([request, step(10)]));
+  assert.notEqual(p([request, step(10)]), p([request, step(11)]));
+  assert.notEqual(p([request, step(10)]), p([request, step(10), step(1, "a2")]));
+  assert.notEqual(p([request, step(10)]), p([request, step(10)], false));
+  // Messages before the request are not part of this turn's progress.
+  assert.equal(p([{ role: "assistant", text: "", id: "old", size: 5 }, request, step(10)]), p([request, step(10)]));
+});
+
+test("browser transcript script reports run failures in thread order and marks only this turn's nudge", () => {
+  const targetUrl = "https://team.example/chat/roboclaw/dashboard/33257e49-0012-426e-80ab-6ba8f8eb881f";
+  const runScript = new Function(
+    "location",
+    "document",
+    `return (${browserTranscriptScript})(${JSON.stringify(targetUrl)}, ${JSON.stringify(key)})`,
+  ) as (loc: { href: string }, doc: unknown) => { ready: boolean; messages: Array<Record<string, unknown>> };
+  const composer = {
+    getAttribute: (n: string) => ({ "aria-label": "Chat composer", "aria-autocomplete": "list" } as Record<string, string>)[n] ?? null,
+    closest: (sel: string) => sel === ".agent-chat__input--chat" ? {} : null,
+  };
+  const userGroup = {
+    classList: { contains: (c: string) => c === "user" },
+    matches: () => false,
+    hasAttribute: () => false,
+    querySelector: () => null,
+  };
+  const userBubble = (text: string, id: string) => ({
+    parentElement: { closest: () => null },
+    classList: { contains: () => false },
+    closest: (sel: string) => (sel === ".chat-group" ? userGroup : null),
+    getAttribute: (n: string) => (n === "data-message-text" ? text : n === "data-message-id" ? id : null),
+    querySelector: () => null,
+  });
+  const failureRow = (retry: boolean) => ({
+    getAttribute: (n: string) => (n === "data-run-failure" ? "run-1" : null),
+    querySelector: (sel: string) => (sel === "button.chat-run-failure__retry" && retry ? {} : null),
+  });
+  const rows = [
+    userBubble(request.text + "\n\nDo the work.", "u1"),
+    failureRow(true),
+    userBubble("Bridge-Nudge: " + key + "\n\nContinue.", "u2"),
+    failureRow(false),
+    userBubble("Bridge-Nudge: idem_other\n\nContinue.", "u3"),
+  ];
+  const scope = {
+    getElementsByTagName: (tag: string) => tag === "textarea" ? [composer] : [],
+    querySelector: () => null,
+  };
+  const thread = {
+    classList: { contains: () => false },
+    closest: (sel: string) => (sel === "main" ? scope : null),
+    querySelectorAll: (sel: string) => {
+      assert.match(sel, /\[data-run-failure\]/);
+      return rows;
+    },
+  };
+  const projection = runScript({ href: targetUrl }, { querySelectorAll: () => [thread] });
+  assert.equal(projection.ready, true);
+  assert.deepEqual(projection.messages.map(m => [m.role, m.text, m.nudge ?? false, m.retryable ?? false]), [
+    ["user", request.text, false, false],
+    ["failure", "", false, true],
+    ["user", "", true, false],
+    ["failure", "", false, false],
+    ["user", "", false, false],
+  ]);
+  // The foreign nudge is an ordinary user message; right after a failure notice it counts as "Try again".
+  const observed = inspectBrowserTurn(JSON.stringify({ ...projection, busy: false }), key);
+  assert.equal(observed.state, "running");
+  assert.equal(observed.nudges, 1);
 });

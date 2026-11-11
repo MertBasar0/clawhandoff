@@ -42,5 +42,16 @@ if (args[0] === "pr" && args[1] === "list") {
   process.exit(0);
 }
 
+const commitPath = args[0] === "api" ? /^repos\/[^/]+\/[^/]+\/git\/commits\/([0-9a-f]{40})$/.exec(args[1] ?? "") : null;
+if (commitPath) {
+  const tree = (state.commitTrees ?? {})[commitPath[1]];
+  if (!tree) {
+    process.stderr.write("Not Found\n");
+    process.exit(1);
+  }
+  process.stdout.write(JSON.stringify({ sha: commitPath[1], tree: { sha: tree } }));
+  process.exit(0);
+}
+
 process.stderr.write(`Unsupported fake gh args: ${args.join(" ")}\n`);
 process.exit(1);

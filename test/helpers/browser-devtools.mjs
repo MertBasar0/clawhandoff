@@ -119,8 +119,26 @@ if (startup.exitOnStartup) {
       save({ ...state, draft: "", loseNextClickWithoutReceipt: false });
       return { isError: true, content: [{ type: "text", text: "browser disconnected before a receipt was observable" }] };
     }
+    const nudgeKey = /^Bridge-Nudge: (idem_[\w-]+)$/m.exec(state.draft)?.[1];
+    if (nudgeKey) {
+      // A nudge resumes the failed turn, which then finishes with its original reply marker.
+      const report = { disposition: "needs_evidence", summaryDelta: "Resumed after a failed reply.", blockers: ["Missing receipt"] };
+      state.messages.push({ role: "user", text: state.draft }, { role: "assistant",
+        text: `Bridge-Reply: ${nudgeKey}\n\n\`\`\`handoff-result\n${JSON.stringify(report)}\n\`\`\`` });
+      state.draft = "";
+      state.nudgeClicks = (state.nudgeClicks ?? 0) + 1;
+      return acted(state, "click");
+    }
     const key = /^Bridge-Turn: (idem_[\w-]+)$/m.exec(state.draft)?.[1];
     assert.ok(key, "bridge must correlate each submission");
+    if (state.failNextTurn) {
+      // The Control UI gave up on this reply and shows "Unable to finish this reply".
+      state.messages.push({ role: "user", text: state.draft }, { role: "failure", text: "", retryable: true });
+      state.draft = "";
+      state.failNextTurn = false;
+      state.clicks = (state.clicks ?? 0) + 1;
+      return acted(state, "click");
+    }
     const missing = !state.draft.includes("receipt:");
     const report = missing
       ? { disposition: "needs_evidence", summaryDelta: "Missing receipt for the local run.", blockers: ["Missing receipt"] }
@@ -173,9 +191,12 @@ if (startup.exitOnStartup) {
       sendLabel: draft ? (de ? "Nachricht senden" : "Send message") : (de ? "Zuerst eine Nachricht eingeben" : "Write a message first"),
       stopLabel: busy ? (de ? "Generierung stoppen" : "Stop generating") : "",
     };
-    const projection = { url, ready: true, busy, controls, messages: visibleMessages.map(({ role, text }) => ({
-      role, text: role === "user" ? text.split("\n", 1)[0] : text,
-    })) };
+    const projection = { url, ready: true, busy, controls, messages: visibleMessages.map(({ role, text, retryable }) => {
+      const firstLine = text.split("\n", 1)[0];
+      if (role === "failure") return { role, text: "", ...(retryable && { retryable }) };
+      if (role === "user" && firstLine.startsWith("Bridge-Nudge: ")) return { role, text: "", nudge: true };
+      return { role, text: role === "user" ? firstLine : text };
+    }) };
     return result({ message: `Script ran on page and returned:\n\`\`\`json\n${JSON.stringify(projection)}\n\`\`\`` });
   });
   await server.connect(new StdioServerTransport());

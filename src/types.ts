@@ -76,6 +76,15 @@ export interface BrowserTargetConfig {
   /** Control UI mount for resolving ambiguous session URLs; use "/" for the root. */
   basePath?: string;
   browserMcp: { command: string; args: string[] };
+  /** How long a turn may show no visible progress before the bridge acts, and how often it may nudge. */
+  recovery?: {
+    /** Idle chat with no answer to the request (default 3 minutes). Then the bridge nudges. */
+    idleStallMs?: number;
+    /** Chat still marked busy with nothing changing (default 20 minutes). Then the turn needs the operator. */
+    busyStallMs?: number;
+    /** Bridge nudges per turn after a failed or stalled reply (default 2). */
+    maxNudges?: number;
+  };
 }
 
 export interface A2ATargetConfig {
@@ -160,6 +169,8 @@ export interface HandoffEnvelopeV2 {
     sourceRemoteRef?: string;
     expectedTreeSha?: string;
     lockedPaths?: string[];
+    /** Update this open pull request, currently at expectedHeadSha, to a head with expectedTreeSha. */
+    updatePullRequest?: { url: string; expectedHeadSha: string };
   };
   requestedCapabilities: {
     allowCodeEdit: boolean;
