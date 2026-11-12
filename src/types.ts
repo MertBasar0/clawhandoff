@@ -1,3 +1,5 @@
+import type { BrowserCondition } from "./browser-health.js";
+
 export type BridgeErrorCode =
   | "INVALID_CONTRACT_CONFLICT"
   | "INVALID_INPUT"
@@ -231,12 +233,16 @@ export type OrchestratorAction =
   | "CONTINUE_AUTONOMOUSLY"
   | "AUTHORIZE_REMOTE_PUBLISH"
   | "PUBLISH_LOCALLY"
-  | "ESCALATE_TO_HUMAN";
+  | "ESCALATE_TO_HUMAN"
+  /** The browser cannot reach the chat. A person restores it, then attaches again. Nothing is resent. */
+  | "RESTORE_BROWSER";
 
 export interface OrchestratorDirective {
   action: OrchestratorAction;
   reason: string;
   remainingTurnBudget: number;
+  /** Browser handoffs only: why the turn is waiting, when the bridge knows. */
+  condition?: BrowserCondition;
 }
 
 export interface HandoffResultEnvelopeV2 {

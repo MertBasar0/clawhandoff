@@ -57,7 +57,14 @@ export const browserTranscriptScript = String.raw`(expectedUrl, turnKey, uuidRou
   const browserMarkdownParts = ${browserMarkdownParts};
   const replySection = ${browserReplySection};
   const url = location.href.replace(/\?openclaw_mount_recovery=\d+$/, "");
-  const page = { url, ready: false, busy: false, messages: [] };
+  // health starts as "loading" and becomes "ready" only once everything below checks out.
+  const page = { url, ready: false, busy: false, health: 'loading', messages: [] };
+  if (location.protocol === 'chrome-error:') {
+    page.health = 'error_page';
+    return page;
+  }
+  const offline = typeof navigator === 'object' && navigator && navigator.onLine === false;
+  const shown = el => !!el && !el.closest('[inert], [hidden], [aria-hidden="true"]');
   const sameUuidRoute = !!uuidRoute && url.startsWith(uuidRoute.prefix) && (() => {
     const tail = url.slice(uuidRoute.prefix.length);
     if (!tail || /[/?#]/.test(tail)) return false;
@@ -69,7 +76,15 @@ export const browserTranscriptScript = String.raw`(expectedUrl, turnKey, uuidRou
       return false;
     }
   })();
-  if (url !== expectedUrl && !sameUuidRoute) return page;
+  if (url !== expectedUrl && !sameUuidRoute) {
+    page.health = 'wrong_url';
+    return page;
+  }
+  // The full-page connection splash replaces the chat while the Gateway is unreachable.
+  if (shown(document.querySelector('.gateway-connection-view'))) {
+    page.health = offline ? 'offline' : 'disconnected';
+    return page;
+  }
   // The router can retain the previous chat's DOM in an inactive pane.
   const threads = Array.from(document.querySelectorAll('main .chat-thread[role="log"]')).filter(thread => {
     const pane = thread.closest('.chat-pane-cache__pane');
@@ -91,13 +106,28 @@ export const browserTranscriptScript = String.raw`(expectedUrl, turnKey, uuidRou
   if (!composerLabel) return page;
   const sendBtn = outsideThread('button.chat-send-btn--send:not(.chat-send-btn--dictation-commit)');
   const stopBtn = outsideThread('button.chat-send-btn--stop');
-  page.ready = true;
+  // Classify the draft here so that its text never leaves the browser.
+  const draft = String(composers[0].value || '');
+  const draftFirst = draft.split('\n', 1)[0].trimEnd();
+  page.draft = !draft.trim() ? 'empty'
+    : turnKey && draftFirst === "Bridge-Turn: " + turnKey ? 'request'
+    : turnKey && draftFirst === "Bridge-Nudge: " + turnKey ? 'nudge'
+    : /^Bridge-(?:Turn|Nudge): idem_[\w-]+$/.test(draftFirst) ? 'bridge_other' : 'text';
+  // "Connecting… · Saved conversation": the pane shows a saved transcript while the Gateway reconnects.
+  const connection = outsideThread('.chat-pane__connection');
+  // A send control marked busy without sending is the "Loading chat" hold.
+  const sendHeld = !!sendBtn && sendBtn.getAttribute('aria-busy') === 'true' &&
+    !sendBtn.classList.contains('chat-send-btn--sending');
+  page.health = offline ? 'offline' : shown(connection) ? 'disconnected' : sendHeld ? 'loading' : 'ready';
   page.busy = !!(stopBtn || scope.querySelector('.chat-send-btn--stop, .chat-send-btn--sending, [data-chat-streaming="true"]'));
   page.controls = {
     composerLabel,
     sendLabel: sendBtn ? (sendBtn.getAttribute('aria-label') || sendBtn.textContent || '').trim() : '',
     stopLabel: stopBtn ? (stopBtn.getAttribute('aria-label') || stopBtn.textContent || '').trim() : '',
   };
+  // A saved or loading transcript can be stale, so a chat that is not ready reports no messages.
+  if (page.health !== 'ready') return page;
+  page.ready = true;
   if (!turnKey) return page; // Preflight and send control discovery only need readiness.
   // A run failure notice ("Unable to finish this reply") sits between bubbles in thread order.
   const rows = Array.from(thread.querySelectorAll('.chat-bubble[data-message-id], [data-run-failure]')).slice(-64);
@@ -162,12 +192,18 @@ export function wrapBrowserPrompt(idempotencyKey: string, prompt: string): strin
  * A short follow-up that resumes a failed or stalled turn. It carries its own marker so the
  * turn's original request stays unique and the turn still ends with the same reply marker.
  */
-export function wrapBrowserNudge(idempotencyKey: string): string {
+export function wrapBrowserNudge(
+  idempotencyKey: string,
+  published?: { url: string; headSha: string },
+): string {
   return [
     `Bridge-Nudge: ${idempotencyKey}`,
     "",
     "Your reply to this handoff stopped before it finished: the chat showed it could not be completed, or it went quiet without a final answer.",
     "Continue from where you stopped. Check which actions already completed before retrying anything, and never repeat a push or a publish that already happened.",
+    ...(published ? [
+      `GitHub already shows ${published.url} at ${published.headSha} with the verified tree, so the push is done. Do not push, force-push or publish again. Finish only what is left, such as the pull request description, and report.`,
+    ] : []),
     "Start your final answer with the following plain-text line by itself.",
     `Bridge-Reply: ${idempotencyKey}`,
     "Then give your assessment and finish with the required handoff-result JSON block. Start both fence lines in column one.",
@@ -210,6 +246,7 @@ export function inspectBrowserTurn(
   alreadyDispatched = false,
 ): BrowserTurnObservation {
   const page = JSON.parse(snapshot) as { ready: boolean; busy: boolean; messages: TranscriptMessage[] };
+  // A loading or disconnected chat can show a stale saved transcript. It is not an observation.
   if (!page.ready) return { state: "uncertain" };
   const request = `Bridge-Turn: ${idempotencyKey}`;
   const reply = `Bridge-Reply: ${idempotencyKey}`;

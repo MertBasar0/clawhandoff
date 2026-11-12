@@ -96,6 +96,44 @@ export class BridgeStore {
     this.db.exec("PRAGMA journal_mode = WAL;");
     this.db.exec("PRAGMA foreign_keys = ON;");
     this.db.exec(SCHEMA_SQL);
+    // Added after the first release. Older databases gain it in place; older bridges ignore it.
+    this.ensureColumn("handoff_turns", "browser_resend_claimed", "INTEGER NOT NULL DEFAULT 0");
+  }
+
+  private ensureColumn(table: string, column: string, definition: string): void {
+    const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as RawRow[];
+    if (!columns.some((row) => row.name === column)) {
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    }
+  }
+
+  /**
+   * Claims the one automatic send of a browser request that was typed but never sent. Only a turn
+   * whose send was already claimed can use it, and only once, across restarts.
+   */
+  claimBrowserResend(handoffId: string, turnId: string): boolean {
+    return this.withTransaction(() => {
+      const current = this.getLatestTurn(handoffId);
+      if (current?.turnId !== turnId || current.dispatchState !== "uncertain") return false;
+      return this.db.prepare(
+        "UPDATE handoff_turns SET browser_resend_claimed = 1 WHERE turn_id = ? AND browser_resend_claimed = 0",
+      ).run(turnId).changes === 1;
+    });
+  }
+
+  browserResendClaimed(turnId: string): boolean {
+    const row = this.db.prepare("SELECT browser_resend_claimed FROM handoff_turns WHERE turn_id = ?").get(turnId) as
+      RawRow | undefined;
+    return row?.browser_resend_claimed === 1;
+  }
+
+  /**
+   * GitHub shows that an authorized update landed while the publishing turn is still open.
+   * The pull request is then verified, so the publish gate refuses any further authorization.
+   */
+  recordPublicationLanded(params: { handoffId: string; prUrl: string; now: string }): void {
+    this.db.prepare(`UPDATE publication_ledger SET pr_state = 'open_verified', pr_url = ?, updated_at = ?
+      WHERE handoff_id = ?`).run(params.prUrl, params.now, params.handoffId);
   }
 
   close(): void {

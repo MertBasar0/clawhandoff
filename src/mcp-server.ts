@@ -94,6 +94,7 @@ export function createBridgeMcpServer(service: BridgeService): McpServer {
               "   - `CONTINUE_AUTONOMOUSLY`: inspect `reported.blockers` against local commits, builds, and tests. If the objection is a false premise or already satisfied, cite commit-bound proof via `bridge_handoff_continue`. If a genuine in-scope gap exists, fix/test locally (passing `updatedLocalRepoPath` if a worktree was created mid-handoff), push the updated ref, and call `bridge_handoff_continue` without pausing to ask the human.",
               "   - `AUTHORIZE_REMOTE_PUBLISH`: `observed` Git verification passed; call `bridge_handoff_continue(intent='authorize_publish')` to unlock Stage-2 managed PR creation for the exact verified commit.",
               "   - `COMPLETE`: present the result and distinguish observed facts from reported checks. `PUBLISH_LOCALLY`: the authorized local owner acts on the exact verified commit. `ESCALATE_TO_HUMAN`: report the specific unresolved decision or blocker.",
+              "   - `RESTORE_BROWSER` (browser targets): relay the concrete step in `reason` (for example restarting Chrome) to the user, then call `bridge_handoff_attach` again. Nothing is resent. `orchestratorDirective.condition` names the browser state.",
             ].join("\n"),
           },
         },

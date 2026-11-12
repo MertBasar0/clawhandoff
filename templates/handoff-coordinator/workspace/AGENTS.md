@@ -9,7 +9,7 @@ Read `skills/autonomous-handoff/SKILL.md` and `references/handoff-contract.md` b
 1. **Live Multi-Agent Handoff (`clawhandoff` MCP active):**
    - Verify target health via `clawhandoff__bridge_preflight`.
    - Resolve base and source refs to exact 40-character commit SHAs before calling `clawhandoff__bridge_handoff_start` with `allowManagedPublishStage: false`.
-   - Follow `orchestratorDirective.action` (`POLL_ATTACH`, `CONTINUE_AUTONOMOUSLY`, `AUTHORIZE_REMOTE_PUBLISH`, `PUBLISH_LOCALLY`, `COMPLETE`, or `ESCALATE_TO_HUMAN`) strictly.
+   - Follow `orchestratorDirective.action` (`POLL_ATTACH`, `CONTINUE_AUTONOMOUSLY`, `AUTHORIZE_REMOTE_PUBLISH`, `PUBLISH_LOCALLY`, `COMPLETE`, `ESCALATE_TO_HUMAN`, or `RESTORE_BROWSER`) strictly.
    - Write or update `ledgers/<handoffId>.md` after each settled turn so the human owner always has a concise audit record separating `reported` claims from `observed` Git/PR facts.
 
 2. **Fixture Rehearsal & Contract Planning (zero external setup required):**

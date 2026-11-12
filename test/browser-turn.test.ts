@@ -172,7 +172,7 @@ test("browser transcript script guards route, streaming placeholder footers, and
       closest: (sel: string) => (sel === "main" ? scope : null),
       querySelectorAll: () => [userBubble, assistantBubble],
     };
-    return { querySelectorAll: () => [thread] };
+    return { querySelectorAll: () => [thread], querySelector: () => null };
   };
 
   const projectComposer = (composerCount: number) =>
@@ -337,7 +337,7 @@ test("browser transcript script reports run failures in thread order and marks o
       return rows;
     },
   };
-  const projection = runScript({ href: targetUrl }, { querySelectorAll: () => [thread] });
+  const projection = runScript({ href: targetUrl }, { querySelectorAll: () => [thread], querySelector: () => null });
   assert.equal(projection.ready, true);
   assert.deepEqual(projection.messages.map(m => [m.role, m.text, m.nudge ?? false, m.retryable ?? false]), [
     ["user", request.text, false, false],

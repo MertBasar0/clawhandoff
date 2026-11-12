@@ -4,7 +4,20 @@ import { setTimeout as delay } from "node:timers/promises";
 import { A2AClient, type A2ATurnObservation } from "./a2a-client.js";
 import { AcpSessionClient, resolveAcpLaunchCommand } from "./acp-client.js";
 import { githubCloneUrl, parseCandidateRef } from "./candidate-ref.js";
-import { ChromeChat } from "./chrome-chat.js";
+import { BrowserNotReady, ChromeChat, type SendOutcome } from "./chrome-chat.js";
+import {
+  browserRecoveryLimits,
+  browserRestoreStep,
+  decideBrowserRecovery,
+  noteHealthy,
+  noteReload,
+  noteUnhealthy,
+  type BrowserCondition,
+  type BrowserPageHealth,
+  type BrowserRecoveryLimits,
+  type BrowserRecoveryState,
+  type BrowserRecoveryStep,
+} from "./browser-health.js";
 import { inspectBrowserTurn, wrapBrowserNudge, wrapBrowserPrompt } from "./browser-turn.js";
 import { CodexAppServerClient } from "./codex-client.js";
 import { normalizeA2ABaseUrl, parseBrowserSessionRoute, sameBrowserSessionUrl } from "./config.js";
@@ -30,12 +43,35 @@ import {
   type CodexTargetConfig,
   type GatewayTargetConfig,
   type HandoffResultEnvelopeV2,
+  type OrchestratorAction,
   type ObservedResult,
   type PreflightResult,
   type SessionRecord,
   type TargetTransport,
   type TurnRecord,
 } from "./types.js";
+
+/** Why a browser turn returns without a reply, as far as the bridge knows. */
+interface BrowserWaiting {
+  condition: BrowserCondition;
+  health: BrowserPageHealth;
+  reloads: number;
+}
+
+interface BrowserPublicationCheck {
+  at: number;
+  note: string;
+  /** GitHub shows the pull request at a head with the verified tree. */
+  landed?: { url: string; headSha: string };
+  /** The head moved to a commit without the verified tree. */
+  foreign?: string;
+}
+
+interface DirectiveOverride {
+  action: OrchestratorAction;
+  reason: string;
+  condition?: BrowserCondition;
+}
 
 export class BridgeService {
   private readonly config: BridgeConfig;
@@ -47,6 +83,15 @@ export class BridgeService {
   private readonly browserProgress = new Map<string, { progress: string; since: number }>();
   /** Nudges this process sent per browser turn, in case the chat does not show them as expected. */
   private readonly browserNudgesSent = new Map<string, number>();
+  /** Turns whose nudge this process typed but could not send yet. */
+  private readonly browserNudgeTyped = new Set<string>();
+  /** Per browser turn: the current episode of a chat that is not ready. */
+  private readonly browserRecovery = new Map<string, BrowserRecoveryState>();
+  /** When a claimed request was first seen neither in the composer nor in the transcript. */
+  private readonly browserUnsentSince = new Map<string, number>();
+  /** The latest GitHub check of a browser turn that publishes an update. */
+  private readonly browserPublicationChecks = new Map<string, BrowserPublicationCheck>();
+  private readonly browserLimits: BrowserRecoveryLimits = browserRecoveryLimits();
   private readonly a2aClients = new Map<string, A2AClient>();
   private readonly codexClients = new Map<string, CodexAppServerClient>();
   private readonly acpClients = new Map<string, AcpSessionClient>();
@@ -90,7 +135,8 @@ export class BridgeService {
     const key = JSON.stringify([identity, target.browserMcp.command, target.browserMcp.args]);
     let chat = this.browserChats.get(key);
     if (!chat) {
-      chat = new ChromeChat({ ...target.browserMcp, sessionUrl: target.sessionUrl, basePath: target.basePath });
+      chat = new ChromeChat({ ...target.browserMcp, sessionUrl: target.sessionUrl, basePath: target.basePath,
+        navigationTimeoutMs: this.browserLimits.navigationTimeoutMs });
       this.browserChats.set(key, chat);
     }
     return chat;
@@ -654,6 +700,42 @@ export class BridgeService {
     return 0;
   }
 
+  /** Records a not-ready read of this turn's chat and decides what to do about it. */
+  private browserRecoveryStep(turnId: string, health: Exclude<BrowserPageHealth, "ready">): BrowserRecoveryStep {
+    const now = Date.now();
+    const state = noteUnhealthy(this.browserRecovery.get(turnId) ?? noteHealthy(), now);
+    this.browserRecovery.set(turnId, state);
+    return decideBrowserRecovery(state, health, now, this.browserLimits);
+  }
+
+  /**
+   * For a turn that authorized an update of an existing pull request, GitHub shows whether the
+   * push already happened, whatever the chat shows. Checked at most once per interval unless forced.
+   */
+  private async browserPublication(session: SessionRecord, turn: TurnRecord, force: boolean): Promise<BrowserPublicationCheck | undefined> {
+    const update = session.envelope.gitContext.updatePullRequest;
+    if (turn.kind !== "authorize_publish" || !update || !session.expectedTreeSha) return undefined;
+    const now = Date.now();
+    const last = this.browserPublicationChecks.get(turn.turnId);
+    if (last && (last.landed || (!force && now - last.at < this.browserLimits.publishCheckIntervalMs))) return last;
+    const pr = await this.githubReconciler.reconcilePullRequestUpdate({
+      repoId: session.repoId,
+      url: update.url,
+      expectedHeadSha: update.expectedHeadSha,
+      publishedTreeSha: session.expectedTreeSha,
+    });
+    const check: BrowserPublicationCheck = { at: now, note: pr.note };
+    if (pr.prState === "open_verified" && pr.headSha) {
+      check.landed = { url: pr.prUrl, headSha: pr.headSha };
+      this.store.recordPublicationLanded({ handoffId: session.handoffId, prUrl: pr.prUrl, now: new Date().toISOString() });
+    } else if (pr.prState === "uncertain_in_flight" && pr.headSha && pr.headSha !== update.expectedHeadSha.toLowerCase()) {
+      // The head moved, but not to the verified tree: someone else changed the pull request.
+      check.foreign = pr.note;
+    }
+    this.browserPublicationChecks.set(turn.turnId, check);
+    return check;
+  }
+
   private async attachBrowserTurn(
     session: SessionRecord,
     turn: TurnRecord,
@@ -663,30 +745,78 @@ export class BridgeService {
     const { handoffId } = session;
     const { turnId, idempotencyKey } = turn;
     const chat = this.browser(target);
+    const limits = this.browserLimits;
     const deadline = Date.now() + waitBudgetMs;
     let submitted = turn.dispatchState !== "prepared";
     let accepted = turn.dispatchState === "dispatched" || Boolean(turn.runId);
     let needsDispatchRecord = turn.dispatchState !== "dispatched";
     let reply: string | undefined;
+    let markedUncertain = false;
+    /** Why this attach returns without a reply, when the bridge knows more than "still running". */
+    let waiting: BrowserWaiting | undefined;
     const recovery = {
       idleStallMs: target.recovery?.idleStallMs ?? 180_000,
       busyStallMs: target.recovery?.busyStallMs ?? 1_200_000,
       maxNudges: target.recovery?.maxNudges ?? 2,
     };
-    const uncertain = (errorText: string) =>
+    const requestText = wrapBrowserPrompt(idempotencyKey, turn.promptText);
+    const uncertain = (errorText: string) => {
+      markedUncertain = true;
       this.store.markTurnUncertain({ handoffId, turnId, errorText, now: new Date().toISOString() });
+    };
+    /** Waits one poll interval inside the budget. False when the budget is spent. */
+    const pause = async () => {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return false;
+      await delay(Math.min(remaining, limits.pollMs));
+      return true;
+    };
+    const claimRequest = () => {
+      const claimed = this.store.claimDispatch(handoffId, turnId);
+      submitted = true; // A competing attach may already have claimed the same turn.
+      return claimed;
+    };
 
     try {
-      if (!submitted) {
-        await chat.send(wrapBrowserPrompt(idempotencyKey, turn.promptText), () => {
-          const claimed = this.store.claimDispatch(handoffId, turnId);
-          submitted = true; // A competing attach may already have claimed the same turn.
-          return claimed;
-        });
-      }
       let transientIdlePolls = 0;
       for (;;) {
-        const receipt = inspectBrowserTurn(await chat.read(idempotencyKey), idempotencyKey, accepted);
+        // The chat must be ready before anything in it is read as progress or anything is typed.
+        const view = await chat.observe(idempotencyKey);
+        if (view.health !== "ready") {
+          const step = this.browserRecoveryStep(turnId, view.health);
+          if (step.kind === "give_up") {
+            const state = this.browserRecovery.get(turnId)!;
+            waiting = { condition: step.condition, health: view.health, reloads: state.reloads };
+            break;
+          }
+          if (step.kind === "reload") {
+            const outcome = await chat.reload();
+            const state = noteReload(this.browserRecovery.get(turnId)!, outcome, Date.now());
+            this.browserRecovery.set(turnId, state);
+            waiting = { condition: view.health === "loading" ? "chat_loading" : "chat_disconnected", health: view.health, reloads: state.reloads };
+            if (outcome === "offline") continue; // The next round reports browser_offline.
+            if (!(await pause())) break;
+            continue;
+          }
+          waiting = { condition: step.condition, health: view.health, reloads: this.browserRecovery.get(turnId)!.reloads };
+          if (!(await pause())) break;
+          continue;
+        }
+        if (this.browserRecovery.get(turnId)?.unhealthySince !== undefined) {
+          // Time spent loading or disconnected is not Robo being quiet: the stall clock starts over.
+          this.browserProgress.delete(turnId);
+        }
+        this.browserRecovery.set(turnId, noteHealthy());
+        waiting = undefined;
+
+        if (!submitted) {
+          const outcome = await this.browserSend(() => chat.send(requestText, claimRequest));
+          if (outcome === "typed") waiting = { condition: "request_typed_unsent", health: "ready", reloads: 0 };
+          if (outcome !== "sent" && !(await pause())) break;
+          continue;
+        }
+
+        const receipt = inspectBrowserTurn(view.transcript!, idempotencyKey, accepted);
         if (needsDispatchRecord && (receipt.state === "running" || receipt.state === "completed" || receipt.state === "failed")) {
           this.store.recordDispatched({
             handoffId, turnId, remoteSessionKey: `browser:${target.sessionUrl}`,
@@ -694,42 +824,84 @@ export class BridgeService {
           });
           accepted = true;
           needsDispatchRecord = false;
+          this.browserUnsentSince.delete(turnId);
         }
         if (receipt.state === "completed") {
-          this.browserProgress.delete(turnId);
-          this.browserNudgesSent.delete(turnId);
+          this.forgetBrowserTurn(turnId);
           reply = receipt.text;
           break;
         }
+
+        // Claimed, yet not in the transcript: either the request still waits in the composer, or it is in flight.
+        if (receipt.state === "absent") {
+          if (view.draft === "request") {
+            waiting = { condition: "request_typed_unsent", health: "ready", reloads: 0 };
+            if (!view.busy) {
+              if (this.store.browserResendClaimed(turnId)) {
+                uncertain("The bridge already pressed send once for this request, yet it is still in the composer and not in the transcript. Open the chat, press send yourself if the request is still unsent, then attach again.");
+                break;
+              }
+              const outcome = await this.browserSend(() =>
+                chat.submitTyped(requestText, () => this.store.claimBrowserResend(handoffId, turnId)));
+              if (outcome === "sent") continue;
+              if (outcome === "unclaimed") {
+                uncertain("The request is still in the composer, and the bridge may not send it again. Open the chat, press send yourself if it is still unsent, then attach again.");
+                break;
+              }
+            }
+            if (!(await pause())) break;
+            continue;
+          }
+          const since = this.browserUnsentSince.get(turnId) ?? Date.now();
+          this.browserUnsentSince.set(turnId, since);
+          if (Date.now() - since >= limits.unsentConfirmMs) {
+            uncertain("The request was claimed for sending, but the chat shows it neither in the composer nor in the transcript. Open the chat: if it is not there or queued, abort this handoff locally and start again.");
+            break;
+          }
+          if (!(await pause())) break;
+          continue;
+        }
+        this.browserUnsentSince.delete(turnId);
+
         const quietMs = this.quietBrowserTurnMs(turnId, receipt.progress);
         const idleStalled = receipt.state === "running" && receipt.idleWithoutAnswer && quietMs >= recovery.idleStallMs;
         if (accepted && (receipt.state === "failed" || idleStalled)) {
           const nudges = Math.max(receipt.nudges ?? 0, this.browserNudgesSent.get(turnId) ?? 0);
-          if (nudges >= recovery.maxNudges) {
-            uncertain(receipt.state === "failed"
-              ? `Robo's reply could not be completed${nudges ? ` after ${nudges} bridge nudge(s)` : ""}. Open the chat, check what already happened, press Try again if it fits, then attach again without resending.`
-              : `Robo has been idle without answering for ${Math.round(quietMs / 60_000)} min${nudges ? ` after ${nudges} bridge nudge(s)` : ""}. Open the chat, then attach again without resending.`);
+          // A nudge can make Robo act again, so GitHub decides first whether a push already happened.
+          const publication = await this.browserPublication(session, turn, true);
+          if (publication?.foreign) {
+            uncertain(`${publication.foreign} The bridge does not nudge Robo while the pull request has a head it did not authorize. Inspect the pull request and the chat, then attach again.`);
             break;
           }
-          try {
-            // The nudge is visible in the chat, so the count survives restarts and is never repeated blindly.
-            await chat.send(wrapBrowserNudge(idempotencyKey), () => {
-              this.browserNudgesSent.set(turnId, nudges + 1);
-              return true;
-            });
+          if (nudges >= recovery.maxNudges) {
+            const landed = publication?.landed
+              ? `The publication landed (${publication.landed.url} is at ${publication.landed.headSha} with the verified tree); only Robo's final reply, such as the pull request description edit, is missing. `
+              : "";
+            uncertain(landed + (receipt.state === "failed"
+              ? `Robo's reply could not be completed${nudges ? ` after ${nudges} bridge nudge(s)` : ""}. Open the chat, check what already happened, press Try again if it fits, then attach again without resending.`
+              : `Robo has been idle without answering for ${Math.round(quietMs / 60_000)} min${nudges ? ` after ${nudges} bridge nudge(s)` : ""}. Open the chat, then attach again without resending.`));
+            break;
+          }
+          // A nudge this process typed but could not send is finished, not counted again.
+          const typedBefore = this.browserNudgeTyped.has(turnId);
+          const outcome = await this.browserSend(() => chat.send(wrapBrowserNudge(idempotencyKey, publication?.landed), () => {
+            if (!typedBefore) this.browserNudgesSent.set(turnId, nudges + 1);
+            return true;
+          }));
+          if (outcome === "typed") this.browserNudgeTyped.add(turnId);
+          if (outcome === "sent") {
+            this.browserNudgeTyped.delete(turnId);
             this.browserProgress.delete(turnId);
-          } catch (error) {
-            // Robo resumed on its own between the read and the send. Keep watching.
-            if (!(error instanceof BridgeError) || error.code !== "BUSY_ACTIVE_TURN") throw error;
           }
           transientIdlePolls = 0;
+          if (outcome !== "sent" && !(await pause())) break;
           continue;
         }
         if (receipt.state === "running" && !receipt.idleWithoutAnswer && quietMs >= recovery.busyStallMs) {
           uncertain(`Robo has shown as working for ${Math.round(quietMs / 60_000)} min with no visible progress. A sub-session may be stuck: open the chat and its sub-sessions, press Try again on any reply that could not be completed, then attach again without resending.`);
           break;
         }
-        if (receipt.state === "running" || receipt.state === "pending" || receipt.state === "absent") {
+        if (receipt.state === "running" || receipt.state === "pending") {
           transientIdlePolls = 0;
         }
         if (receipt.state === "uncertain") {
@@ -739,21 +911,19 @@ export class BridgeService {
               if (accepted) break;
             } else {
               transientIdlePolls += 1;
-              await delay(Math.min(remainingForConfirm, 1200));
+              await delay(Math.min(remainingForConfirm, limits.pollMs));
               continue;
             }
           }
           uncertain("The visible chat cannot tie a finished answer to this exact turn. Inspect the existing chat and attach again.");
           break;
         }
-        const remaining = deadline - Date.now();
-        if (remaining <= 0) {
-          if (receipt.state === "absent" || receipt.state === "pending") {
+        if (!(await pause())) {
+          if (receipt.state === "pending") {
             uncertain("The sent turn is not yet confirmed in the configured chat. Reopen it and attach without resending.");
           }
           break;
         }
-        await delay(Math.min(remaining, 1200));
       }
     } catch (error) {
       if (!(error instanceof BridgeError)) throw error;
@@ -766,9 +936,69 @@ export class BridgeService {
     if (reply) return this.finalizeSettledTurn({ session, turn, terminalReplyText: reply });
     const latest = this.requireLatestTurn(handoffId);
     const current = this.requireSession(handoffId);
-    return current.lifecycleStatus === "running" || current.lifecycleStatus === "uncertain"
-      ? this.buildRunningOrUncertainResult(current, latest)
-      : this.buildEnvelopeFromRecords(current, latest);
+    if (current.lifecycleStatus !== "running" && current.lifecycleStatus !== "uncertain") {
+      return this.buildEnvelopeFromRecords(current, latest);
+    }
+    let publication: BrowserPublicationCheck | undefined;
+    try {
+      publication = await this.browserPublication(session, turn, false);
+    } catch {
+      // GitHub is only extra evidence here. The chat state stands on its own.
+    }
+    return this.buildRunningOrUncertainResult(current, latest,
+      this.browserDirective(waiting, markedUncertain, publication?.landed));
+  }
+
+  /** Runs one send. A chat that stopped being ready before anything was claimed is read again. */
+  private async browserSend(send: () => Promise<SendOutcome>): Promise<SendOutcome | "not_ready"> {
+    try {
+      return await send();
+    } catch (error) {
+      if (error instanceof BrowserNotReady) return "not_ready";
+      throw error;
+    }
+  }
+
+  private forgetBrowserTurn(turnId: string): void {
+    this.browserProgress.delete(turnId);
+    this.browserNudgesSent.delete(turnId);
+    this.browserNudgeTyped.delete(turnId);
+    this.browserRecovery.delete(turnId);
+    this.browserUnsentSince.delete(turnId);
+    this.browserPublicationChecks.delete(turnId);
+  }
+
+  /** Turns what this attach learned about the browser into the directive the caller acts on. */
+  private browserDirective(
+    waiting: BrowserWaiting | undefined,
+    markedUncertain: boolean,
+    landed: { url: string; headSha: string } | undefined,
+  ): DirectiveOverride | undefined {
+    const published = landed
+      ? `The publication landed: ${landed.url} is at ${landed.headSha} with the verified tree, so do not authorize another publish. `
+      : "";
+    if (waiting?.condition === "browser_offline" || waiting?.condition === "chat_unreachable") {
+      return { action: "RESTORE_BROWSER", condition: waiting.condition,
+        reason: published + browserRestoreStep(waiting.condition, waiting.health, waiting.reloads) };
+    }
+    // A reason recorded in this attach needs a person; the conditions below never override it.
+    if (markedUncertain) return undefined;
+    if (waiting?.condition === "chat_loading" || waiting?.condition === "chat_disconnected") {
+      const what = waiting.condition === "chat_loading" ? "is still loading" : "is reconnecting to its Gateway (it shows a saved conversation)";
+      return { action: "POLL_ATTACH", condition: waiting.condition,
+        reason: `${published}The chat ${what}. The bridge treats this as not yet observed, not as Robo stopping` +
+          (waiting.reloads ? `, and reloaded the tab ${waiting.reloads} time(s)` : "") +
+          `. Call bridge_handoff_attach again; nothing is resent and no nudge is typed while the chat is not ready.` };
+    }
+    if (waiting?.condition === "request_typed_unsent") {
+      return { action: "POLL_ATTACH", condition: "request_typed_unsent",
+        reason: `${published}The request is typed in the chat but not sent yet, because the chat could not send it. The bridge presses send once, as soon as the chat is ready and idle. Call bridge_handoff_attach again.` };
+    }
+    if (landed) {
+      return { action: "POLL_ATTACH", condition: "published_reply_pending",
+        reason: `${published}Robo's turn is still open, for example for the pull request description edit. Call bridge_handoff_attach again.` };
+    }
+    return undefined;
   }
 
   private async attachA2ATurn(
@@ -1777,6 +2007,7 @@ export class BridgeService {
   private buildRunningOrUncertainResult(
     session: SessionRecord,
     turn: TurnRecord,
+    override?: DirectiveOverride,
   ): HandoffResultEnvelopeV2 {
     const pubLedger = this.store.getPublicationLedger(session.handoffId);
     const status = turn.dispatchState === "uncertain" ? "uncertain" : "running";
@@ -1808,7 +2039,9 @@ export class BridgeService {
       lifecycleStatus: status,
       reported: turn.reported,
       observed,
-      orchestratorDirective: evaluated.directive,
+      orchestratorDirective: override
+        ? { ...override, remainingTurnBudget: evaluated.directive.remainingTurnBudget }
+        : evaluated.directive,
     };
   }
 
