@@ -631,6 +631,7 @@ export class BridgeStore {
     headRef?: string;
     headSha?: string;
     attempted?: boolean;
+    updatedAt?: string;
   } {
     const row = this.db
       .prepare(`SELECT p.*, EXISTS(SELECT 1 FROM handoff_turns t WHERE t.handoff_id = p.handoff_id
@@ -645,6 +646,7 @@ export class BridgeStore {
       prUrl: typeof row.pr_url === "string" ? row.pr_url : undefined,
       headRef: typeof row.head_ref === "string" ? row.head_ref : undefined,
       headSha: typeof row.head_sha === "string" ? row.head_sha : undefined,
+      updatedAt: typeof row.updated_at === "string" ? row.updated_at : undefined,
     };
   }
 

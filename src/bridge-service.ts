@@ -1832,11 +1832,16 @@ export class BridgeService {
         "This uncertain turn authorized publication. Verify the pull request and attach or abort instead; it cannot be closed as a plain failure.",
       );
     }
+    // A publication attempt, or a publication record that changed while this turn was out, may
+    // belong to this turn. An older record (an earlier turn reported an existing pull request)
+    // says nothing about this one.
     const ledger = this.store.getPublicationLedger(session.handoffId);
-    if (ledger.attempted || ledger.prState !== "none") {
+    const ledgerChangedDuringTurn =
+      ledger.prState !== "none" && (!ledger.updatedAt || ledger.updatedAt >= turn.createdAt);
+    if (ledger.attempted || ledgerChangedDuringTurn) {
       throw new BridgeError(
         "RECONCILIATION_UNCERTAIN",
-        `This handoff already has a publication record (${ledger.prState}). Attach or abort it instead of closing the turn.`,
+        `This handoff's publication record (${ledger.prState}) may belong to the uncertain turn. Attach or abort it instead of closing the turn.`,
       );
     }
     const update = session.envelope.gitContext.updatePullRequest;

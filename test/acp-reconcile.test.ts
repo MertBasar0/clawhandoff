@@ -181,3 +181,49 @@ test("reconcile refuses an uncertain turn that authorized publication", async ()
     ctx.restoreEnv();
   }
 });
+
+test("reconcile ignores a publication record older than the uncertain turn, and refuses one written during it", async () => {
+  const ctx = setup([
+    { delayMs: 60_000, replyText: "never delivered" },
+    { delayMs: 60_000, replyText: "never delivered either" },
+  ]);
+  const first = new BridgeService(ctx.config);
+  const older = await first.startHandoff({ targetId: "codex", waitBudgetMs: 200, envelope: ctx.envelope });
+  const newer = await first.startHandoff({
+    targetId: "codex",
+    waitBudgetMs: 200,
+    envelope: { ...ctx.envelope, requestId: `${ctx.envelope.requestId}-b` },
+  });
+  await first.close();
+
+  // An earlier turn reported an existing pull request (stored as uncertain_in_flight) long before
+  // the uncertain turn; on the other handoff the record changed after the turn went out.
+  const db = new DatabaseSync(join(ctx.dataDir, "bridge-state.sqlite"));
+  const setLedger = (handoffId: string, updatedAt: string) => {
+    const res = db
+      .prepare("UPDATE publication_ledger SET pr_state = 'uncertain_in_flight', updated_at = ? WHERE handoff_id = ?")
+      .run(updatedAt, handoffId);
+    if (res.changes === 0) {
+      db.prepare(
+        "INSERT INTO publication_ledger (handoff_id, repo_id, pr_state, updated_at) VALUES (?, 'example/app', 'uncertain_in_flight', ?)",
+      ).run(handoffId, updatedAt);
+    }
+  };
+  setLedger(older.handoffId, "2000-01-01T00:00:00.000Z");
+  setLedger(newer.handoffId, "2999-01-01T00:00:00.000Z");
+  db.close();
+
+  const second = new BridgeService(ctx.config);
+  try {
+    const reason = "Gateway log shows the run failed before any model replied; no repository change.";
+    const closed = await second.reconcileUncertainTurn({ handoffId: older.handoffId, reason });
+    assert.equal(closed.lifecycleStatus, "failed");
+    await assert.rejects(
+      second.reconcileUncertainTurn({ handoffId: newer.handoffId, reason }),
+      (err: unknown) => err instanceof BridgeError && err.code === "RECONCILIATION_UNCERTAIN",
+    );
+  } finally {
+    await second.close();
+    ctx.restoreEnv();
+  }
+});
