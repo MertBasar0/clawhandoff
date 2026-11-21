@@ -213,6 +213,11 @@ export const VerifyGitInputSchema = z.object({
   remoteUrlOrPath: z.string().min(1).optional(),
 });
 
+export const ReconcileHandoffInputSchema = z.object({
+  handoffId: z.string().min(1).max(128),
+  reason: z.string().min(10).max(500),
+});
+
 export const AbortHandoffInputSchema = z.object({
   localOnly: z.boolean().optional(),
   handoffId: z.string().min(1).max(128),

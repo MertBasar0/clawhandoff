@@ -234,6 +234,8 @@ SQLite records the intent before sending. An attach may deliver a prepared, unse
 
 **Updating an existing pull request.** Set `gitContext.updatePullRequest` to the pull request URL and its current head (`expectedHeadSha`), together with `expectedTreeSha`. The open pull request then no longer counts as an earlier publication. While its head is still `expectedHeadSha`, publication can be authorized, even again after an attempt that never landed. A head that moved to a commit with `expectedTreeSha` counts as published, whatever commit the publisher made. Any other head stops the gate as uncertain.
 
+**An uncertain turn that cannot resolve.** An ACP prompt that ends without any reply (an agent whose models all failed authentication ends this way) or refuses now settles as `failed`, and the handoff can continue. A turn that stays `uncertain` (for example, a run lost when the bridge process restarted) blocks `bridge_handoff_continue`. After checking the target, call `bridge_handoff_reconcile` with the handoff and a reason. It attaches first; if the turn is still uncertain, it closes it as `failed` so the same handoff and remote session can continue. It refuses a turn that authorized publication, a handoff with a publication record, and an update of an existing pull request whose head moved. Unlike abort, the handoff stays open.
+
 Use `bridge_handoff_abort` for an intentional cancellation. It can cancel a recorded Gateway run or close a browser turn before submission. For a submitted browser turn, stop Robo in the chat UI if necessary. After reviewing the conversation, `localOnly: true` closes local browser tracking while the remote conversation continues.
 
 ## Git verification and publication
