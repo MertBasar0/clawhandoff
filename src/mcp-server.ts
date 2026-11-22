@@ -6,6 +6,7 @@ import {
   AttachHandoffInputSchema,
   ContinueHandoffInputSchema,
   PreflightInputSchema,
+  ReconcileHandoffInputSchema,
   StartHandoffInputSchema,
   VerifyGitInputSchema,
 } from "./schema.js";
@@ -198,6 +199,23 @@ export function createBridgeMcpServer(service: BridgeService): McpServer {
     async (args) => {
       try {
         return formatToolSuccess(await service.abortHandoff(args));
+      } catch (err) {
+        return formatToolError(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "bridge_handoff_reconcile",
+    {
+      title: "Close an Uncertain Handoff Turn",
+      description:
+        "Closes the latest turn of a handoff stuck in `uncertain` as failed, so the same handoff and remote session can continue. Attaches first; refuses publish turns, handoffs with a publication record, and update-PR handoffs whose pull request moved. Requires the operator's reason (what was checked on the target). Unlike abort, the handoff stays open.",
+      inputSchema: ReconcileHandoffInputSchema.shape,
+    },
+    async (args) => {
+      try {
+        return formatToolSuccess(await service.reconcileUncertainTurn(args));
       } catch (err) {
         return formatToolError(err);
       }

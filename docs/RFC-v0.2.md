@@ -232,6 +232,7 @@ export interface HandoffResultEnvelopeV2 {
 | `bridge_handoff_attach` | Resumes the saved handoff after interruption, restart, or wait expiry. It can send a prepared message for the first time. If a send was attempted, attach looks for its receipt or follows the recorded run. If it cannot establish delivery, it reports the uncertainty. |
 | `bridge_handoff_continue` | Requires the same `handoffId`, a `message`, and an `intent`. Use `counter_evidence_or_followup` to submit evidence or newly verified Git information. Use `authorize_publish` to send separate approval for the verified candidate. |
 | `bridge_verify_git` | Inspects an isolated repository without checkout. It checks ancestry against `pinnedBaseCommitSha`, verifies `observedHeadSha` and `observedTreeSha`, and checks `lockedPaths` in intermediate commits after the source commit. |
+| `bridge_handoff_reconcile` | Closes a turn stuck in `uncertain` as `failed` after the operator checked the target, so the same handoff can continue. Requires a reason, attaches first, and refuses publish turns, handoffs with a publication record, and update-PR handoffs whose head moved. |
 | `bridge_handoff_abort` | Stops a recorded Gateway run or cancels a browser turn before submission. To stop a submitted browser response, use the chat UI. After inspecting the chat, use `localOnly: true` to close local tracking. Ending a wait alone leaves the run active. |
 
 ### 6.2 Phase 1 acceptance tests and success metrics

@@ -11,7 +11,7 @@ const CLI_ENTRYPOINT = resolve(process.cwd(), "dist/cli.js");
 const FAKE_OPENCLAW_CLI = resolve(process.cwd(), "test/helpers/fake-openclaw-cli.mjs");
 const FAKE_GH_CLI = resolve(process.cwd(), "test/helpers/fake-gh-cli.mjs");
 
-test("MCP Stdio E2E: exposes all 6 tools and autonomous-handoff prompt cleanly over JSON-RPC stdio", async () => {
+test("MCP Stdio E2E: exposes all 7 tools and autonomous-handoff prompt cleanly over JSON-RPC stdio", async () => {
   const fixture = createTempGitFixture();
   const dataDir = mkdtempSync(join(tmpdir(), "clawhandoff-e2e-"));
   const stateFile = join(dataDir, "fake-gateway-state.json");
@@ -85,6 +85,7 @@ test("MCP Stdio E2E: exposes all 6 tools and autonomous-handoff prompt cleanly o
         "bridge_handoff_abort",
         "bridge_handoff_attach",
         "bridge_handoff_continue",
+        "bridge_handoff_reconcile",
         "bridge_handoff_start",
         "bridge_preflight",
         "bridge_verify_git",

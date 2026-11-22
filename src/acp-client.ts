@@ -529,8 +529,18 @@ export class AcpSessionClient {
       .then((rawRes) => {
         const res = asRecord(rawRes);
         const stopReason = readString(res, "stopReason");
+        const replied = tracked.chunks.join("").trim().length > 0;
         if (stopReason === "cancelled") {
           tracked.status = "cancelled";
+        } else if (!replied || stopReason === "refusal") {
+          // The prompt response is the end of the turn: nothing is still running remotely. An agent
+          // that ends without any reply (for example after a model or authentication failure) or
+          // refuses has failed this turn; it is not a terminal state with an unknown reply.
+          tracked.status = "failed";
+          tracked.errorMessage = replied
+            ? `ACP agent refused the prompt (stopReason=refusal).`
+            : `ACP prompt ended without a reply (stopReason=${stopReason ?? "none"}). ` +
+              "The agent may have failed before answering, for example on a model or authentication error; check its logs.";
         } else {
           tracked.status = "completed";
         }

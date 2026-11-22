@@ -1806,6 +1806,68 @@ export class BridgeService {
     return this.buildEnvelopeFromRecords(this.requireSession(session.handoffId), this.requireLatestTurn(session.handoffId));
   }
 
+  /**
+   * Closes an uncertain turn as failed so the same handoff (and its remote session) can continue,
+   * when an operator has checked the target and the bridge can prove nothing was published.
+   * Unlike abort, the handoff stays open. A fresh attach runs first, so a turn the bridge can
+   * still resolve is resolved normally instead.
+   */
+  async reconcileUncertainTurn(params: { handoffId: string; reason: string }): Promise<HandoffResultEnvelopeV2> {
+    const reason = params.reason.trim();
+    if (reason.length < 10) {
+      throw new BridgeError("INVALID_INPUT", "Give the reason the uncertain turn can be closed (what you checked on the target).");
+    }
+    const attached = await this.attachHandoff({ handoffId: params.handoffId, waitBudgetMs: 0 });
+    if (attached.lifecycleStatus !== "uncertain") {
+      return attached;
+    }
+    const session = this.requireSession(params.handoffId);
+    const turn = this.requireLatestTurn(params.handoffId);
+    if (turn.dispatchState !== "uncertain") {
+      return this.buildEnvelopeFromRecords(session, turn);
+    }
+    if (turn.kind === "authorize_publish") {
+      throw new BridgeError(
+        "PUBLISH_GATE_BLOCKED",
+        "This uncertain turn authorized publication. Verify the pull request and attach or abort instead; it cannot be closed as a plain failure.",
+      );
+    }
+    // A publication attempt, or a publication record that changed while this turn was out, may
+    // belong to this turn. An older record (an earlier turn reported an existing pull request)
+    // says nothing about this one.
+    const ledger = this.store.getPublicationLedger(session.handoffId);
+    const ledgerChangedDuringTurn =
+      ledger.prState !== "none" && (!ledger.updatedAt || ledger.updatedAt >= turn.createdAt);
+    if (ledger.attempted || ledgerChangedDuringTurn) {
+      throw new BridgeError(
+        "RECONCILIATION_UNCERTAIN",
+        `This handoff's publication record (${ledger.prState}) may belong to the uncertain turn. Attach or abort it instead of closing the turn.`,
+      );
+    }
+    const update = session.envelope.gitContext.updatePullRequest;
+    if (update) {
+      const pr = await this.githubReconciler.reconcilePullRequestUpdate({
+        repoId: session.repoId,
+        url: update.url,
+        expectedHeadSha: update.expectedHeadSha,
+        publishedTreeSha: session.expectedTreeSha ?? "",
+      });
+      if (!pr.headSha || pr.headSha.toLowerCase() !== update.expectedHeadSha.toLowerCase()) {
+        throw new BridgeError(
+          "RECONCILIATION_UNCERTAIN",
+          `The pull request is no longer at its pre-publish head (${pr.note}). Inspect it before closing the turn.`,
+        );
+      }
+    }
+    return await this.finalizeSettledTurn({
+      session,
+      turn,
+      runFailedError:
+        `Closed by the operator as failed: ${reason}` +
+        (turn.errorText ? ` (bridge state before closing: ${turn.errorText})` : ""),
+    });
+  }
+
   private async reconcileUndispatchedTurn(
     session: SessionRecord,
     turn: TurnRecord,
