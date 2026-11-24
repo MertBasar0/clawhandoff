@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -432,6 +433,100 @@ test("failure 3: Chrome without network gets a browser_offline directive with a 
   const back = await b.attach(started.handoffId);
   assert.equal(directive(back).action, "POLL_ATTACH");
   assert.equal(directive(back).condition, undefined);
+  assert.equal(b.state().clicks, 1);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Chrome DevTools MCP could not attach to Chrome (2026-11-24/25)
+
+/** The stored state of a handoff's latest turn, read directly from SQLite. */
+function storedTurn(dataDir: string, handoffId: string) {
+  const db = new DatabaseSync(join(dataDir, "bridge-state.sqlite"), { readOnly: true });
+  try {
+    const turn = db.prepare(
+      "SELECT dispatch_state, error_text FROM handoff_turns WHERE handoff_id = ? ORDER BY turn_number DESC LIMIT 1",
+    ).get(handoffId) as { dispatch_state: string; error_text: string | null };
+    const session = db.prepare("SELECT lifecycle_status FROM handoff_sessions WHERE handoff_id = ?").get(handoffId) as
+      { lifecycle_status: string };
+    return { dispatchState: turn.dispatch_state, errorText: turn.error_text, lifecycleStatus: session.lifecycle_status };
+  } finally {
+    db.close();
+  }
+}
+
+const connectTimeout = /\(browser_connect_timeout\)/;
+
+test("a failed attach to Chrome leaves a dispatched turn as it was, and the next attach reads the settled reply", async (t) => {
+  const b = browserBridge(t, { silentRobo: true });
+  const started = await b.start();
+  assert.equal(storedTurn(b.fixture.rootDir, started.handoffId).dispatchState, "dispatched");
+
+  // Robo finishes while Chrome still waits for the user to allow remote debugging.
+  const key = /^Bridge-Turn: (idem_[\w-]+)$/m.exec(b.state().messages[0]!.text)![1];
+  const report = { disposition: "needs_evidence", summaryDelta: "Finished while unobserved.", blockers: ["Missing receipt"] };
+  b.update({
+    messages: [...b.state().messages, { role: "assistant", text: `Bridge-Reply: ${key}\n\n\`\`\`handoff-result\n${JSON.stringify(report)}\n\`\`\`` }],
+    failNext: { tool: "list_pages", kind: "connect_timeout" },
+  });
+  const unattached = await b.attach(started.handoffId);
+  assert.equal(unattached.lifecycleStatus, "running");
+  assert.equal(directive(unattached).action, "POLL_ATTACH");
+  assert.equal(directive(unattached).condition, "browser_not_attached");
+  assert.match(directive(unattached).reason, connectTimeout);
+  assert.match(directive(unattached).reason, /remote debugging prompt.*No page was read.*bridge_handoff_attach again/);
+  assert.doesNotMatch(JSON.stringify(unattached), PRIVATE);
+  assert.deepEqual(storedTurn(b.fixture.rootDir, started.handoffId),
+    { dispatchState: "dispatched", errorText: null, lifecycleStatus: "running" });
+
+  const settled = await b.attach(started.handoffId);
+  assert.equal(settled.lifecycleStatus, "settled");
+  assert.equal(settled.reported?.summaryDelta, "Finished while unobserved.");
+  assert.equal(b.state().clicks, 1);
+  assert.equal(b.state().nudgeClicks ?? 0, 0);
+});
+
+test("a failed attach to Chrome before a prepared request is typed keeps it prepared, and the next attach sends it once", async (t) => {
+  const b = browserBridge(t, { failNext: { tool: "list_pages", kind: "connect_timeout" } });
+  let handoffId: string | undefined;
+  await assert.rejects(b.start(), (error: unknown) => {
+    assert.ok(error instanceof BridgeError);
+    assert.equal(error.code, "TARGET_UNAVAILABLE");
+    assert.match(error.message, connectTimeout);
+    assert.match(error.remediation ?? "", /still prepared: attach to hoff_[\w-]+ again/);
+    assert.doesNotMatch(`${error.message} ${error.remediation}`, PRIVATE);
+    handoffId = /attach to (hoff_[\w-]+)/.exec(error.remediation ?? "")?.[1];
+    return true;
+  });
+  assert.ok(handoffId);
+  assert.deepEqual(storedTurn(b.fixture.rootDir, handoffId),
+    { dispatchState: "prepared", errorText: null, lifecycleStatus: "running" });
+  assert.equal(b.state().fills ?? 0, 0);
+
+  const sent = await b.attach(handoffId);
+  assert.equal(sent.lifecycleStatus, "settled");
+  assert.equal(b.state().fills, 1);
+  assert.equal(b.state().clicks, 1);
+  await b.attach(handoffId);
+  assert.equal(b.state().clicks, 1);
+});
+
+test("a failed attach to Chrome right after the claim, before typing, undoes the claim so the request is sent once later", async (t) => {
+  const b = browserBridge(t, { failNext: { tool: "fill", kind: "connect_timeout" } });
+  let handoffId: string | undefined;
+  await assert.rejects(b.start(), (error: unknown) => {
+    assert.ok(error instanceof BridgeError);
+    assert.match(error.message, /could not complete fill \(browser_connect_timeout\)/);
+    handoffId = /attach to (hoff_[\w-]+)/.exec(error.remediation ?? "")?.[1];
+    return true;
+  });
+  assert.ok(handoffId);
+  assert.deepEqual(storedTurn(b.fixture.rootDir, handoffId),
+    { dispatchState: "prepared", errorText: null, lifecycleStatus: "running" });
+  assert.equal(b.state().draft, "");
+
+  const sent = await b.attach(handoffId);
+  assert.equal(sent.lifecycleStatus, "settled");
+  assert.equal(b.state().fills, 1);
   assert.equal(b.state().clicks, 1);
 });
 

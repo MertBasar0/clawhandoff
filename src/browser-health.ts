@@ -35,13 +35,15 @@ export type BrowserDraftKind =
 
 /**
  * Why a browser turn is not progressing, reported in `orchestratorDirective.condition`.
- * The first four keep `POLL_ATTACH`; the last two need a person and use `RESTORE_BROWSER`.
+ * The first five keep `POLL_ATTACH`; the last two need a person and use `RESTORE_BROWSER`.
  */
 export type BrowserCondition =
   | "chat_loading"
   | "chat_disconnected"
   | "request_typed_unsent"
   | "published_reply_pending"
+  /** Chrome DevTools MCP could not attach to Chrome, so no page was read. */
+  | "browser_not_attached"
   | "browser_offline"
   | "chat_unreachable";
 

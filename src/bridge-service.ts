@@ -3,8 +3,15 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { A2AClient, type A2ATurnObservation } from "./a2a-client.js";
 import { AcpSessionClient, resolveAcpLaunchCommand } from "./acp-client.js";
-import { githubCloneUrl, parseCandidateRef } from "./candidate-ref.js";
-import { BrowserNotReady, ChromeChat, type SendOutcome } from "./chrome-chat.js";
+import { githubCloneUrl, parseCandidateRef, type CandidateRefLocation } from "./candidate-ref.js";
+import {
+  BrowserNotReady,
+  BrowserUnattachedBeforeTyping,
+  ChromeChat,
+  isBrowserConnectFailure,
+  type ChromeFailure,
+  type SendOutcome,
+} from "./chrome-chat.js";
 import {
   browserRecoveryLimits,
   browserRestoreStep,
@@ -24,7 +31,7 @@ import { normalizeA2ABaseUrl, parseBrowserSessionRoute, sameBrowserSessionUrl } 
 import { evaluateOrchestratorDirective } from "./directive.js";
 import { buildPrettySessionUrl, OpenClawGatewayClient } from "./gateway-client.js";
 import { GitVerifier } from "./git-verifier.js";
-import { GitHubReconciler } from "./github-reconciler.js";
+import { GitHubReconciler, type PullRequestHead } from "./github-reconciler.js";
 import {
   compileAuthorizePublishPrompt,
   compileFollowupPrompt,
@@ -754,6 +761,8 @@ export class BridgeService {
     let markedUncertain = false;
     /** Why this attach returns without a reply, when the bridge knows more than "still running". */
     let waiting: BrowserWaiting | undefined;
+    /** Chrome DevTools MCP could not attach to Chrome. Nothing was observed, so the turn is unchanged. */
+    let unattached: ChromeFailure | undefined;
     const recovery = {
       idleStallMs: target.recovery?.idleStallMs ?? 180_000,
       busyStallMs: target.recovery?.busyStallMs ?? 1_200_000,
@@ -927,11 +936,19 @@ export class BridgeService {
       }
     } catch (error) {
       if (!(error instanceof BridgeError)) throw error;
-      const attachAgain = `When the chat is ready, attach to ${handoffId}.`;
+      // Typing failed before anything reached the composer: the claim is undone, so the turn stays prepared.
+      if (error instanceof BrowserUnattachedBeforeTyping && this.store.releaseUnsentClaim(handoffId, turnId)) {
+        submitted = false;
+      }
       if (!submitted) {
+        const attachAgain = isBrowserConnectFailure(error)
+          ? `Nothing was typed and the turn is still prepared: attach to ${handoffId} again once Chrome is attached, and the request is sent once then.`
+          : `When the chat is ready, attach to ${handoffId}.`;
         throw new BridgeError(error.code, error.message, error.remediation ? `${error.remediation} ${attachAgain}` : attachAgain);
       }
-      uncertain(error.remediation ? `${error.message} ${error.remediation}` : error.message);
+      // A failed attach to Chrome read no page. It is not evidence about the turn, so its state stays as it is.
+      if (isBrowserConnectFailure(error)) unattached = error;
+      else uncertain(error.remediation ? `${error.message} ${error.remediation}` : error.message);
     }
     if (reply) return this.finalizeSettledTurn({ session, turn, terminalReplyText: reply });
     const latest = this.requireLatestTurn(handoffId);
@@ -946,7 +963,7 @@ export class BridgeService {
       // GitHub is only extra evidence here. The chat state stands on its own.
     }
     return this.buildRunningOrUncertainResult(current, latest,
-      this.browserDirective(waiting, markedUncertain, publication?.landed));
+      this.browserDirective(waiting, markedUncertain, publication?.landed, unattached));
   }
 
   /** Runs one send. A chat that stopped being ready before anything was claimed is read again. */
@@ -973,10 +990,16 @@ export class BridgeService {
     waiting: BrowserWaiting | undefined,
     markedUncertain: boolean,
     landed: { url: string; headSha: string } | undefined,
+    unattached?: ChromeFailure,
   ): DirectiveOverride | undefined {
     const published = landed
       ? `The publication landed: ${landed.url} is at ${landed.headSha} with the verified tree, so do not authorize another publish. `
       : "";
+    if (unattached) {
+      return { action: "POLL_ATTACH", condition: "browser_not_attached",
+        reason: `${published}${unattached.message} ${unattached.remediation ?? ""} No page was read, so the bridge left the turn as it was. ` +
+          "Call bridge_handoff_attach again (allow Chrome's remote debugging prompt if it shows); nothing is resent and no nudge is typed." };
+    }
     if (waiting?.condition === "browser_offline" || waiting?.condition === "chat_unreachable") {
       return { action: "RESTORE_BROWSER", condition: waiting.condition,
         reason: published + browserRestoreStep(waiting.condition, waiting.health, waiting.reloads) };
@@ -1641,23 +1664,19 @@ export class BridgeService {
     candidateRef?: string,
     reportedPrUrl?: string,
     remoteSource = session.remoteUrlOrPath ?? session.localRepoPath,
+    preferPullRequestHead = true,
   ): Promise<ObservedResult> {
     const ledger = this.store.getPublicationLedger(session.handoffId);
     let git: ObservedResult = { reachableRefVerified: false, reconciledPrState: "none" };
     if (candidateRef && remoteSource) {
       // A target may report owner/repo:<ref>. A ref in another repository is fetched from GitHub.
       const location = parseCandidateRef(candidateRef, session.repoId);
+      const prUrl = reportedPrUrl ?? ledger.prUrl;
+      const prHead = location && prUrl && preferPullRequestHead
+        ? await this.candidatePullRequestHead(session, location, prUrl)
+        : undefined;
       git = location
-        ? await this.gitVerifier.verifyCandidate({
-            remoteUrlOrPath: remoteSource,
-            ...(location.repository ? { candidateRemoteUrlOrPath: githubCloneUrl(location.repository) } : {}),
-            localRepoPath: session.localRepoPath,
-            candidateRef: location.ref,
-            pinnedBaseCommitSha: session.pinnedBaseCommitSha,
-            pinnedSourceCommitSha: session.pinnedSourceCommitSha,
-            expectedTreeSha: session.expectedTreeSha,
-            lockedPaths: session.lockedPaths,
-          })
+        ? await this.verifyCandidateLocation(session, remoteSource, location, prHead)
         : { ...git, verificationNotes: [`Refusing candidateRef "${candidateRef}": expected a plain Git ref or owner/repo:<ref>.`] };
     }
     if (session.publisherOwner === "none" && !reportedPrUrl && !ledger.attempted && !ledger.prUrl) return git;
@@ -1693,6 +1712,80 @@ export class BridgeService {
     return { ...git, reconciledPrState: pr.prState, reconciledPrUrl: pr.prUrl };
   }
 
+  /**
+   * The pull request whose head is the candidate ref, when GitHub confirms it: its head branch is
+   * the candidate branch (or the candidate is its `refs/pull/<n>/head`), in the same repository.
+   */
+  private async candidatePullRequestHead(
+    session: SessionRecord,
+    location: CandidateRefLocation,
+    prUrl: string,
+  ): Promise<PullRequestHead | undefined> {
+    const head = await this.githubReconciler.pullRequestHead({ repoId: session.repoId, url: prUrl });
+    if (!head) return undefined;
+    const sameRef = location.ref === `refs/pull/${head.number}/head` ||
+      location.ref.replace(/^refs\/heads\//, "") === head.headRefName;
+    const sameRepository = !location.repository ||
+      head.headRepository?.toLowerCase() === location.repository.toLowerCase();
+    return sameRef && sameRepository ? head : undefined;
+  }
+
+  /**
+   * Verifies a candidate ref. When it is a pull request's head, the pull request head is what was
+   * published, so it wins over the configured source: the configured source is used only when it
+   * serves exactly that head commit, and otherwise `refs/pull/<n>/head` is fetched from the pull
+   * request's repository. A fork that never received the branch, or holds an older copy of it,
+   * then no longer hides a published head.
+   */
+  private async verifyCandidateLocation(
+    session: SessionRecord,
+    remoteSource: string,
+    location: CandidateRefLocation,
+    prHead: PullRequestHead | undefined,
+  ): Promise<ObservedResult> {
+    const verify = (candidateRef: string, candidateRemoteUrlOrPath?: string) => this.gitVerifier.verifyCandidate({
+      remoteUrlOrPath: remoteSource,
+      ...(candidateRemoteUrlOrPath ? { candidateRemoteUrlOrPath } : {}),
+      localRepoPath: session.localRepoPath,
+      candidateRef,
+      pinnedBaseCommitSha: session.pinnedBaseCommitSha,
+      pinnedSourceCommitSha: session.pinnedSourceCommitSha,
+      expectedTreeSha: session.expectedTreeSha,
+      lockedPaths: session.lockedPaths,
+    });
+    const configured = await verify(location.ref, location.repository ? githubCloneUrl(location.repository) : undefined);
+    if (!prHead || (configured.reachableRefVerified && configured.observedHeadSha === prHead.headSha)) return configured;
+
+    const pullRef = `refs/pull/${prHead.number}/head`;
+    const why = configured.reachableRefVerified
+      ? `The configured source has ${location.ref} at ${configured.observedHeadSha}, but ${prHead.url} is at ${prHead.headSha}.`
+      : `The configured source does not serve ${location.ref}.`;
+    const fromPullRequest = await verify(pullRef, githubCloneUrl(prHead.repository));
+    if (!fromPullRequest.reachableRefVerified) {
+      // Nothing better was found. A reachable configured ref still stands, with the mismatch noted.
+      const fallback = configured.reachableRefVerified ? configured : fromPullRequest;
+      return {
+        ...fallback,
+        verificationNotes: [
+          ...(configured.verificationNotes ?? []),
+          why,
+          ...(fromPullRequest.verificationNotes ?? []),
+        ],
+      };
+    }
+    const lagging = fromPullRequest.observedHeadSha !== prHead.headSha
+      ? [`${pullRef} is at ${fromPullRequest.observedHeadSha}, while GitHub reports ${prHead.headSha} as the pull request head; GitHub may not have updated the pull ref yet.`]
+      : [];
+    return {
+      ...fromPullRequest,
+      verificationNotes: [
+        `${why} Verified the pull request head ${pullRef} from ${prHead.repository} instead.`,
+        ...lagging,
+        ...(fromPullRequest.verificationNotes ?? []),
+      ],
+    };
+  }
+
   async verifyGit(params: {
     handoffId: string;
     candidateRef: string;
@@ -1713,7 +1806,9 @@ export class BridgeService {
       );
     }
 
-    const observed = await this.observeCandidate(session, params.candidateRef, latestTurn.reported?.prUrl, remoteSource);
+    // An explicitly named remote is the caller's choice and is not replaced by a pull request head.
+    const observed = await this.observeCandidate(session, params.candidateRef, latestTurn.reported?.prUrl, remoteSource,
+      params.remoteUrlOrPath === undefined);
     const verifiedPublishHeadSha = this.verifiedHead(session, observed);
 
     const evaluated = evaluateOrchestratorDirective({
