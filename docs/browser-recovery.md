@@ -50,6 +50,18 @@ The attach loop then handles an **unsent own turn**: the transcript has no `Brid
 
 A claimed request that appears neither in the composer nor in the transcript for `unsentConfirmMs` becomes `uncertain`. It is never typed again.
 
+## Chrome DevTools MCP could not attach
+
+On 2026-11-24/25 three attaches to a Robo chat failed with `list_pages (browser_connect_timeout)`: Chrome had not finished attaching within Chrome DevTools MCP's 60-second limit, usually because nobody had clicked Chrome's remote-debugging Allow prompt yet. The bridge recorded each turn as `uncertain` with `ESCALATE_TO_HUMAN`, although nothing had been observed. Robo had finished, and a later attach that did connect read the settled reply.
+
+A failure to attach is now not evidence about the turn. These causes mean that the failed call never reached a page: `browser_connect_timeout`, `browser_connect_failed`, `mcp_start_failed`, `mcp_start_timeout`, `mcp_log_file_failed` and `mcp_unsupported`. On any of them:
+
+- **A sent turn** (dispatched, running, or claimed for sending) keeps its stored state. The attach returns `POLL_ATTACH` with `condition: "browser_not_attached"`. The `reason` names the cause and its remedy, such as allowing Chrome's remote debugging prompt, and says to attach again. Nothing is resent and no nudge is typed.
+- **A prepared turn** stays `prepared`. The call fails with a transient `TARGET_UNAVAILABLE` whose remediation names the handoff to attach to. The next attach that connects sends the request once.
+- **A claim without typing.** `send` claims the turn right before it types. If Chrome cannot be attached while the request is being typed, nothing reached the composer, so the bridge undoes that claim (`releaseUnsentClaim`) and the turn is `prepared` again. Only a bare claim is undone: one without a run id, a recorded reason, or the automatic resend.
+
+Failures that may have reached the page, such as `tool_error`, `mcp_request_timeout` or `mcp_transport_closed` during a click, still make a sent turn `uncertain`.
+
 ## Reconciling a publish turn against GitHub
 
 For an `authorize_publish` turn with `gitContext.updatePullRequest`, the pull request head says whether the push already happened, whatever the chat shows. The bridge checks it with `gh` at most once per `publishCheckIntervalMs`, and always before it nudges:
@@ -71,6 +83,7 @@ If Robo stays quiet after the last nudge, the turn still becomes `uncertain`. It
 | `chat_disconnected` | `POLL_ATTACH` | The chat is reconnecting or shows a saved conversation. Not yet observed, not a stopped Robo. |
 | `request_typed_unsent` | `POLL_ATTACH` | The request is in the composer. The bridge sends it once when the chat is ready. |
 | `published_reply_pending` | `POLL_ATTACH` | GitHub shows the publication. Robo's reply is still pending. Do not authorize again. |
+| `browser_not_attached` | `POLL_ATTACH` | Chrome DevTools MCP could not attach to Chrome, so no page was read. The turn is unchanged. Allow Chrome's remote debugging prompt if it shows, then attach again. |
 | `chat_unreachable` | `RESTORE_BROWSER` | The chat did not recover after bounded reloads, or the tab shows another page. |
 | `browser_offline` | `RESTORE_BROWSER` | Chrome cannot load pages. Restart Chrome, then attach again. |
 

@@ -114,10 +114,45 @@ const CAUSES = {
 
 export type ChromeFailureCause = keyof typeof CAUSES;
 
-export function chromeFailure(action: string, cause: ChromeFailureCause): BridgeError {
-  const [reason, remediation] = CAUSES[cause];
-  const what = action === "start" ? "could not start" : `could not complete ${action}`;
-  return new BridgeError("TARGET_UNAVAILABLE", `Chrome DevTools MCP ${what} (${cause}): ${reason}.`, remediation);
+/** A Chrome DevTools MCP failure, with its cause kept for the caller. */
+export class ChromeFailure extends BridgeError {
+  constructor(readonly action: string, readonly failure: ChromeFailureCause) {
+    const [reason, remediation] = CAUSES[failure];
+    const what = action === "start" ? "could not start" : `could not complete ${action}`;
+    super("TARGET_UNAVAILABLE", `Chrome DevTools MCP ${what} (${failure}): ${reason}.`, remediation);
+  }
+}
+
+export function chromeFailure(action: string, cause: ChromeFailureCause): ChromeFailure {
+  return new ChromeFailure(action, cause);
+}
+
+/**
+ * Causes that mean Chrome DevTools MCP never reached a page: it could not start, or it could not
+ * attach to Chrome (for example while Chrome still waits for the user to allow remote debugging).
+ * The failed call read nothing and changed nothing, so it says nothing about any turn.
+ */
+const CONNECT_FAILURES: ReadonlySet<ChromeFailureCause> = new Set([
+  "browser_connect_timeout",
+  "browser_connect_failed",
+  "mcp_start_failed",
+  "mcp_start_timeout",
+  "mcp_log_file_failed",
+  "mcp_unsupported",
+]);
+
+export function isBrowserConnectFailure(error: unknown): error is ChromeFailure {
+  return error instanceof ChromeFailure && CONNECT_FAILURES.has(error.failure);
+}
+
+/**
+ * A connection failure after `send` claimed the turn, before anything of the request reached the
+ * composer. The claim may be released: the request was provably never typed or sent.
+ */
+export class BrowserUnattachedBeforeTyping extends ChromeFailure {
+  constructor(error: ChromeFailure) {
+    super(error.action, error.failure);
+  }
 }
 
 const REPLY_MARKERS: ReadonlyArray<readonly [RegExp, ChromeFailureCause]> = [
@@ -518,6 +553,9 @@ export class ChromeChat {
       if (retry) await this.page(page);
       await this.tool("fill", { uid: empty.composer!.id, value: draftText }, page);
       return page;
+    }).catch((error: unknown) => {
+      // The fill never reached the page, so the composer still holds nothing of this request.
+      throw isBrowserConnectFailure(error) ? new BrowserUnattachedBeforeTyping(error) : error;
     });
     return await this.clickTyped(filledPage, draftText);
   }

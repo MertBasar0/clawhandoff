@@ -203,12 +203,29 @@ test("a classified browser failure reaches the handoff without tab details", asy
   // The chat takes one unfinished handoff at a time.
   await service.abortHandoff({ handoffId: unsent });
 
-  // After the claim the turn is uncertain, and its recorded error names the cause.
-  update({ failNext: { tool: "click", kind: "connect_timeout" } });
+  // After the claim, a failure that may have reached the page makes the turn uncertain, and its
+  // recorded error names the cause.
+  update({ failNext: { tool: "click", kind: "tool_error" } });
   const uncertain = await start("chrome-after-claim");
   assert.equal(uncertain.lifecycleStatus, "uncertain");
+  assert.equal(uncertain.orchestratorDirective.action, "ESCALATE_TO_HUMAN");
   const notes = (uncertain.observed.verificationNotes ?? []).join("\n");
-  assert.match(notes, /Chrome DevTools MCP could not complete click \(browser_connect_timeout\)/);
-  assert.match(notes, /responsive/);
+  assert.match(notes, /Chrome DevTools MCP could not complete click \(tool_error\)/);
+  assert.match(notes, /attachment permission/);
   assert.doesNotMatch(notes, PRIVATE);
+  await service.abortHandoff({ handoffId: uncertain.handoffId, localOnly: true });
+
+  // A failure to attach to Chrome after the request was typed read nothing: the turn keeps its
+  // state, the caller is told to attach again, and that attach sends the typed request once.
+  update({ draft: "", failNext: { tool: "click", kind: "connect_timeout" } });
+  const unattached = await start("chrome-after-claim-unattached");
+  assert.equal(unattached.orchestratorDirective.action, "POLL_ATTACH");
+  assert.equal(unattached.orchestratorDirective.condition, "browser_not_attached");
+  assert.match(unattached.orchestratorDirective.reason, /could not complete click \(browser_connect_timeout\).*responsive.*bridge_handoff_attach again/);
+  assert.doesNotMatch(JSON.stringify(unattached), PRIVATE);
+  assert.equal(unattached.observed.verificationNotes, undefined);
+  const clicksBefore = JSON.parse(readFileSync(statePath, "utf8")).clicks ?? 0;
+  const sent = await service.attachHandoff({ handoffId: unattached.handoffId, waitBudgetMs: 0 });
+  assert.notEqual(sent.orchestratorDirective.action, "ESCALATE_TO_HUMAN");
+  assert.equal(JSON.parse(readFileSync(statePath, "utf8")).clicks, clicksBefore + 1);
 });

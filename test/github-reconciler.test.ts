@@ -6,6 +6,34 @@ import { test } from "node:test";
 import { GitHubReconciler } from "../src/github-reconciler.js";
 import type { ReconciledPrState } from "../src/types.js";
 
+test("a pull request head is read only for a pull request of the handoff's repository", async (t) => {
+  const dataDir = mkdtempSync(join(tmpdir(), "clawhandoff-pr-head-"));
+  const stateFile = join(dataDir, "github-state.json");
+  const previousStateFile = process.env.FAKE_GATEWAY_STATE_FILE;
+  process.env.FAKE_GATEWAY_STATE_FILE = stateFile;
+  t.after(() => {
+    if (previousStateFile === undefined) delete process.env.FAKE_GATEWAY_STATE_FILE;
+    else process.env.FAKE_GATEWAY_STATE_FILE = previousStateFile;
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+  const reconciler = new GitHubReconciler(resolve("test/helpers/fake-gh-cli.mjs"));
+  const url = "https://github.com/example/repo/pull/7";
+  const headSha = "c".repeat(40);
+  writeFileSync(stateFile, JSON.stringify({ openPrs: [{ number: 7, url, headRefName: "robo/fix", headRefOid: headSha.toUpperCase(),
+    headRepository: { nameWithOwner: "robo/repo" } }] }));
+
+  assert.deepEqual(await reconciler.pullRequestHead({ repoId: "Example/Repo", url }), {
+    number: 7, url, repository: "Example/Repo", headRefName: "robo/fix", headRepository: "robo/repo", headSha,
+  });
+  // Another repository's pull request, or no pull request at all, is never looked up.
+  assert.equal(await reconciler.pullRequestHead({ repoId: "example/repo", url: "https://github.com/other/repo/pull/7" }), undefined);
+  assert.equal(await reconciler.pullRequestHead({ repoId: "example/repo", url: "https://github.com/example/repo/issues/7" }), undefined);
+  // GitHub must confirm the same pull request.
+  assert.equal(await reconciler.pullRequestHead({ repoId: "example/repo", url: "https://github.com/example/repo/pull/8" }), undefined);
+  writeFileSync(stateFile, JSON.stringify({ ghFailure: true }));
+  assert.equal(await reconciler.pullRequestHead({ repoId: "example/repo", url }), undefined);
+});
+
 test("PR reconciliation verifies the exact open head and preserves uncertain publication outcomes", async (t) => {
   const dataDir = mkdtempSync(join(tmpdir(), "clawhandoff-pr-state-"));
   const stateFile = join(dataDir, "github-state.json");

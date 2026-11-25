@@ -244,6 +244,8 @@ For a task that needs Git verification, configure a repository to fetch from wit
 
 A `candidateRef` is a plain ref, or a ref qualified with its GitHub repository, as in `owner/repo:refs/heads/branch`. If `owner/repo` is the handoff’s `repoId`, the bridge fetches the ref from the configured repository. Otherwise it fetches it from `https://github.com/<owner>/<repo>.git`. It refuses anything else, such as a refspec.
 
+When the target also reports a pull request of the handoff’s `repoId` (or one is already recorded) and GitHub confirms that its head branch is the candidate branch, the pull request head wins. The configured repository is used only when it serves exactly that head commit. Otherwise the bridge fetches `refs/pull/<n>/head` from the pull request’s repository, so a fork that never received a managed publisher’s branch, or holds an older copy of it, no longer hides the published head. The tree, ancestry and locked-path checks are the same. `bridge_verify_git` with an explicit `remoteUrlOrPath` keeps that remote.
+
 The initial `publisherOwner` determines who can be asked to publish. When omitted from the envelope, the bridge defaults to `remote_gated` (configurable via `defaultPublisherOwner` in `bridge-config.json` or `CLAWHANDOFF_DEFAULT_PUBLISHER_OWNER`).
 
 | `publisherOwner` | Who acts |

@@ -5,6 +5,19 @@ import type { ReconciledPrState, RivalPrWarning } from "./types.js";
 
 const execFileAsync = promisify(execFile);
 
+/** Where a pull request's head is, as GitHub reports it. */
+export interface PullRequestHead {
+  number: number;
+  url: string;
+  /** The repository the pull request belongs to. It always serves `refs/pull/<number>/head`. */
+  repository: string;
+  /** The head branch name, without `refs/heads/`. */
+  headRefName: string;
+  /** The `owner/repo` that holds the head branch, when GitHub still knows it. */
+  headRepository?: string;
+  headSha: string;
+}
+
 export class GitHubReconciler {
   private readonly ghCliPath: string;
 
@@ -217,6 +230,38 @@ export class GitHubReconciler {
       return uncertain(`The pull request head moved to ${head}, whose tree is not the verified tree. Someone else may have updated it.`, head);
     } catch {
       return uncertain(`The pull request head moved to ${head}, and its tree could not be read.`, head);
+    }
+  }
+
+  /**
+   * Reads where a pull request of the handoff's repository points: its head branch, the repository
+   * that holds it, and its head commit. Undefined when the URL is not such a pull request or the
+   * lookup fails, so callers keep their own source.
+   */
+  async pullRequestHead(params: { repoId: string; url: string }): Promise<PullRequestHead | undefined> {
+    const match = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)\/?$/i.exec(params.url.trim());
+    if (!match || `${match[1]}/${match[2]}`.toLowerCase() !== params.repoId.trim().toLowerCase()) return undefined;
+    const number = Number(match[3]);
+    try {
+      const rec = JSON.parse(await this.invokeGh([
+        "pr", "view", String(number), "--repo", params.repoId, "--json", "url,headRefName,headRefOid,headRepository",
+      ])) as Record<string, unknown>;
+      const url = typeof rec?.url === "string" ? rec.url : undefined;
+      const headSha = typeof rec?.headRefOid === "string" ? rec.headRefOid.toLowerCase() : undefined;
+      const headRefName = typeof rec?.headRefName === "string" ? rec.headRefName : undefined;
+      if (!url || url.toLowerCase() !== params.url.trim().replace(/\/$/, "").toLowerCase() ||
+          !headSha || !/^[0-9a-f]{40}$/.test(headSha) || !headRefName) return undefined;
+      const repository = rec.headRepository as { nameWithOwner?: unknown } | null | undefined;
+      return {
+        number,
+        url,
+        repository: params.repoId,
+        headRefName,
+        headSha,
+        ...(typeof repository?.nameWithOwner === "string" ? { headRepository: repository.nameWithOwner } : {}),
+      };
+    } catch {
+      return undefined;
     }
   }
 

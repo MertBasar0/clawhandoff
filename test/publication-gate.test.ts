@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
 import { BridgeService } from "../src/bridge-service.js";
@@ -142,6 +142,108 @@ test("A candidateRef qualified with the handoff repository passes both stages an
   const refused = await service.verifyGit({ handoffId: ready.handoffId, candidateRef: "example/repo:refs/heads/main:refs/heads/x" });
   assert.equal(refused.observed.reachableRefVerified, false);
   assert.match((refused.observed.verificationNotes ?? []).join("\n"), /Refusing candidateRef/);
+});
+
+/**
+ * The 2026-11-25 shape: the handoff's configured source is a fork, while the managed publisher
+ * pushed its own commit (same tree) to a branch of the pull request's repository. GitHub's
+ * https://github.com/example/repo.git is served by a local bare repository through `insteadOf`.
+ */
+async function publishToPullRequestRepository(t: TestContext, opts: { staleForkCopy?: boolean } = {}) {
+  const fixture = createTempGitFixture();
+  const head = fixture.commitFile("README.md", "verified tree", "prepare candidate");
+  fixture.git(["push", "origin", "refs/heads/main"]);
+  const tree = fixture.revParse("HEAD^{tree}");
+  const branch = "openclaw/good-crayfish-803745";
+  const upstreamDir = join(fixture.rootDir, "upstream.git");
+  mkdirSync(upstreamDir);
+  fixture.git(["init", "--bare", "--initial-branch=main"], upstreamDir);
+  fixture.git(["commit", "--allow-empty", "-m", "managed publication with the verified tree"]);
+  const published = fixture.revParse("HEAD");
+  fixture.git(["push", upstreamDir, "refs/heads/main", `HEAD:refs/heads/${branch}`, "HEAD:refs/pull/9/head"]);
+  if (opts.staleForkCopy) fixture.git(["push", "origin", `${head}:refs/heads/${branch}`]);
+  const savedGit = Object.fromEntries(["GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_KEY_1", "GIT_CONFIG_VALUE_1"]
+    .map((name) => [name, process.env[name]]));
+  Object.assign(process.env, {
+    GIT_CONFIG_COUNT: "2",
+    GIT_CONFIG_KEY_0: `url.${upstreamDir.replace(/\\/g, "/")}.insteadOf`,
+    GIT_CONFIG_VALUE_0: "https://github.com/example/repo.git",
+    GIT_CONFIG_KEY_1: "protocol.file.allow",
+    GIT_CONFIG_VALUE_1: "always",
+  });
+
+  const statePath = join(fixture.rootDir, "gateway.json");
+  const originalEnv = process.env.FAKE_GATEWAY_STATE_FILE;
+  process.env.FAKE_GATEWAY_STATE_FILE = statePath;
+  const prUrl = "https://github.com/example/repo/pull/9";
+  const reply = (fields: Record<string, unknown>) => "```handoff-result\n" + JSON.stringify({
+    summaryDelta: String(fields.disposition), blockers: [], claimedChecks: [], ...fields,
+  }) + "\n```";
+  writeFileSync(statePath, JSON.stringify({ openPrs: [], queuedTurnReplies: [
+    { replyText: reply({ disposition: "ready_for_publish_gate", candidateRef: "refs/heads/main", candidateCommitSha: head }) },
+    { replyText: reply({ disposition: "completed", candidateRef: `refs/heads/${branch}`, candidateCommitSha: published, prUrl }),
+      createdPr: { number: 9, url: prUrl, headRefName: branch, headRefOid: published } },
+  ] }));
+  const service = new BridgeService({
+    dataDir: fixture.rootDir,
+    ghCliPath: resolve("test/helpers/fake-gh-cli.mjs"),
+    targets: { robo: { targetId: "robo", url: "https://gateway.example", authMode: "direct-token",
+      agentId: "main", cliPath: resolve("test/helpers/fake-openclaw-cli.mjs") } },
+  });
+  t.after(() => {
+    service.close();
+    for (const [name, value] of Object.entries(savedGit)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    if (originalEnv === undefined) delete process.env.FAKE_GATEWAY_STATE_FILE;
+    else process.env.FAKE_GATEWAY_STATE_FILE = originalEnv;
+    fixture.cleanup();
+  });
+
+  const ready = await service.startHandoff({ targetId: "robo", envelope: {
+    schemaVersion: "0.2", requestId: "pr-head", workspaceId: "workspace", title: "Publish verified commit",
+    outcome: "Publish a draft after exact commit verification.", mode: "publish_unchanged", publisherOwner: "remote_gated",
+    gitContext: { repoId: "example/repo", remoteUrlOrPath: fixture.originBareDir, pinnedBaseCommitSha: head,
+      pinnedSourceCommitSha: head, expectedTreeSha: tree },
+    requestedCapabilities: { allowCodeEdit: false, allowBranchPush: false, allowManagedPublishStage: false },
+    acceptanceCriteria: ["Only the approved tree is published"],
+  } });
+  assert.equal(ready.orchestratorDirective.action, "AUTHORIZE_REMOTE_PUBLISH", JSON.stringify(ready.observed.verificationNotes));
+  const result = await service.continueHandoff({ handoffId: ready.handoffId, intent: "authorize_publish", message: "Publish the verified commit." });
+  return { result, head, published, tree, prUrl, service, handoffId: ready.handoffId, branch, fixture };
+}
+
+test("A published ref that the configured fork lacks is verified at the pull request head", async (t) => {
+  const { result, published, tree } = await publishToPullRequestRepository(t);
+  const notes = (result.observed.verificationNotes ?? []).join("\n");
+  assert.equal(result.observed.reachableRefVerified, true, notes);
+  assert.equal(result.observed.observedHeadSha, published);
+  assert.equal(result.observed.observedTreeSha, tree);
+  assert.equal(result.observed.treeMatchesExpected, true);
+  assert.equal(result.observed.baseIsAncestor, true);
+  assert.equal(result.observed.lockedPathsClean, true);
+  assert.match(notes, /does not serve refs\/heads\/openclaw\/good-crayfish-803745\. Verified the pull request head refs\/pull\/9\/head from example\/repo instead\./);
+  assert.doesNotMatch(notes, /Failed to fetch candidateRef/);
+});
+
+test("A pull request head wins over an older copy of its branch in the configured fork", async (t) => {
+  const { result, head, published } = await publishToPullRequestRepository(t, { staleForkCopy: true });
+  const notes = (result.observed.verificationNotes ?? []).join("\n");
+  assert.equal(result.observed.reachableRefVerified, true, notes);
+  assert.equal(result.observed.observedHeadSha, published);
+  assert.equal(result.observed.treeMatchesExpected, true);
+  assert.match(notes, new RegExp(`configured source has refs/heads/openclaw/good-crayfish-803745 at ${head}, but .*pull/9 is at ${published}`));
+});
+
+test("An explicitly named remote is not replaced by the pull request head", async (t) => {
+  const { service, handoffId, branch, fixture } = await publishToPullRequestRepository(t);
+  // The named fork never received the branch, and the caller asked for exactly that remote.
+  const explicit = await service.verifyGit({ handoffId, candidateRef: `refs/heads/${branch}`, remoteUrlOrPath: fixture.originBareDir });
+  const notes = (explicit.observed.verificationNotes ?? []).join("\n");
+  assert.equal(explicit.observed.reachableRefVerified, false);
+  assert.match(notes, /Failed to fetch candidateRef/);
+  assert.doesNotMatch(notes, /refs\/pull\/9\/head/);
 });
 
 test("Omitting publisherOwner defaults to remote_gated (unless config overrides defaultPublisherOwner) and mid-handoff updatedLocalRepoPath binds worktree", async (t) => {

@@ -395,6 +395,26 @@ export class BridgeStore {
     });
   }
 
+  /**
+   * Undoes `claimDispatch` for a request that provably never left the bridge, such as a browser
+   * request whose typing failed because Chrome could not be attached. Only a bare claim (no run, no
+   * recorded reason) goes back to `prepared`, so the next attach sends it once.
+   */
+  releaseUnsentClaim(handoffId: string, turnId: string): boolean {
+    return this.withTransaction(() => {
+      const changed = this.db.prepare(
+        `UPDATE handoff_turns SET dispatch_state = 'prepared'
+         WHERE turn_id = ? AND handoff_id = ? AND dispatch_state = 'uncertain' AND run_id IS NULL AND error_text IS NULL
+           AND browser_resend_claimed = 0`,
+      ).run(turnId, handoffId).changes;
+      if (changed) {
+        this.db.prepare("UPDATE handoff_sessions SET lifecycle_status = 'running' WHERE handoff_id = ? AND lifecycle_status = 'uncertain'")
+          .run(handoffId);
+      }
+      return changed === 1;
+    });
+  }
+
   recordDispatched(params: {
     handoffId: string;
     turnId: string;
